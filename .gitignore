@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+dist/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.claude
