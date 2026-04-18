@@ -39,13 +39,23 @@ class SQLGenerationNode:
             api_key=settings.litellm_key,
         )
 
-    def _build_prompt(self, schema_context: str, question: str, error: str | None) -> str:
+    def _build_prompt(
+        self, schema_context: str, question: str, error: str | None, history_context: str = "", query_type: str = "NEW_TOPIC"
+    ) -> str:
         base = f"""You are a SQL expert. Database schema:
 
 {schema_context}
 
 ---
+{history_context}
+
+---
 Return ONLY a valid SQL SELECT query. No explanation, no markdown fences.
+
+{"If the user uses pronouns or relative descriptors, refer to the conversation history above." if "No prior" not in history_context else ""}
+
+Query Type: {query_type}
+{("If REFINEMENT, use previous SQL as a CTE or subquery to build upon it." if query_type == "REFINEMENT" else "This is a new topic. Generate fresh SQL.") if query_type else ""}
 
 Question: {question}"""
         if error:
@@ -57,6 +67,8 @@ Question: {question}"""
             state["schema_context"],
             state["question"],
             state.get("error"),
+            state.get("history_context", ""),
+            state.get("query_type", "NEW_TOPIC"),
         )
         response = await self._client.chat.completions.create(
             model=settings.llm_model,
@@ -68,8 +80,8 @@ Question: {question}"""
 
 
 class SQLExecutionNode:
-    def __init__(self) -> None:
-        pass
+    def __init__(self, thread_mgr=None) -> None:
+        self._thread_mgr = thread_mgr
 
     async def __call__(self, state: SQLAgentState) -> dict:
         sql = (state["sql_query"] or "").strip()
@@ -89,3 +101,11 @@ class SQLExecutionNode:
         except Exception as exc:
             logger.warning("SQL execution error: %s", exc)
             return {"sql_result": None, "error": str(exc)}
+
+        if self._thread_mgr and state.get("sql_query"):
+            await self._thread_mgr.save_turn(
+                state["thread_id"],
+                state["question"],
+                state["sql_query"],
+                state.get("sql_result", ""),
+            )

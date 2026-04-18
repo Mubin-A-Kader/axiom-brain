@@ -3,7 +3,9 @@ import logging
 from langgraph.graph import StateGraph, END
 
 from axiom.agent.nodes import SchemaRetrievalNode, SQLGenerationNode, SQLExecutionNode
+from axiom.agent.planner import QueryPlannerNode
 from axiom.agent.state import SQLAgentState
+from axiom.agent.thread import ThreadManager
 from axiom.config import settings
 from axiom.rag.schema import SchemaRAG
 
@@ -18,18 +20,22 @@ def _should_correct(state: SQLAgentState) -> str:
 
 async def build_graph():
     rag = SchemaRAG()
+    thread_mgr = ThreadManager()
 
     schema_node = SchemaRetrievalNode(rag)
+    planner_node = QueryPlannerNode()
     gen_node = SQLGenerationNode()
-    exec_node = SQLExecutionNode()
+    exec_node = SQLExecutionNode(thread_mgr)
 
     graph = StateGraph(SQLAgentState)
     graph.add_node("retrieve_schema", schema_node)
+    graph.add_node("plan_query", planner_node)
     graph.add_node("generate_sql", gen_node)
     graph.add_node("execute_sql", exec_node)
 
     graph.set_entry_point("retrieve_schema")
-    graph.add_edge("retrieve_schema", "generate_sql")
+    graph.add_edge("retrieve_schema", "plan_query")
+    graph.add_edge("plan_query", "generate_sql")
     graph.add_edge("generate_sql", "execute_sql")
     graph.add_conditional_edges("execute_sql", _should_correct)
 

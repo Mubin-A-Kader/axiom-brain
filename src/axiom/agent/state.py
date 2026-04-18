@@ -10,3 +10,7 @@ class SQLAgentState(TypedDict):
     error: Optional[str]
     attempts: int
     session_id: str
+    thread_id: str
+    history_context: str
+    is_stale: bool
+    query_type: str
