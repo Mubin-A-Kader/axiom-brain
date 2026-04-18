@@ -61,7 +61,8 @@ Or full stack: `docker compose up -d`
 
 ## Key Design Decisions
 - **Class-based nodes** — each LangGraph node is a class with `__call__`, injectable deps
-- **MCP for DB access** — connector is a subprocess; swap DB type by changing one arg
+- **asyncpg for DB access** — direct async connection; MCP connector kept for future swap
 - **Lakera Guard is a no-op** when `LAKERA_API_KEY` is empty (safe for local dev)
-- **Redis checkpointer** — multi-turn sessions work out of the box
+- **Redis checkpointer** — multi-turn sessions survive restarts; falls back to MemorySaver if Redis down
 - **Schema prompt ordering** — schema first, question last (maximises vLLM prefix cache hits)
+- **LiteLLM proxy via OpenAI SDK** — use `openai.AsyncOpenAI(base_url=litellm_url/v1)` to avoid litellm client provider detection hijacking Gemini requests

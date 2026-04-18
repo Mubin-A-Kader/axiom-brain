@@ -1,10 +1,13 @@
+import logging
+
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.redis import RedisSaver
 
 from axiom.agent.nodes import SchemaRetrievalNode, SQLGenerationNode, SQLExecutionNode
 from axiom.agent.state import SQLAgentState
 from axiom.config import settings
 from axiom.rag.schema import SchemaRAG
+
+logger = logging.getLogger(__name__)
 
 
 def _should_correct(state: SQLAgentState) -> str:
@@ -13,12 +16,12 @@ def _should_correct(state: SQLAgentState) -> str:
     return END
 
 
-def build_graph(connector_script: str = "src/axiom/connectors/postgres_server.py") -> StateGraph:
+async def build_graph():
     rag = SchemaRAG()
 
     schema_node = SchemaRetrievalNode(rag)
     gen_node = SQLGenerationNode()
-    exec_node = SQLExecutionNode(connector_script)
+    exec_node = SQLExecutionNode()
 
     graph = StateGraph(SQLAgentState)
     graph.add_node("retrieve_schema", schema_node)
@@ -30,5 +33,14 @@ def build_graph(connector_script: str = "src/axiom/connectors/postgres_server.py
     graph.add_edge("generate_sql", "execute_sql")
     graph.add_conditional_edges("execute_sql", _should_correct)
 
-    checkpointer = RedisSaver(settings.redis_url)
+    try:
+        from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+        checkpointer = AsyncRedisSaver.from_conn_string(settings.redis_url)
+        await checkpointer.asetup()
+        logger.info("Using Redis checkpointer at %s", settings.redis_url)
+    except Exception as exc:
+        from langgraph.checkpoint.memory import MemorySaver
+        logger.warning("Redis unavailable (%s), falling back to MemorySaver", exc)
+        checkpointer = MemorySaver()
+
     return graph.compile(checkpointer=checkpointer)

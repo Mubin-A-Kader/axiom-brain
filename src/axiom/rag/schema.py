@@ -10,6 +10,16 @@ class SchemaRAG:
                                             port=int(settings.chroma_url.split(":")[-1]))
         self._collection = self._client.get_or_create_collection(settings.chroma_collection)
         self._graph: nx.Graph = nx.Graph()
+        self._load_from_chroma()
+
+    def _load_from_chroma(self) -> None:
+        try:
+            existing = self._collection.get(include=["metadatas", "documents"])
+            for table_name, meta in zip(existing["ids"], existing["metadatas"]):
+                cols = meta.get("columns", "").split(",") if meta.get("columns") else []
+                self._graph.add_node(table_name, columns=[c.strip() for c in cols if c.strip()])
+        except Exception:
+            pass
 
     def ingest(self, tables: dict) -> None:
         """Load table DDL strings and foreign-key relationships into ChromaDB + NetworkX."""
@@ -20,7 +30,7 @@ class SchemaRAG:
                 self._graph.add_edge(table_name, fk["references"], via=fk["column"])
             docs.append(meta["ddl"])
             ids.append(table_name)
-            metas.append({"table": table_name})
+            metas.append({"table": table_name, "columns": ",".join(meta.get("columns", []))})
 
         if docs:
             self._collection.upsert(documents=docs, ids=ids, metadatas=metas)

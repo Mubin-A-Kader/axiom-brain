@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-axiom}
       POSTGRES_DB: axiomdb
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -38,12 +38,20 @@ services:
 
   litellm:
     image: ghcr.io/berriai/litellm:main-latest
-    command: ["--model", "${LLM_MODEL:-gemini/gemini-1.5-flash}", "--port", "8000"]
+    command: ["--config", "/app/config.yaml", "--port", "8000", "--detailed_debug"]
     ports:
       - "8000:8000"
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml
     environment:
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
     depends_on:
       - redis
 
@@ -68,7 +76,7 @@ services:
       chromadb:
         condition: service_started
       litellm:
-        condition: service_started
+        condition: service_healthy
 
 volumes:
   postgres_data:

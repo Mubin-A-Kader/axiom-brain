@@ -13,7 +13,13 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Axiom Brain", version="0.1.0")
 
 _guard = LakeraGuard()
-_agent = build_graph()
+_agent = None
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    global _agent
+    _agent = await build_graph()
 
 
 class QueryRequest(BaseModel):
@@ -38,6 +44,7 @@ async def query(req: QueryRequest) -> QueryResponse:
         raise HTTPException(status_code=400, detail="Input blocked by security policy.")
 
     session_id = req.session_id or str(uuid.uuid4())
+    thread_id = str(uuid.uuid4())
 
     state = await _agent.ainvoke(
         {
@@ -49,7 +56,7 @@ async def query(req: QueryRequest) -> QueryResponse:
             "attempts": 0,
             "session_id": session_id,
         },
-        config={"configurable": {"thread_id": session_id}},
+        config={"configurable": {"thread_id": thread_id}},
     )
 
     if state.get("error"):

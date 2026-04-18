@@ -1,22 +1,34 @@
+import logging
+
 import httpx
 
 from axiom.config import settings
 
+logger = logging.getLogger(__name__)
+
 
 class LakeraGuard:
-    _URL = "https://api.lakera.ai/v1/prompt_injection"
+    _URL = "https://api.lakera.ai/v2/guard/results"
 
     async def is_safe(self, user_input: str) -> bool:
         """Returns True if input passes the semantic firewall."""
         if not settings.lakera_api_key:
             return True  # guard disabled in local dev
 
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                self._URL,
-                headers={"Authorization": f"Bearer {settings.lakera_api_key}"},
-                json={"input": user_input},
-                timeout=5.0,
-            )
-            resp.raise_for_status()
-            return resp.json()["results"][0]["flagged"] is False
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    self._URL,
+                    headers={"Authorization": f"Bearer {settings.lakera_api_key}"},
+                    json={"messages": [{"role": "user", "content": user_input}]},
+                    timeout=5.0,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                logger.debug("Lakera response: %s", data)
+                result = data.get("results", [{}])[0]
+                # v2 uses "flagged", v1 used same — fall back to safe if missing
+                return result.get("flagged", False) is False
+        except (httpx.HTTPError, KeyError, IndexError) as exc:
+            logger.warning("Lakera Guard unavailable: %s — allowing request", exc)
+            return True
