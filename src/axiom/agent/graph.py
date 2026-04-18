@@ -52,4 +52,7 @@ async def build_graph():
         logger.warning("Redis unavailable (%s), falling back to MemorySaver", exc)
         checkpointer = MemorySaver()
 
-    return graph.compile(checkpointer=checkpointer)
+    return graph.compile(
+        checkpointer=checkpointer,
+        interrupt_before=["execute_sql"],
+    )

@@ -25,6 +25,8 @@ def sample_state() -> SQLAgentState:
         "error": None,
         "attempts": 0,
         "session_id": "test-session-1",
+        "thread_id": "test-thread-1",
+        "tenant_id": "default_tenant",
     }
 
 
@@ -35,6 +37,8 @@ def mock_rag() -> AsyncMock:
     rag.retrieve = AsyncMock(
         return_value="TABLE users (id INT, email VARCHAR, active BOOL)"
     )
+    rag.retrieve_examples = AsyncMock(return_value="")
+    rag.retrieve_exact = AsyncMock(return_value="")
     return rag
 
 
@@ -60,7 +64,7 @@ async def test_schema_retrieval_node_success(
 
     assert "schema_context" in result
     assert "TABLE users" in result["schema_context"]
-    mock_rag.retrieve.assert_called_once_with(sample_state["question"])
+    mock_rag.retrieve.assert_called_once_with("default_tenant", sample_state["question"])
 
 
 @pytest.mark.asyncio
@@ -87,10 +91,10 @@ async def test_sql_generation_node_basic(
     """Test SQL generation node produces SQL query."""
     node = SQLGenerationNode()
 
-    with patch.object(node._litellm, "acompletion") as mock_completion:
+    with patch.object(node._client.chat.completions, "create", new_callable=AsyncMock) as mock_create:
         mock_response = MagicMock()
-        mock_response.choices[0].message.content = "SELECT * FROM users WHERE active = true"
-        mock_completion.return_value = mock_response
+        mock_response.choices[0].message.content = "<sql>SELECT * FROM users WHERE active = true</sql>"
+        mock_create.return_value = mock_response
 
         state = sample_state.copy()
         state["schema_context"] = sample_schema_context
@@ -113,47 +117,47 @@ async def test_sql_generation_node_with_error_correction(
     state["error"] = "Column 'username' does not exist"
     state["attempts"] = 1
 
-    with patch.object(node._litellm, "acompletion") as mock_completion:
+    with patch.object(node._client.chat.completions, "create", new_callable=AsyncMock) as mock_create:
         mock_response = MagicMock()
-        mock_response.choices[0].message.content = "SELECT * FROM users WHERE email IS NOT NULL"
-        mock_completion.return_value = mock_response
+        mock_response.choices[0].message.content = "<sql>SELECT * FROM users WHERE email IS NOT NULL</sql>"
+        mock_create.return_value = mock_response
 
         result = await node(state)
 
         assert result["attempts"] == 2
         # Check that error correction prompt was included
-        call_args = mock_completion.call_args
+        call_args = mock_create.call_args
         prompt = call_args[1]["messages"][0]["content"]
-        assert "Previous attempt failed" in prompt
+        assert "PREVIOUS ATTEMPT FAILED" in prompt
 
 
-def test_sql_generation_prompt_building(sample_schema_context: str) -> None:
+def test_sql_generation_prompt_building(sample_state: SQLAgentState, sample_schema_context: str) -> None:
     """Test SQL generation prompt structure."""
     node = SQLGenerationNode()
-    prompt = node._build_prompt(
-        schema_context=sample_schema_context,
-        question="Count active users",
-        error=None,
-    )
+    state = sample_state.copy()
+    state["schema_context"] = sample_schema_context
+    state["question"] = "Count active users"
+    state["error"] = None
+    prompt = node._build_prompt(state)
 
     assert "SQL expert" in prompt
     assert "TABLE users" in prompt
     assert "Count active users" in prompt
-    assert "Previous attempt failed" not in prompt
+    assert "PREVIOUS ATTEMPT FAILED" not in prompt
 
 
-def test_sql_generation_prompt_with_error(sample_schema_context: str) -> None:
+def test_sql_generation_prompt_with_error(sample_state: SQLAgentState, sample_schema_context: str) -> None:
     """Test SQL prompt includes error context."""
     node = SQLGenerationNode()
     error = "Syntax error near 'WHERE'"
-    prompt = node._build_prompt(
-        schema_context=sample_schema_context,
-        question="Get user emails",
-        error=error,
-    )
+    state = sample_state.copy()
+    state["schema_context"] = sample_schema_context
+    state["question"] = "Get user emails"
+    state["error"] = error
+    prompt = node._build_prompt(state)
 
     assert error in prompt
-    assert "Fix the query" in prompt
+    assert "PREVIOUS ATTEMPT FAILED" in prompt
 
 
 # ============================================================================
@@ -164,45 +168,39 @@ def test_sql_generation_prompt_with_error(sample_schema_context: str) -> None:
 @pytest.mark.asyncio
 async def test_sql_execution_node_success(sample_state: SQLAgentState) -> None:
     """Test SQL execution node successfully executes query."""
-    node = SQLExecutionNode("src/axiom/connectors/postgres_server.py")
+    node = SQLExecutionNode()
     state = sample_state.copy()
     state["sql_query"] = "SELECT * FROM users LIMIT 1"
 
-    mock_session = AsyncMock()
-    mock_result = MagicMock()
-    mock_result.content = [MagicMock(text='[{"id": 1, "email": "test@example.com"}]')]
-    mock_session.call_tool = AsyncMock(return_value=mock_result)
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_conn = AsyncMock()
+    mock_conn.fetch = AsyncMock(return_value=[{"id": 1, "email": "test@example.com"}])
+    mock_conn.close = AsyncMock()
 
-    with patch("axiom.agent.nodes.ClientSession", return_value=mock_session):
+    with patch("axiom.agent.nodes.asyncpg.connect", return_value=mock_conn):
         result = await node(state)
 
         assert "sql_result" in result
         assert result["error"] is None
-        mock_session.call_tool.assert_called_once()
-        call_args = mock_session.call_tool.call_args
-        assert call_args[0][0] == "run_query"
+        mock_conn.fetch.assert_called_once_with("SELECT * FROM users LIMIT 1")
 
 
 @pytest.mark.asyncio
 async def test_sql_execution_node_error(sample_state: SQLAgentState) -> None:
     """Test SQL execution node handles errors gracefully."""
-    node = SQLExecutionNode("src/axiom/connectors/postgres_server.py")
+    node = SQLExecutionNode()
     state = sample_state.copy()
-    state["sql_query"] = "INVALID SQL QUERY"
+    state["sql_query"] = "SELECT INVALID SQL QUERY"
 
-    mock_session = AsyncMock()
-    mock_session.call_tool = AsyncMock(side_effect=Exception("Query syntax error"))
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_conn = AsyncMock()
+    mock_conn.fetch = AsyncMock(side_effect=Exception("Query syntax error"))
+    mock_conn.close = AsyncMock()
 
-    with patch("axiom.agent.nodes.ClientSession", return_value=mock_session):
+    with patch("axiom.agent.nodes.asyncpg.connect", return_value=mock_conn):
         result = await node(state)
 
         assert result["sql_result"] is None
         assert "error" in result
-        assert "syntax error" in result["error"].lower()
+        assert "Query syntax error" in result["error"]
 
 
 # ============================================================================
@@ -213,7 +211,7 @@ async def test_sql_execution_node_error(sample_state: SQLAgentState) -> None:
 @pytest.mark.asyncio
 async def test_graph_full_flow(sample_state: SQLAgentState, mock_rag: AsyncMock) -> None:
     """Test full agent graph execution."""
-    graph = build_graph()
+    graph = await build_graph()
 
     with patch("axiom.agent.graph.SchemaRAG", return_value=mock_rag):
         with patch.object(SQLGenerationNode, "__call__") as mock_gen:
@@ -301,17 +299,17 @@ async def test_schema_retrieval_with_special_characters(
     node = SchemaRetrievalNode(mock_rag)
     await node(state)
 
-    mock_rag.retrieve.assert_called_once_with(special_question)
+    mock_rag.retrieve.assert_called_once_with("default_tenant", special_question)
 
 
 def test_sql_generation_with_empty_schema(sample_state: SQLAgentState) -> None:
     """Test SQL generation gracefully handles empty schema."""
     node = SQLGenerationNode()
-    prompt = node._build_prompt(
-        schema_context="",
-        question="Get users",
-        error=None,
-    )
+    state = sample_state.copy()
+    state["schema_context"] = ""
+    state["question"] = "Get users"
+    state["error"] = None
+    prompt = node._build_prompt(state)
 
     assert len(prompt) > 0
     assert "SQL expert" in prompt
@@ -320,22 +318,17 @@ def test_sql_generation_with_empty_schema(sample_state: SQLAgentState) -> None:
 @pytest.mark.asyncio
 async def test_execution_node_max_retry_check(sample_state: SQLAgentState) -> None:
     """Test that execution node tracks retry attempts."""
-    node = SQLExecutionNode("src/axiom/connectors/postgres_server.py")
+    node = SQLExecutionNode()
 
     state = sample_state.copy()
     state["attempts"] = 5
     state["error"] = "Previous query failed"
     state["sql_query"] = "SELECT * FROM users"
 
-    # Node itself doesn't enforce max retries; that's in the conditional edge
-    # But we can verify it doesn't crash on high attempt counts
-    mock_session = AsyncMock()
-    mock_result = MagicMock()
-    mock_result.content = [MagicMock(text="[]")]
-    mock_session.call_tool = AsyncMock(return_value=mock_result)
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_conn = AsyncMock()
+    mock_conn.fetch = AsyncMock(return_value=[])
+    mock_conn.close = AsyncMock()
 
-    with patch("axiom.agent.nodes.ClientSession", return_value=mock_session):
+    with patch("axiom.agent.nodes.asyncpg.connect", return_value=mock_conn):
         result = await node(state)
         assert result is not None

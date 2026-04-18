@@ -207,9 +207,23 @@ class SQLExecutionNode:
         if not sql.upper().startswith("SELECT"):
             return {"sql_result": None, "error": "Only SELECT queries are allowed."}
         
+        tenant_id = state.get("tenant_id", "default_tenant")
         result_update = {}
         try:
-            conn = await asyncpg.connect(settings.database_url)
+            # 1. Look up tenant DB URL from Control Plane
+            cp_conn = await asyncpg.connect(settings.database_url)
+            try:
+                row = await cp_conn.fetchrow("SELECT db_url FROM tenants WHERE tenant_id = $1", tenant_id)
+                if not row or not row["db_url"]:
+                    # Fallback to default if no specific tenant found (useful for testing/dev)
+                    target_db_url = settings.database_url
+                else:
+                    target_db_url = row["db_url"]
+            finally:
+                await cp_conn.close()
+
+            # 2. Execute query on Target DB
+            conn = await asyncpg.connect(target_db_url)
             try:
                 rows = await conn.fetch(sql)
                 if not rows:
