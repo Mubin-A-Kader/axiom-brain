@@ -33,15 +33,14 @@ History:
 
 New Query: {question}
 
-Is this query a REFINEMENT (follow-up to previous results) or a NEW_TOPIC (completely different)?
+Is this query a REFINEMENT (follow-up to the previous query/result) or a NEW_TOPIC (asking about something different)?
 
-Consider:
-- Does it use pronouns like "them", "those", "it"?
-- Does it reference "higher", "lower", "more", "less" (comparative)?
-- Is it asking for a modification of the previous result?
-- Or is it asking about a completely different topic?
+Guidelines:
+- If the query uses pronouns ("their", "them", "it", "his", "her", "that", "those") or relative terms ("more", "higher", "latest", "recent") to refer to the PREVIOUS result, it is a REFINEMENT.
+- If the query mentions a NEW entity (e.g. a different customer name, a different product name/email), it is a NEW_TOPIC.
+- If in doubt, choose NEW_TOPIC.
 
-Respond with JSON: {{"query_type": "REFINEMENT" or "NEW_TOPIC", "reason": "brief explanation"}}"""
+Respond with ONLY JSON: {{"query_type": "REFINEMENT" or "NEW_TOPIC", "reason": "brief explanation"}}"""
 
         response = await self._client.chat.completions.create(
             model=settings.llm_model,
@@ -50,8 +49,14 @@ Respond with JSON: {{"query_type": "REFINEMENT" or "NEW_TOPIC", "reason": "brief
         )
 
         try:
-            result = json.loads(response.choices[0].message.content)
-            query_type = result.get("query_type", "NEW_TOPIC")
+            content = response.choices[0].message.content
+            import re
+            match = re.search(r"\{.*\}", content, re.DOTALL)
+            if match:
+                result = json.loads(match.group(0))
+                query_type = result.get("query_type", "NEW_TOPIC")
+            else:
+                query_type = "NEW_TOPIC"
         except Exception as exc:
             logger.warning("Failed to parse planner response: %s", exc)
             query_type = "NEW_TOPIC"

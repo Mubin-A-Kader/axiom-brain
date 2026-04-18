@@ -28,7 +28,7 @@ class ThreadManager:
 
     async def _get_client(self) -> redis.Redis:
         if not self._client:
-            self._client = await redis.from_url(self._redis_url)
+            self._client = await redis.from_url(self._redis_url, decode_responses=True)
         return self._client
 
     async def get_history(self, thread_id: str) -> list[Turn]:
@@ -39,10 +39,24 @@ class ThreadManager:
             data = await client.get(key)
             if not data:
                 return []
+            
+            if isinstance(data, bytes):
+                data = data.decode("utf-8")
+                
             parsed = json.loads(data)
-            return parsed.get("turns", [])
+            turns = parsed.get("turns", [])
+            # Ensure every turn has the required fields to avoid crashes downstream
+            return [
+                {
+                    "timestamp": t.get("timestamp", 0.0),
+                    "question": t.get("question", ""),
+                    "sql": t.get("sql", ""),
+                    "result": t.get("result", ""),
+                }
+                for t in turns if isinstance(t, dict)
+            ]
         except Exception as exc:
-            logger.warning("Failed to load thread history: %s", exc)
+            logger.warning("Failed to load thread history for %s: %s", thread_id, exc)
             return []
 
     async def get_context_injection(self, thread_id: str, schema_context: str) -> tuple[str, bool]:
@@ -58,16 +72,22 @@ class ThreadManager:
         token_count = len(schema_context) // 4
 
         for turn in history[-self._history_size :]:
-            turn_text = f"Q: {turn['question']}\nSQL: {turn['sql']}\n"
+            # Include a snippet of the result to help resolve entity IDs/names
+            res_val = turn.get("result", "")
+            if len(res_val) > 200:
+                res_val = res_val[:200] + "..."
+            
+            turn_text = f"Q: {turn['question']}\nSQL: {turn['sql']}\nResult: {res_val}\n"
             turn_tokens = len(turn_text) // 4
             token_count += turn_tokens
 
-            # Stop adding if we exceed 80% of typical context (assume 128k token window)
+            # Stop adding if we exceed 80% of typical context
             if token_count > int(128000 * self._token_limit):
                 context_lines.append("[... history truncated due to token limit ...]")
                 break
             context_lines.append(f"Q: {turn['question']}")
             context_lines.append(f"SQL: {turn['sql']}")
+            context_lines.append(f"Result: {res_val}")
 
         context = "\n".join(context_lines)
         return context, is_stale

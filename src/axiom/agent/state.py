@@ -4,7 +4,11 @@ from typing_extensions import TypedDict
 
 class SQLAgentState(TypedDict):
     question: str
+    selected_tables: list[str]
     schema_context: str
+    few_shot_examples: str
+    custom_rules: str
+    tenant_id: str
     sql_query: Optional[str]
     sql_result: Optional[str]
     error: Optional[str]

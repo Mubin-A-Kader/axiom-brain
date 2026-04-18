@@ -2,7 +2,7 @@ import logging
 
 from langgraph.graph import StateGraph, END
 
-from axiom.agent.nodes import SchemaRetrievalNode, SQLGenerationNode, SQLExecutionNode
+from axiom.agent.nodes import SchemaRetrievalNode, SQLGenerationNode, SQLExecutionNode, TableSelectionNode
 from axiom.agent.planner import QueryPlannerNode
 from axiom.agent.state import SQLAgentState
 from axiom.agent.thread import ThreadManager
@@ -22,18 +22,21 @@ async def build_graph():
     rag = SchemaRAG()
     thread_mgr = ThreadManager()
 
+    routing_node = TableSelectionNode(rag)
     schema_node = SchemaRetrievalNode(rag)
     planner_node = QueryPlannerNode()
     gen_node = SQLGenerationNode()
     exec_node = SQLExecutionNode(thread_mgr)
 
     graph = StateGraph(SQLAgentState)
+    graph.add_node("route_tables", routing_node)
     graph.add_node("retrieve_schema", schema_node)
     graph.add_node("plan_query", planner_node)
     graph.add_node("generate_sql", gen_node)
     graph.add_node("execute_sql", exec_node)
 
-    graph.set_entry_point("retrieve_schema")
+    graph.set_entry_point("route_tables")
+    graph.add_edge("route_tables", "retrieve_schema")
     graph.add_edge("retrieve_schema", "plan_query")
     graph.add_edge("plan_query", "generate_sql")
     graph.add_edge("generate_sql", "execute_sql")
@@ -41,7 +44,7 @@ async def build_graph():
 
     try:
         from langgraph.checkpoint.redis.aio import AsyncRedisSaver
-        checkpointer = AsyncRedisSaver.from_conn_string(settings.redis_url)
+        checkpointer = AsyncRedisSaver(settings.redis_url)
         await checkpointer.asetup()
         logger.info("Using Redis checkpointer at %s", settings.redis_url)
     except Exception as exc:
