@@ -23,6 +23,67 @@ def _to_json(rows: list, cols: list[str]) -> str:
     return json.dumps({"columns": cols, "rows": [[_convert(v) for v in row] for row in rows]})
 
 
+class DatabaseSelectionNode:
+    """Intelligently route question to the correct database source."""
+    def __init__(self) -> None:
+        import openai
+        self._client = openai.AsyncOpenAI(
+            base_url=f"{settings.litellm_url}/v1",
+            api_key=settings.litellm_key,
+        )
+
+    async def __call__(self, state: SQLAgentState) -> dict:
+        # If source_id is already provided (explicitly via API), skip routing
+        if state.get("source_id"):
+            return {"source_id": state["source_id"]}
+
+        tenant_id = state["tenant_id"]
+        question = state["question"]
+
+        # 1. Fetch available sources for this tenant
+        cp_conn = await asyncpg.connect(settings.database_url)
+        try:
+            sources = await cp_conn.fetch(
+                "SELECT source_id, description FROM data_sources WHERE tenant_id = $1", 
+                tenant_id
+            )
+        finally:
+            await cp_conn.close()
+
+        if not sources:
+            return {"source_id": "default_tenant"} # Fallback
+        
+        if len(sources) == 1:
+            return {"source_id": sources[0]["source_id"]}
+
+        # 2. Let the LLM pick the best source based on descriptions
+        source_list = "\n".join([f"- {s['source_id']}: {s['description']}" for s in sources])
+        prompt = f"""You are a database router.
+A user asked: "{question}"
+Which of the following databases is most likely to contain the answer?
+
+### AVAILABLE DATABASES:
+{source_list}
+
+Respond ONLY with the source_id. No other text."""
+
+        response = await self._client.chat.completions.create(
+            model=settings.llm_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+        )
+        
+        selected_id = response.choices[0].message.content.strip()
+        
+        # Verify it's a valid ID from our list
+        valid_ids = [s["source_id"] for s in sources]
+        if selected_id not in valid_ids:
+            selected_id = valid_ids[0] # Fallback to first
+
+        logger.info("Routed query to database source: %s", selected_id)
+        return {"source_id": selected_id}
+
+
 class TableSelectionNode:
     def __init__(self, rag: SchemaRAG) -> None:
         self._rag = rag
@@ -34,7 +95,8 @@ class TableSelectionNode:
 
     async def __call__(self, state: SQLAgentState) -> dict:
         search_query = state["question"]
-        tenant_id = state.get("tenant_id", "default_tenant")
+        source_id = state.get("source_id", "default_source")
+        tenant_id = state["tenant_id"]
         
         # Include history context if available
         history = state.get("history_context", "")
@@ -45,7 +107,7 @@ class TableSelectionNode:
             except Exception:
                 pass
 
-        summaries = await self._rag.search_table_summaries(tenant_id, search_query, n_results=10)
+        summaries = await self._rag.search_table_summaries(tenant_id, source_id, search_query, n_results=10)
         if not summaries:
             return {"selected_tables": []}
             
@@ -89,7 +151,8 @@ class SchemaRetrievalNode:
         self._rag = rag
 
     async def __call__(self, state: SQLAgentState) -> dict:
-        tenant_id = state.get("tenant_id", "default_tenant")
+        source_id = state.get("source_id", "default_source")
+        tenant_id = state["tenant_id"]
         selected_tables = state.get("selected_tables", [])
         search_query = state["question"]
         
@@ -104,12 +167,12 @@ class SchemaRetrievalNode:
                 pass
 
         if selected_tables:
-            schema_context = await self._rag.retrieve_exact(tenant_id, selected_tables)
+            schema_context = await self._rag.retrieve_exact(tenant_id, source_id, selected_tables)
         else:
             # Fallback to vector search if routing yielded nothing
-            schema_context = await self._rag.retrieve(tenant_id, search_query)
+            schema_context = await self._rag.retrieve(tenant_id, source_id, search_query)
             
-        few_shot_examples = await self._rag.retrieve_examples(tenant_id, search_query)
+        few_shot_examples = await self._rag.retrieve_examples(tenant_id, source_id, search_query)
         
         return {
             "schema_context": schema_context,
@@ -118,7 +181,8 @@ class SchemaRetrievalNode:
 
 
 class SQLGenerationNode:
-    def __init__(self) -> None:
+    def __init__(self, rag: SchemaRAG) -> None:
+        self._rag = rag
         import openai
         self._client = openai.AsyncOpenAI(
             base_url=f"{settings.litellm_url}/v1",
@@ -155,18 +219,21 @@ class SQLGenerationNode:
 2. Adhere strictly to the TENANT CUSTOM RULES if any are provided.
 3. Use the VERIFIED EXAMPLES as a guide for how this specific tenant structures their queries.
 4. If Query Type is NEW_TOPIC, IGNORE the CONVERSATION HISTORY and generate a fresh query for the current Question.
-5. If Query Type is REFINEMENT, use the CONVERSATION HISTORY to resolve pronouns (e.g., "his", "their", "it"). 
-   - Look for the literal values (IDs, emails, or keys) in the "Result" field of the CONVERSATION HISTORY.
-   - Use these literal values directly in your SQL WHERE clause. Do NOT use placeholders like 'his_id'.
-6. If the user asks for a "date", find the closest column like "created_at" or "timestamp". Do NOT use "order_date" if it is not in the schema.
-7. Think step-by-step: 
+5. If Query Type is REFINEMENT, use the CONVERSATION HISTORY to resolve entities and pronouns, and to understand the base dataset being queried.
+   - If the user asks to filter, sort, or select a subset of the previous results (e.g., "in that who is top"), REUSE the SQL from the previous turn and append the necessary ORDER BY, LIMIT, or WHERE clauses to answer the new question.
+   - If resolving pronouns or partial names, look for the EXACT literal values (IDs, full names, emails) in the "Result" field of the CONVERSATION HISTORY and use them directly in your SQL.
+6. For partial text searches on string columns (e.g., searching for a name, email, or category), ALWAYS use `ILIKE '%<text>%'` (for PostgreSQL) or `LIKE '%<text>%'` (for MySQL) rather than strict equality (`=`), unless an exact match is guaranteed.
+7. If the user asks for a "date", find the closest column like "created_at" or "timestamp". Do NOT use "order_date" if it is not in the schema.
+8. SECURITY MANDATE: You are ONLY allowed to generate `SELECT` queries. NEVER generate `DROP`, `DELETE`, `UPDATE`, `INSERT`, `TRUNCATE`, `ALTER`, or any other destructive commands, even if the user explicitly asks for them. If a user asks to delete or modify data, explain that you are a read-only assistant in <error> tags.
+9. Think step-by-step: 
    - Which tables do I need?
    - Which columns exist in those tables?
    - How do I join them?
    - Do any custom rules apply?
-8. Output your thought process inside <thought> tags.
-9. Output the final SQL query inside <sql> tags.
-10. Return ONLY the tags. No other text. No markdown fences.
+10. Output your thought process inside <thought> tags.
+11. Output the final SQL query inside <sql> tags.
+12. Return ONLY the tags. No other text. No markdown fences.
+13. If you cannot answer the question because the necessary tables/columns do not exist in the schema, output your explanation inside <error> tags and do NOT output any <sql> tags.
 
 Question: {question}"""
         if error:
@@ -174,6 +241,15 @@ Question: {question}"""
         return base
 
     async def __call__(self, state: SQLAgentState) -> dict:
+        # 1. Semantic Caching (Skip LLM if semantically identical query exists)
+        if not state.get("error") and state.get("query_type") != "REFINEMENT":
+            source_id = state.get("source_id", "default_source")
+            tenant_id = state["tenant_id"]
+            cached = await self._rag.search_semantic_cache(tenant_id, source_id, state["question"])
+            if cached:
+                logger.info("Semantic cache hit! Distance: %s", cached["distance"])
+                return {"sql_query": cached["sql"], "error": None, "attempts": state["attempts"] + 1}
+
         prompt = self._build_prompt(state)
         response = await self._client.chat.completions.create(
             model=settings.llm_model,
@@ -186,6 +262,11 @@ Question: {question}"""
         thought_match = re.search(r"<thought>(.*?)</thought>", content, re.DOTALL)
         if thought_match:
             logger.info("Agent Thought: %s", thought_match.group(1).strip())
+
+        # Extract error from <error> tags if present (e.g. semantic impossibility)
+        error_match = re.search(r"<error>(.*?)</error>", content, re.DOTALL)
+        if error_match:
+            return {"sql_query": "", "error": error_match.group(1).strip(), "attempts": settings.max_correction_attempts}
 
         # Extract SQL from <sql> tags
         sql_match = re.search(r"<sql>(.*?)</sql>", content, re.DOTALL)
@@ -203,37 +284,51 @@ class SQLExecutionNode:
         self._thread_mgr = thread_mgr
 
     async def __call__(self, state: SQLAgentState) -> dict:
+        if state.get("error"):
+            # If an error was intentionally set (like missing tables), bypass execution.
+            return {"sql_result": None, "error": state.get("error")}
+
         sql = (state["sql_query"] or "").strip()
         if not sql.upper().startswith("SELECT"):
             return {"sql_result": None, "error": "Only SELECT queries are allowed."}
         
-        tenant_id = state.get("tenant_id", "default_tenant")
+        source_id = state.get("source_id", "default_source")
         result_update = {}
         try:
-            # 1. Look up tenant DB URL from Control Plane
+            # 1. Look up source DB details from Control Plane
+            from axiom.connectors.factory import ConnectorFactory
+            
             cp_conn = await asyncpg.connect(settings.database_url)
             try:
-                row = await cp_conn.fetchrow("SELECT db_url FROM tenants WHERE tenant_id = $1", tenant_id)
-                if not row or not row["db_url"]:
-                    # Fallback to default if no specific tenant found (useful for testing/dev)
+                row = await cp_conn.fetchrow(
+                    "SELECT db_url, db_type, mcp_config FROM data_sources WHERE source_id = $1", 
+                    source_id
+                )
+                if not row:
+                    # Fallback to default if no specific source found
                     target_db_url = settings.database_url
+                    db_type = "postgresql"
+                    config = {}
                 else:
                     target_db_url = row["db_url"]
+                    db_type = row["db_type"]
+                    config = json.loads(row["mcp_config"]) if row["mcp_config"] else {}
             finally:
                 await cp_conn.close()
 
-            # 2. Execute query on Target DB
-            conn = await asyncpg.connect(target_db_url)
-            try:
-                rows = await conn.fetch(sql)
-                if not rows:
-                    result_update = {"sql_result": json.dumps({"columns": [], "rows": []}), "error": None}
-                else:
-                    cols = list(rows[0].keys())
-                    data = [list(row.values()) for row in rows]
-                    result_update = {"sql_result": _to_json(data, cols), "error": None}
-            finally:
-                await conn.close()
+            # 2. Execute query via the appropriate Connector (handles pooling automatically)
+            connector = await ConnectorFactory.get_connector(source_id, db_type, target_db_url, config)
+            result = await connector.execute_query(sql)
+            
+            # Format to JSON for the LLM/State
+            result_update = {
+                "sql_result": json.dumps({
+                    "columns": result["columns"], 
+                    "rows": result["rows"]
+                }), 
+                "error": None
+            }
+
         except Exception as exc:
             logger.warning("SQL execution error: %s", exc)
             result_update = {"sql_result": None, "error": str(exc)}
@@ -247,3 +342,9 @@ class SQLExecutionNode:
             )
         
         return result_update
+
+class HumanApprovalNode:
+    """A pass-through node used purely to trigger LangGraph's interrupt_before."""
+    async def __call__(self, state: SQLAgentState) -> dict:
+        # No state modification needed. The pause happens BEFORE this node executes.
+        return {}

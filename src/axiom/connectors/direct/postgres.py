@@ -1,0 +1,121 @@
+import json
+import logging
+from typing import Any, Dict, List, Optional
+from datetime import date, datetime
+from decimal import Decimal
+
+import asyncpg
+from axiom.connectors.base import BaseConnector
+
+logger = logging.getLogger(__name__)
+
+class PostgresConnector(BaseConnector):
+    """Direct async connector for PostgreSQL using asyncpg."""
+    
+    def __init__(self, source_id: str, db_url: str, config: Optional[Dict[str, Any]] = None):
+        super().__init__(source_id, db_url, config)
+        self._pool: Optional[asyncpg.Pool] = None
+
+    async def connect(self) -> None:
+        """Initialize the asyncpg connection pool."""
+        if not self._pool:
+            self._pool = await asyncpg.create_pool(
+                self.db_url,
+                min_size=self.config.get("min_pool_size", 1),
+                max_size=self.config.get("max_pool_size", 10)
+            )
+            logger.info(f"Initialized PostgreSQL pool for source: {self.source_id}")
+
+    async def disconnect(self) -> None:
+        """Close the asyncpg connection pool."""
+        if self._pool:
+            await self._pool.close()
+            self._pool = None
+            logger.info(f"Closed PostgreSQL pool for source: {self.source_id}")
+
+    def _serialize(self, v: Any) -> Any:
+        if isinstance(v, Decimal):
+            return float(v)
+        if isinstance(v, (datetime, date)):
+            return v.isoformat()
+        return v
+
+    async def execute_query(self, sql: str) -> Dict[str, Any]:
+        """Execute a SELECT query and return formatted results."""
+        if not self._pool:
+            await self.connect()
+        
+        async with self._pool.acquire() as conn:
+            # Wrap the execution in a strictly read-only transaction
+            async with conn.transaction(readonly=True):
+                rows = await conn.fetch(sql)
+                if not rows:
+                    return {"columns": [], "rows": []}
+                
+                cols = list(rows[0].keys())
+                data = [[self._serialize(v) for v in row.values()] for row in rows]
+                return {"columns": cols, "rows": data}
+
+    async def get_schema(self) -> Dict[str, Any]:
+        """Extract table structures, columns, and foreign keys from public schema."""
+        if not self._pool:
+            await self.connect()
+            
+        schema = {}
+        async with self._pool.acquire() as conn:
+            # 1. Get all user tables in public schema
+            tables_query = """
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                AND table_type = 'BASE TABLE';
+            """
+            tables = await conn.fetch(tables_query)
+            
+            for table_record in tables:
+                table_name = table_record['table_name']
+                
+                # 2. Get columns for this table
+                cols_query = """
+                    SELECT column_name, data_type 
+                    FROM information_schema.columns 
+                    WHERE table_name = $1 
+                    AND table_schema = 'public'
+                    ORDER BY ordinal_position;
+                """
+                columns = await conn.fetch(cols_query, table_name)
+                col_names = [col['column_name'] for col in columns]
+                
+                # Formulate a basic DDL approximation
+                col_defs = [f"{col['column_name']} {col['data_type']}" for col in columns]
+                ddl = f"CREATE TABLE {table_name} ({', '.join(col_defs)})"
+                
+                # 3. Get foreign keys
+                fk_query = """
+                    SELECT
+                        kcu.column_name, 
+                        ccu.table_name AS foreign_table_name,
+                        ccu.column_name AS foreign_column_name 
+                    FROM 
+                        information_schema.table_constraints AS tc 
+                        JOIN information_schema.key_column_usage AS kcu
+                          ON tc.constraint_name = kcu.constraint_name
+                          AND tc.table_schema = kcu.table_schema
+                        JOIN information_schema.constraint_column_usage AS ccu
+                          ON ccu.constraint_name = tc.constraint_name
+                          AND ccu.table_schema = tc.table_schema
+                    WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_name = $1;
+                """
+                fks = await conn.fetch(fk_query, table_name)
+                foreign_keys = [
+                    {"column": fk["column_name"], "references": fk["foreign_table_name"]}
+                    for fk in fks
+                ]
+                
+                schema[table_name] = {
+                    "ddl": ddl,
+                    "columns": col_names,
+                    "foreign_keys": foreign_keys,
+                    "description": f"Autogenerated schema for table {table_name}.",
+                }
+        return schema

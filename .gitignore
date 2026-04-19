@@ -8,3 +8,4 @@ dist/
 .pytest_cache/
 .claude
 GEMINI.md
+*.log

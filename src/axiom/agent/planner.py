@@ -36,8 +36,9 @@ New Query: {question}
 Is this query a REFINEMENT (follow-up to the previous query/result) or a NEW_TOPIC (asking about something different)?
 
 Guidelines:
-- If the query uses pronouns ("their", "them", "it", "his", "her", "that", "those") or relative terms ("more", "higher", "latest", "recent") to refer to the PREVIOUS result, it is a REFINEMENT.
-- If the query mentions a NEW entity (e.g. a different customer name, a different product name/email), it is a NEW_TOPIC.
+- If the query uses phrases like "in that", "of those", "from that list", or refers to the previous result using pronouns ("their", "them", "it", "his", "her", "that", "those") or relative terms ("more", "higher", "latest", "recent"), it is ALWAYS a REFINEMENT.
+- Even if a new name or entity is mentioned (e.g., "anyone with name bob"), if it is contextualized by "in that" or refers to the previous results, it is a REFINEMENT.
+- If the query is completely unrelated and stands alone without needing prior context, it is a NEW_TOPIC.
 - If in doubt, choose NEW_TOPIC.
 
 Respond with ONLY JSON: {{"query_type": "REFINEMENT" or "NEW_TOPIC", "reason": "brief explanation"}}"""

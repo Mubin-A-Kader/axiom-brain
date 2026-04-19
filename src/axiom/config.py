@@ -17,9 +17,12 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379"
     chroma_url: str = "http://localhost:8200"
     chroma_collection: str = "schema"
+    chroma_token: str = "secret-chroma-token"
 
     # Security
     lakera_api_key: str = ""
+    supabase_jwt_secret: str = "super-secret-jwt-token-with-at-least-32-characters-long"
+    supabase_jwks_url: str = "http://localhost:9999/.well-known/jwks.json"
 
     # Agent
     max_correction_attempts: int = 3
