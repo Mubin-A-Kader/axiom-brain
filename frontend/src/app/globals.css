@@ -1,0 +1,97 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-body), "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-mono), "Fira Code", ui-monospace, SFMono-Regular, monospace;
+  --font-heading: var(--font-header), "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
+  
+  /* Tactile Slate Palette */
+  --color-tactile-base: #1E1E1C;
+  --color-tactile-surface: #2A2927;
+  --color-tactile-text: #E6E1D8;
+  --color-tactile-primary: #638A70;
+  --color-tactile-primary-hover: #729E81;
+  --color-tactile-warning: #C26D5C;
+  --color-tactile-warning-bg: rgba(194, 109, 92, 0.08);
+  --color-tactile-border: rgba(255, 255, 255, 0.05);
+
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+
+  /* Shadows */
+  --shadow-tactile: 0 4px 12px rgba(0, 0, 0, 0.2);
+}
+
+:root {
+  --background: #1E1E1C;
+  --foreground: #E6E1D8;
+  --primary: #638A70;
+  --primary-foreground: #1E1E1C;
+  --muted: #2A2927;
+  --muted-foreground: #94a3b8;
+  --border: rgba(255, 255, 255, 0.05);
+  --input: rgba(255, 255, 255, 0.05);
+  --ring: #638A70;
+  --radius: 0.5rem;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans; /* Force dark mode via layout.tsx class */
+  }
+}
+
+/* Custom Tactile Studio Utilities */
+.tactile-card {
+  @apply bg-tactile-surface border border-tactile-border shadow-tactile rounded-lg;
+}
+
+.tactile-button {
+  @apply bg-tactile-primary hover:bg-tactile-primary-hover text-tactile-base font-semibold rounded-md transition-all duration-200 ease-out shadow-tactile;
+}
+
+.tactile-warning {
+  @apply bg-tactile-warning-bg border-l-4 border-tactile-warning text-tactile-text p-4 rounded-r-md;
+}
+
+.tactile-input {
+  @apply bg-tactile-base border border-tactile-border focus-within:border-tactile-primary focus-within:ring-1 focus-within:ring-tactile-primary rounded-lg transition-all duration-200 shadow-inner;
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 10px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
