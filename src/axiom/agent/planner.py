@@ -44,7 +44,7 @@ Guidelines:
 Respond with ONLY JSON: {{"query_type": "REFINEMENT" or "NEW_TOPIC", "reason": "brief explanation"}}"""
 
         response = await self._client.chat.completions.create(
-            model=settings.llm_model,
+            model=state.get("llm_model") or settings.llm_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
         )

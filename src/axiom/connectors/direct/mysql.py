@@ -30,9 +30,14 @@ class MySQLConnector(BaseConnector):
         }
 
     async def connect(self) -> None:
-        """Initialize the aiomysql connection pool."""
+        """Initialize the aiomysql connection pool, with optional SSH tunneling."""
         if not self._pool:
-            conn_args = self._parse_url(self.db_url)
+            # 1. Start SSH tunnel if configured
+            effective_url = await self._start_ssh_tunnel()
+            
+            # 2. Parse effective URL (might be rewritten to localhost)
+            conn_args = self._parse_url(effective_url)
+            
             self._pool = await aiomysql.create_pool(
                 **conn_args,
                 minsize=self.config.get("min_pool_size", 1),
@@ -42,18 +47,24 @@ class MySQLConnector(BaseConnector):
             logger.info(f"Initialized MySQL pool for source: {self.source_id}")
 
     async def disconnect(self) -> None:
-        """Close the aiomysql connection pool."""
+        """Close the aiomysql connection pool and stop SSH tunnel."""
         if self._pool:
             self._pool.close()
             await self._pool.wait_closed()
             self._pool = None
             logger.info(f"Closed MySQL pool for source: {self.source_id}")
+        
+        # Always attempt to stop tunnel on disconnect
+        await self._stop_ssh_tunnel()
 
     def _serialize(self, v: Any) -> Any:
+        import uuid
         if isinstance(v, Decimal):
             return float(v)
         if isinstance(v, (datetime, date)):
             return v.isoformat()
+        if isinstance(v, uuid.UUID):
+            return str(v)
         return v
 
     async def execute_query(self, sql: str) -> Dict[str, Any]:

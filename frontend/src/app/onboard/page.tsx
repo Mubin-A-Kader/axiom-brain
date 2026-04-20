@@ -28,7 +28,8 @@ export default function OnboardingPage() {
 
       // Check if user already has a tenant
       try {
-        const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+        const hostname = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
+        const API_URL = process.env.NEXT_PUBLIC_API_URL || `http://${hostname}:8080`;
         const res = await fetch(`${API_URL}/api/tenant`, {
           headers: {
             "Authorization": `Bearer ${session.access_token}`
@@ -65,7 +66,8 @@ export default function OnboardingPage() {
       const supabase = createClient();
       const { data: { session } } = await supabase.auth.getSession();
       
-      const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+      const hostname = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
+      const API_URL = process.env.NEXT_PUBLIC_API_URL || `http://${hostname}:8080`;
       const res = await fetch(`${API_URL}/api/tenant`, {
         method: "POST",
         headers: {

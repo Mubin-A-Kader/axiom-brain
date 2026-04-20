@@ -5,6 +5,8 @@ from datetime import date, datetime
 from decimal import Decimal
 
 import asyncpg
+import sqlglot
+from sqlglot import exp
 
 from axiom.agent.state import SQLAgentState
 from axiom.config import settings
@@ -68,7 +70,7 @@ Which of the following databases is most likely to contain the answer?
 Respond ONLY with the source_id. No other text."""
 
         response = await self._client.chat.completions.create(
-            model=settings.llm_model,
+            model=state.get("llm_model") or settings.llm_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
         )
@@ -117,6 +119,9 @@ class TableSelectionNode:
 Given the user's question, review the following candidate tables and their descriptions.
 Select up to 3 tables that are most likely needed to answer the question.
 
+### IMPORTANT:
+Table names are CASE-SENSITIVE. You MUST return the names EXACTLY as they appear in the list below.
+
 ### CANDIDATE TABLES:
 {summary_text}
 
@@ -126,7 +131,7 @@ Select up to 3 tables that are most likely needed to answer the question.
 Respond ONLY with a JSON list of table names, e.g. ["table1", "table2"]. No other text or markdown."""
 
         response = await self._client.chat.completions.create(
-            model=settings.llm_model,
+            model=state.get("llm_model") or settings.llm_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
         )
@@ -227,20 +232,32 @@ class SQLGenerationNode:
 8. SECURITY MANDATE: You are ONLY allowed to generate `SELECT` queries. NEVER generate `DROP`, `DELETE`, `UPDATE`, `INSERT`, `TRUNCATE`, `ALTER`, or any other destructive commands, even if the user explicitly asks for them. If a user asks to delete or modify data, explain that you are a read-only assistant in <error> tags.
 9. Think step-by-step: 
    - Which tables do I need?
+   - Do these tables only contain technical IDs? If yes, find the descriptive table to JOIN with.
    - Which columns exist in those tables?
-   - How do I join them?
-   - Do any custom rules apply?
+   - How do I join them correctly using the foreign keys shown in SCHEMA CONTEXT?
+   - Match exact case for identifiers (PostgreSQL double quotes for capitals).
 10. Output your thought process inside <thought> tags.
 11. Output the final SQL query inside <sql> tags.
 12. Return ONLY the tags. No other text. No markdown fences.
 13. If you cannot answer the question because the necessary tables/columns do not exist in the schema, output your explanation inside <error> tags and do NOT output any <sql> tags.
+14. STRICT QUOTING RULE: Identify if the target database is PostgreSQL or MySQL.
+    - In PostgreSQL, you MUST enclose any column or table name that contains an uppercase letter in double quotes (e.g., "packageId", "UserOrders"). 
+    - Do NOT double-quote standard snake_case columns or lowercase table names (e.g., use user_id, not "user_id").
+    - In MySQL, use backticks (`) for mixed-case identifiers.
+    - Always match the EXACT case shown in the SCHEMA CONTEXT.
+15. PREFER NAMES OVER IDs (STRICT): Technical IDs and UUIDs (e.g., "userId", "f47ac10b...") are useless to human users.
+    - You MUST NOT return technical IDs/UUIDs in your final SELECT list if a human-readable name, email, or label exists in a related table.
+    - If your primary table only has technical IDs, you MUST JOIN with the corresponding entity table (e.g., "users", "customers", "profiles") to retrieve descriptive columns like "name", "full_name", or "email".
+    - Even if the user doesn't explicitly ask for a "name", assume they want human-readable labels instead of technical hashes.
 
 Question: {question}"""
         if error:
-            base += f"\n\n### PREVIOUS ATTEMPT FAILED:\n{error}\n\nReview the SCHEMA CONTEXT and CUSTOM RULES carefully. The column you used probably does not exist. Fix it."
+            base += f"\n\n### PREVIOUS ATTEMPT FAILED:\n{error}\n\nReview the SCHEMA CONTEXT carefully. If the error suggests a column or table name that exists but with different capitalization, you MUST use double quotes around that name (e.g., \"membershipFees\")."
         return base
 
     async def __call__(self, state: SQLAgentState) -> dict:
+        attempts = state.get("attempts", 0)
+        
         # 1. Semantic Caching (Skip LLM if semantically identical query exists)
         if not state.get("error") and state.get("query_type") != "REFINEMENT":
             source_id = state.get("source_id", "default_source")
@@ -248,11 +265,17 @@ Question: {question}"""
             cached = await self._rag.search_semantic_cache(tenant_id, source_id, state["question"])
             if cached:
                 logger.info("Semantic cache hit! Distance: %s", cached["distance"])
-                return {"sql_query": cached["sql"], "error": None, "attempts": state["attempts"] + 1}
+                return {"sql_query": cached["sql"], "error": None, "attempts": attempts + 1}
+
+        if attempts >= settings.max_correction_attempts:
+            return {
+                "error": f"Exhausted maximum SQL correction attempts ({settings.max_correction_attempts}). Last error: {state.get('error')}",
+                "attempts": attempts
+            }
 
         prompt = self._build_prompt(state)
         response = await self._client.chat.completions.create(
-            model=settings.llm_model,
+            model=state.get("llm_model") or settings.llm_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=settings.llm_temperature,
         )
@@ -283,14 +306,41 @@ class SQLExecutionNode:
     def __init__(self, thread_mgr=None) -> None:
         self._thread_mgr = thread_mgr
 
+    def _is_read_only(self, sql: str) -> bool:
+        """Use sqlglot to strictly verify the query is a SELECT statement."""
+        try:
+            # We assume a single statement for now
+            parsed = sqlglot.parse_one(sql, read="postgres") # default to postgres dialect
+            
+            # Check if it's a SELECT-like statement
+            if not isinstance(parsed, (exp.Select, exp.Union, exp.Except, exp.Intersect, exp.With)):
+                return False, "Query is not a SELECT statement."
+            
+            # Check for forbidden expressions within the tree (e.g. subqueries that write)
+            forbidden = [exp.Update, exp.Delete, exp.Drop, exp.Insert, exp.Create, exp.Alter]
+            for node in parsed.find_all(*forbidden):
+                return False, f"Forbidden command '{node.key}' detected in SQL."
+                
+            return True, None
+        except Exception as exc:
+            logger.warning("SQL parsing failed for security check: %s", exc)
+            # If we can't parse it reliably, we block it to be safe
+            return False, f"SQL Security Parsing Error: {str(exc)}"
+
     async def __call__(self, state: SQLAgentState) -> dict:
         if state.get("error"):
             # If an error was intentionally set (like missing tables), bypass execution.
             return {"sql_result": None, "error": state.get("error")}
 
         sql = (state["sql_query"] or "").strip()
-        if not sql.upper().startswith("SELECT"):
-            return {"sql_result": None, "error": "Only SELECT queries are allowed."}
+        if not sql:
+             return {"sql_result": None, "error": "No SQL query generated."}
+        
+        # 1. Robust Security Validation
+        safe, sec_error = self._is_read_only(sql)
+        if not safe:
+            logger.error("Security Violation Blocked: %s (Query: %s)", sec_error, sql)
+            return {"sql_result": None, "error": f"Security violation: {sec_error}"}
         
         source_id = state.get("source_id", "default_source")
         result_update = {}
@@ -325,7 +375,7 @@ class SQLExecutionNode:
                 "sql_result": json.dumps({
                     "columns": result["columns"], 
                     "rows": result["rows"]
-                }), 
+                }, default=str), 
                 "error": None
             }
 
@@ -348,3 +398,76 @@ class HumanApprovalNode:
     async def __call__(self, state: SQLAgentState) -> dict:
         # No state modification needed. The pause happens BEFORE this node executes.
         return {}
+
+class DataStorytellingNode:
+    """Transform SQL results into a visualization specification for the frontend."""
+    def __init__(self) -> None:
+        import openai
+        self._client = openai.AsyncOpenAI(
+            base_url=f"{settings.litellm_url}/v1",
+            api_key=settings.litellm_key,
+        )
+
+    async def __call__(self, state: SQLAgentState) -> dict:
+        if state.get("error") or not state.get("sql_result"):
+            return {"visualization": None}
+
+        question = state["question"]
+        result_json = json.loads(state["sql_result"])
+        columns = result_json.get("columns", [])
+        rows = result_json.get("rows", [])
+
+        if not rows or not columns:
+            return {"visualization": None}
+
+        # Data sample for the LLM to understand types and values
+        sample = rows[:5]
+
+        prompt = f"""You are a Senior Data Analyst. 
+Given the user's question and the SQL result set, generate a visualization specification.
+
+### QUESTION:
+{question}
+
+### RESULT COLUMNS:
+{columns}
+
+### DATA SAMPLE (Top 5 rows):
+{sample}
+
+### INSTRUCTIONS:
+1. Determine the best plot type: bar, line, scatter, pie, histogram, area, or indicator.
+2. Select the correct x_axis and y_axis column names from the RESULT COLUMNS.
+3. The title must be a data-driven INSIGHT (e.g., "Revenue grew by 20% in Q4") rather than a generic description.
+4. If the data is a single scalar value, use plot_type "indicator".
+5. If the data has no obvious trend or categorical breakdown, return null.
+
+### OUTPUT FORMAT (Strict JSON):
+{{
+  "x_axis": "<column_name | null>",
+  "y_axis": "<column_name | list_of_column_names>",
+  "plot_type": "<bar | line | scatter | pie | histogram | area | indicator>",
+  "title": "<insightful_title>"
+}}
+
+Respond ONLY with the JSON object. No markdown, no filler."""
+
+        try:
+            response = await self._client.chat.completions.create(
+                model=state.get("llm_model") or settings.llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+            )
+            content = response.choices[0].message.content.strip()
+
+            # Basic validation that it's JSON
+            # If the LLM returns "null" or invalid JSON, we catch it
+            if content.lower() == "null":
+                return {"visualization": None}
+
+            # Validate it's parseable
+            json.loads(content) 
+            return {"visualization": content}
+        except Exception as exc:
+            logger.warning("Failed to generate visualization spec: %s", exc)
+            return {"visualization": None}

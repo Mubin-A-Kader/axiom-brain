@@ -30,6 +30,7 @@ export async function askQuestion(req: QueryRequest): Promise<QueryResponse> {
       thread_id: req.thread_id || "",
       tenant_id: req.tenant_id || "default_tenant",
       source_id: req.source_id,
+      model: req.model,
     }),
   });
 
@@ -56,6 +57,7 @@ export async function approveQuery(req: ApproveRequest): Promise<QueryResponse> 
       session_id: req.session_id || "",
       tenant_id: req.tenant_id || "default_tenant",
       approved: req.approved,
+      model: req.model,
     }),
   });
 

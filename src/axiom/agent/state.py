@@ -19,3 +19,5 @@ class SQLAgentState(TypedDict):
     history_context: str
     is_stale: bool
     query_type: str
+    visualization: Optional[str]
+    llm_model: Optional[str]

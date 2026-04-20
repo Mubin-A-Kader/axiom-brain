@@ -18,8 +18,22 @@ async def main():
         await conn.execute("""
             DO $$ 
             BEGIN 
+                -- Handle legacy table if it exists with 'tenant_id' instead of 'id'
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tenants' AND column_name='id') AND 
+                   EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tenants' AND column_name='tenant_id') THEN
+                    ALTER TABLE tenants RENAME COLUMN tenant_id TO id;
+                END IF;
+
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tenants' AND column_name='name') THEN
+                    ALTER TABLE tenants ADD COLUMN name TEXT NOT NULL DEFAULT 'Nexus Workspace';
+                END IF;
+
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tenants' AND column_name='owner_id') THEN
                     ALTER TABLE tenants ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'unknown';
+                END IF;
+
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tenants' AND column_name='created_at') THEN
+                    ALTER TABLE tenants ADD COLUMN created_at TIMESTAMPTZ DEFAULT NOW();
                 END IF;
             END $$;
         """)

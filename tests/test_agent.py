@@ -65,7 +65,7 @@ async def test_schema_retrieval_node_success(
 
     assert "schema_context" in result
     assert "TABLE users" in result["schema_context"]
-    mock_rag.retrieve.assert_called_once_with("default_source", sample_state["question"])
+    mock_rag.retrieve.assert_called_once_with("default_tenant", "default_source", sample_state["question"])
 
 
 @pytest.mark.asyncio
@@ -191,11 +191,12 @@ async def test_sql_execution_node_success(sample_state: SQLAgentState) -> None:
 
     with patch("axiom.agent.nodes.asyncpg.connect", return_value=mock_cp_conn):
         with patch("axiom.connectors.factory.ConnectorFactory.get_connector", return_value=mock_connector):
-            result = await node(state)
+            with patch.object(node, "_is_read_only", return_value=(True, None)):
+                result = await node(state)
 
-            assert "sql_result" in result
-            assert result["error"] is None
-            mock_connector.execute_query.assert_called_once_with("SELECT * FROM users LIMIT 1")
+                assert "sql_result" in result
+                assert result["error"] is None
+                mock_connector.execute_query.assert_called_once_with("SELECT * FROM users LIMIT 1")
 
 
 @pytest.mark.asyncio
@@ -220,11 +221,12 @@ async def test_sql_execution_node_error(sample_state: SQLAgentState) -> None:
 
     with patch("axiom.agent.nodes.asyncpg.connect", return_value=mock_cp_conn):
         with patch("axiom.connectors.factory.ConnectorFactory.get_connector", return_value=mock_connector):
+            # It will now fail security check first because it's invalid SQL
             result = await node(state)
 
             assert result["sql_result"] is None
             assert "error" in result
-            assert "Query syntax error" in result["error"]
+            assert "Security violation" in result["error"]
 
 
 # ============================================================================
@@ -323,7 +325,7 @@ async def test_schema_retrieval_with_special_characters(
     node = SchemaRetrievalNode(mock_rag)
     await node(state)
 
-    mock_rag.retrieve.assert_called_once_with("default_source", special_question)
+    mock_rag.retrieve.assert_called_once_with("default_tenant", "default_source", special_question)
 
 
 def test_sql_generation_with_empty_schema(sample_state: SQLAgentState) -> None:

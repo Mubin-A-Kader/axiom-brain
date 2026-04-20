@@ -21,7 +21,8 @@ export function Sidebar() {
       setHasSession(!!session);
       if (session) {
         // Fetch tenant details
-        const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+        const hostname = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
+        const API_URL = process.env.NEXT_PUBLIC_API_URL || `http://${hostname}:8080`;
         fetch(`${API_URL}/api/tenant`, {
           headers: { "Authorization": `Bearer ${session.access_token}` }
         })

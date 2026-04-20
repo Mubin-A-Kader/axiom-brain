@@ -1,5 +1,6 @@
 import networkx as nx
 import chromadb
+import tiktoken
 
 from axiom.config import settings
 
@@ -13,7 +14,11 @@ class SchemaRAG:
         )
         self._collection = self._client.get_or_create_collection(settings.chroma_collection)
         self._graphs: dict[str, nx.Graph] = {}
+        self._encoding = tiktoken.get_encoding("cl100k_base")
         self._load_from_chroma()
+
+    def _count_tokens(self, text: str) -> int:
+        return len(self._encoding.encode(text))
 
     def _load_from_chroma(self) -> None:
         try:
@@ -159,35 +164,63 @@ class SchemaRAG:
             if not results.get("documents") or not results["documents"][0]:
                 return "No schema context found."
             
-            return "\n\n".join(results["documents"][0])
+            docs = []
+            total_tokens = 0
+            for ddl in results["documents"][0]:
+                tokens = self._count_tokens(ddl)
+                if total_tokens + tokens > settings.max_schema_tokens:
+                    break
+                docs.append(ddl)
+                total_tokens += tokens
+                
+            return "\n\n".join(docs) if docs else "No schema context found."
         except Exception:
             return "No schema context found."
 
     async def retrieve_exact(self, tenant_id: str, source_id: str, tables: list[str]) -> str:
-        """Retrieve exact DDLs for this tenant using table names."""
+        """Retrieve exact DDLs for this tenant using table names, plus neighbors within token limits."""
         if not tables:
             return "No schema context found."
             
         related: set[str] = set(tables)
         graph = self._graphs.get(source_id, nx.Graph())
+        
+        # Priority 1: Exact tables
+        # Priority 2: Direct neighbors
         for t in tables:
             if t in graph:
                 related.update(nx.neighbors(graph, t))
 
         lines: list[str] = []
-        if related:
-            related_ids = [f"{tenant_id}_{source_id}_{t}" for t in related]
-            ddl_results = self._collection.get(ids=related_ids, include=["documents"])
-            if ddl_results and ddl_results["documents"]:
-                for ddl in ddl_results["documents"]:
-                    if ddl:
-                        lines.append(ddl)
+        total_tokens = 0
         
-        if not lines and related:
-            for table in related:
-                node_data = graph.nodes.get(table, {})
-                cols = ", ".join(node_data.get("columns", []))
-                lines.append(f"TABLE {table} ({cols})")
+        # Fetch actual DDLs from Chroma
+        if related:
+            # We want to process tables in 'related' such that the explicitly selected tables come first
+            # to ensure they are included if we hit token limits.
+            ordered_related = tables + [t for t in related if t not in tables]
+            
+            for table in ordered_related:
+                table_id = f"{tenant_id}_{source_id}_{table}"
+                ddl_results = self._collection.get(ids=[table_id], include=["documents"])
+                
+                if ddl_results and ddl_results["documents"] and ddl_results["documents"][0]:
+                    ddl = ddl_results["documents"][0]
+                    tokens = self._count_tokens(ddl)
+                    if total_tokens + tokens > settings.max_schema_tokens:
+                        continue
+                    lines.append(ddl)
+                    total_tokens += tokens
+                else:
+                    # Fallback if DDL missing from Chroma but in graph
+                    if table in graph:
+                        node_data = graph.nodes.get(table, {})
+                        cols = ", ".join(node_data.get("columns", []))
+                        ddl = f"TABLE {table} ({cols})"
+                        tokens = self._count_tokens(ddl)
+                        if total_tokens + tokens <= settings.max_schema_tokens:
+                            lines.append(ddl)
+                            total_tokens += tokens
 
         return "\n\n".join(lines) if lines else "No schema context found."
 

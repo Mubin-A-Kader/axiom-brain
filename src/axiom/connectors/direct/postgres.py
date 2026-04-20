@@ -17,27 +17,37 @@ class PostgresConnector(BaseConnector):
         self._pool: Optional[asyncpg.Pool] = None
 
     async def connect(self) -> None:
-        """Initialize the asyncpg connection pool."""
+        """Initialize the asyncpg connection pool, with optional SSH tunneling."""
         if not self._pool:
+            # 1. Start SSH tunnel if configured
+            effective_url = await self._start_ssh_tunnel()
+            
+            # 2. Create the pool using the (possibly rewritten) URL
             self._pool = await asyncpg.create_pool(
-                self.db_url,
+                effective_url,
                 min_size=self.config.get("min_pool_size", 1),
                 max_size=self.config.get("max_pool_size", 10)
             )
             logger.info(f"Initialized PostgreSQL pool for source: {self.source_id}")
 
     async def disconnect(self) -> None:
-        """Close the asyncpg connection pool."""
+        """Close the asyncpg connection pool and stop SSH tunnel."""
         if self._pool:
             await self._pool.close()
             self._pool = None
             logger.info(f"Closed PostgreSQL pool for source: {self.source_id}")
+        
+        # Always attempt to stop tunnel on disconnect
+        await self._stop_ssh_tunnel()
 
     def _serialize(self, v: Any) -> Any:
+        import uuid
         if isinstance(v, Decimal):
             return float(v)
         if isinstance(v, (datetime, date)):
             return v.isoformat()
+        if isinstance(v, uuid.UUID):
+            return str(v)
         return v
 
     async def execute_query(self, sql: str) -> Dict[str, Any]:
@@ -57,43 +67,70 @@ class PostgresConnector(BaseConnector):
                 return {"columns": cols, "rows": data}
 
     async def get_schema(self) -> Dict[str, Any]:
-        """Extract table structures, columns, and foreign keys from public schema."""
+        """Extract table structures, columns, and foreign keys across all user schemas."""
         if not self._pool:
             await self.connect()
             
         schema = {}
         async with self._pool.acquire() as conn:
-            # 1. Get all user tables in public schema
+            # Diagnostic: What DB am I in?
+            db_name = await conn.fetchval("SELECT current_database()")
+            user_name = await conn.fetchval("SELECT current_user")
+            logger.info(f"Extracting schema for source '{self.source_id}' from DB '{db_name}' as user '{user_name}'")
+
+            # 1. Get all user tables/views/mat-views across all non-system schemas
+            # Using pg_class/pg_namespace for better reliability than information_schema
             tables_query = """
-                SELECT table_name 
-                FROM information_schema.tables 
-                WHERE table_schema = 'public' 
-                AND table_type = 'BASE TABLE';
+                SELECT n.nspname as table_schema, c.relname as table_name,
+                       CASE c.relkind 
+                         WHEN 'r' THEN 'BASE TABLE' 
+                         WHEN 'v' THEN 'VIEW' 
+                         WHEN 'm' THEN 'MATERIALIZED VIEW' 
+                         WHEN 'f' THEN 'FOREIGN TABLE'
+                       END as table_type
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname NOT IN ('information_schema', 'pg_catalog')
+                AND c.relkind IN ('r', 'v', 'm', 'f');
             """
             tables = await conn.fetch(tables_query)
+            logger.info(f"Schema extraction found {len(tables)} objects in '{db_name}'")
             
+            if not tables:
+                # Fallback: List ALL schemas to see what's visible
+                all_schemas = await conn.fetch("SELECT nspname FROM pg_namespace")
+                logger.warning(f"No tables found! Visible schemas: {[s['nspname'] for s in all_schemas]}")
+
             for table_record in tables:
+                schema_name = table_record['table_schema']
                 table_name = table_record['table_name']
+                table_type = table_record['table_type']
+                
+                # Use fully qualified name if not in public
+                full_name = f"{schema_name}.{table_name}" if schema_name != 'public' else table_name
+                logger.debug(f"Extracting metadata for {table_type}: {full_name}")
                 
                 # 2. Get columns for this table
                 cols_query = """
                     SELECT column_name, data_type 
                     FROM information_schema.columns 
-                    WHERE table_name = $1 
-                    AND table_schema = 'public'
+                    WHERE table_schema = $1 AND table_name = $2 
                     ORDER BY ordinal_position;
                 """
-                columns = await conn.fetch(cols_query, table_name)
+                columns = await conn.fetch(cols_query, schema_name, table_name)
                 col_names = [col['column_name'] for col in columns]
                 
-                # Formulate a basic DDL approximation
-                col_defs = [f"{col['column_name']} {col['data_type']}" for col in columns]
-                ddl = f"CREATE TABLE {table_name} ({', '.join(col_defs)})"
+                # Formulate a basic DDL approximation with quoted identifiers
+                col_defs = [f'"{col["column_name"]}" {col["data_type"]}' for col in columns]
+                # Quote each part of the full_name if it contains a schema
+                quoted_full_name = ".".join([f'"{p}"' for p in full_name.split(".")])
+                ddl = f"CREATE TABLE {quoted_full_name} ({', '.join(col_defs)})"
                 
                 # 3. Get foreign keys
                 fk_query = """
                     SELECT
                         kcu.column_name, 
+                        ccu.table_schema AS foreign_table_schema,
                         ccu.table_name AS foreign_table_name,
                         ccu.column_name AS foreign_column_name 
                     FROM 
@@ -104,18 +141,19 @@ class PostgresConnector(BaseConnector):
                         JOIN information_schema.constraint_column_usage AS ccu
                           ON ccu.constraint_name = tc.constraint_name
                           AND ccu.table_schema = tc.table_schema
-                    WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_name = $1;
+                    WHERE tc.constraint_type = 'FOREIGN KEY' 
+                    AND tc.table_schema = $1 AND tc.table_name = $2;
                 """
-                fks = await conn.fetch(fk_query, table_name)
-                foreign_keys = [
-                    {"column": fk["column_name"], "references": fk["foreign_table_name"]}
-                    for fk in fks
-                ]
+                fks = await conn.fetch(fk_query, schema_name, table_name)
+                foreign_keys = []
+                for fk in fks:
+                    ref_name = f"{fk['foreign_table_schema']}.{fk['foreign_table_name']}" if fk['foreign_table_schema'] != 'public' else fk['foreign_table_name']
+                    foreign_keys.append({"column": fk["column_name"], "references": ref_name})
                 
-                schema[table_name] = {
+                schema[full_name] = {
                     "ddl": ddl,
                     "columns": col_names,
                     "foreign_keys": foreign_keys,
-                    "description": f"Autogenerated schema for table {table_name}.",
+                    "description": f"Autogenerated schema for table {full_name}.",
                 }
         return schema

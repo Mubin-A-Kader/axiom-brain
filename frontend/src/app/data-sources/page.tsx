@@ -31,6 +31,19 @@ function TactileButton({ children, onClick, className = "", disabled = false, va
   );
 }
 
+const initialFormData = {
+  source_id: "",
+  db_type: "postgresql",
+  db_url: "",
+  description: "",
+  config_json: "",
+  use_ssh: false,
+  ssh_host: "",
+  ssh_port: "22",
+  ssh_user: "",
+  ssh_key: ""
+};
+
 export default function DataSourcesPage() {
   const [sources, setSources] = useState<Source[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -43,12 +56,7 @@ export default function DataSourcesPage() {
 
   const router = useRouter();
 
-  const [formData, setFormData] = useState({
-    source_id: "",
-    db_type: "postgresql",
-    db_url: "",
-    description: ""
-  });
+  const [formData, setFormData] = useState(initialFormData);
 
   useEffect(() => {
     const checkTenant = async () => {
@@ -61,7 +69,8 @@ export default function DataSourcesPage() {
       }
 
       try {
-        const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+        const hostname = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
+        const API_URL = process.env.NEXT_PUBLIC_API_URL || `http://${hostname}:8080`;
         const res = await fetch(`${API_URL}/api/tenant`, {
           headers: {
             "Authorization": `Bearer ${session.access_token}`
@@ -113,17 +122,37 @@ export default function DataSourcesPage() {
     setIsLoading(true);
 
     try {
+      let finalUrl = formData.db_url;
+      if (formData.db_type === 'mcp' && !finalUrl.startsWith('mcp://')) {
+        finalUrl = 'mcp://' + finalUrl;
+      }
+
+      // Prepare config
+      let mcp_config = formData.config_json ? JSON.parse(formData.config_json) : {};
+      
+      if (formData.use_ssh) {
+        mcp_config.ssh = {
+          host: formData.ssh_host,
+          port: parseInt(formData.ssh_port) || 22,
+          username: formData.ssh_user,
+          private_key: formData.ssh_key
+        };
+      }
+
       if (editingSourceId) {
         await updateSource(tenantId, editingSourceId, {
           description: formData.description,
-          db_url: formData.db_url,
+          db_url: finalUrl,
           db_type: formData.db_type,
+          mcp_config: mcp_config
         });
         setSuccess("Source updated successfully.");
       } else {
         const payload: SourceIn = {
           ...formData,
-          tenant_id: tenantId
+          db_url: finalUrl,
+          tenant_id: tenantId,
+          mcp_config: mcp_config
         };
         await onboardSource(payload);
         setSuccess("Ingestion started successfully. It may take a minute to process the schema.");
@@ -131,7 +160,7 @@ export default function DataSourcesPage() {
       
       setIsAdding(false);
       setEditingSourceId(null);
-      setFormData({ source_id: "", db_type: "postgresql", db_url: "", description: "" });
+      setFormData(initialFormData);
       // Refresh list
       loadSources();
     } catch (err: any) {
@@ -170,12 +199,19 @@ export default function DataSourcesPage() {
   }
 
   function startEdit(source: Source) {
+    const ssh = source.mcp_config?.ssh || {};
     setEditingSourceId(source.source_id);
     setFormData({
       source_id: source.source_id,
       db_type: source.db_type,
       db_url: "", // Security: don't populate URL as it's sensitive
-      description: source.description || ""
+      description: source.description || "",
+      config_json: source.mcp_config ? JSON.stringify(source.mcp_config, null, 2) : "",
+      use_ssh: !!source.mcp_config?.ssh,
+      ssh_host: ssh.host || "",
+      ssh_port: String(ssh.port || "22"),
+      ssh_user: ssh.username || "",
+      ssh_key: ssh.private_key || ""
     });
     setIsAdding(true);
   }
@@ -209,7 +245,7 @@ export default function DataSourcesPage() {
             {!isAdding && (
               <TactileButton onClick={() => {
                 setEditingSourceId(null);
-                setFormData({ source_id: "", db_type: "postgresql", db_url: "", description: "" });
+                setFormData(initialFormData);
                 setIsAdding(true);
               }}>
                 <Plus className="w-4 h-4 mr-2" />
@@ -306,6 +342,86 @@ export default function DataSourcesPage() {
                     onChange={e => setFormData({...formData, description: e.target.value})}
                   />
                 </div>
+
+                {/* SSH Tunneling Section */}
+                {(formData.db_type === 'postgresql' || formData.db_type === 'mysql') && (
+                  <div className="space-y-6 border-t border-[rgba(255,255,255,0.05)] pt-6">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Shield className="w-4 h-4 text-[#638A70]" />
+                        <h3 className="text-sm font-semibold text-[#E6E1D8] uppercase tracking-wider">SSH Tunneling</h3>
+                      </div>
+                      <label className="relative inline-flex items-center cursor-pointer">
+                        <input 
+                          type="checkbox" 
+                          className="sr-only peer"
+                          checked={formData.use_ssh}
+                          onChange={e => setFormData({...formData, use_ssh: e.target.checked})}
+                        />
+                        <div className="w-9 h-5 bg-[#1E1E1C] peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-[#E6E1D8]/20 after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-[#638A70]"></div>
+                        <span className="ml-3 text-xs font-mono text-[#E6E1D8]/50 uppercase">Enable Tunnel</span>
+                      </label>
+                    </div>
+
+                    {formData.use_ssh && (
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 animate-in fade-in zoom-in-95 duration-200">
+                        <div className="space-y-2">
+                          <label className="text-[10px] font-mono text-[#E6E1D8]/30 uppercase tracking-widest block ml-1">Bastion Host</label>
+                          <input 
+                            placeholder="bastion.example.com"
+                            className="w-full bg-[#1E1E1C] border border-[rgba(255,255,255,0.05)] rounded-lg px-4 py-2 text-xs text-[#E6E1D8] focus:border-[#638A70]/50 outline-none"
+                            value={formData.ssh_host}
+                            onChange={e => setFormData({...formData, ssh_host: e.target.value})}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <label className="text-[10px] font-mono text-[#E6E1D8]/30 uppercase tracking-widest block ml-1">SSH Port</label>
+                          <input 
+                            placeholder="22"
+                            className="w-full bg-[#1E1E1C] border border-[rgba(255,255,255,0.05)] rounded-lg px-4 py-2 text-xs text-[#E6E1D8] focus:border-[#638A70]/50 outline-none"
+                            value={formData.ssh_port}
+                            onChange={e => setFormData({...formData, ssh_port: e.target.value})}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <label className="text-[10px] font-mono text-[#E6E1D8]/30 uppercase tracking-widest block ml-1">SSH User</label>
+                          <input 
+                            placeholder="ubuntu"
+                            className="w-full bg-[#1E1E1C] border border-[rgba(255,255,255,0.05)] rounded-lg px-4 py-2 text-xs text-[#E6E1D8] focus:border-[#638A70]/50 outline-none"
+                            value={formData.ssh_user}
+                            onChange={e => setFormData({...formData, ssh_user: e.target.value})}
+                          />
+                        </div>
+                        <div className="col-span-full space-y-2">
+                          <label className="text-[10px] font-mono text-[#E6E1D8]/30 uppercase tracking-widest block ml-1">Private Key</label>
+                          <textarea 
+                            placeholder="-----BEGIN RSA PRIVATE KEY-----"
+                            className="w-full bg-[#1E1E1C] border border-[rgba(255,255,255,0.05)] rounded-lg px-4 py-3 text-[10px] text-[#E6E1D8] focus:border-[#638A70]/50 outline-none h-24 font-mono resize-none"
+                            value={formData.ssh_key}
+                            onChange={e => setFormData({...formData, ssh_key: e.target.value})}
+                          />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {formData.db_type === 'mcp' && (
+                  <div className="space-y-2">
+                    <label className="text-[11px] font-mono text-[#E6E1D8]/50 uppercase tracking-widest block ml-1">
+                      Advanced Configuration (JSON)
+                    </label>
+                    <textarea 
+                      placeholder='{ "env": { "SNOWFLAKE_ACCOUNT": "..." } }'
+                      className="w-full bg-[#1E1E1C] border border-[rgba(255,255,255,0.05)] rounded-lg px-4 py-3 text-[#E6E1D8] focus:border-[#638A70]/50 outline-none transition-all shadow-inner h-32 font-mono text-xs resize-none"
+                      value={formData.config_json}
+                      onChange={e => setFormData({...formData, config_json: e.target.value})}
+                    />
+                    <p className="text-[10px] text-[#E6E1D8]/30 ml-1">
+                      Optional JSON to pass to the MCP server (e.g., env variables, tool maps).
+                    </p>
+                  </div>
+                )}
 
                 <div className="flex gap-4 pt-4">
                   <TactileButton type="submit" disabled={isLoading}>

@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { 
   Database, Check, X, Copy, 
   Terminal, Activity, LayoutDashboard, Settings, 
-  CornerDownLeft, Loader2, AlertCircle, ChevronRight, ChevronDown, Search, Network
+  CornerDownLeft, Loader2, AlertCircle, ChevronRight, ChevronDown, Search, Network, Sparkles, Cpu
 } from "lucide-react";
 import { useAxiomChat } from "../hooks/useAxiomChat";
 import { createClient } from "@/lib/supabase/client";
@@ -142,50 +142,174 @@ function DataTable({ result }: { result: any }) {
   );
 }
 
+function VisualizationRenderer({ visualization, result }: { visualization: any, result: any }) {
+  const data = typeof result === 'string' ? JSON.parse(result) : result;
+  const { plot_type, x_axis, y_axis, title } = visualization;
+
+  if (!data || !data.rows || data.rows.length === 0) return null;
+
+  // Handle Indicator (Scalar Value)
+  if (plot_type === 'indicator') {
+    const val = data.rows[0][data.columns.indexOf(y_axis)];
+    return (
+      <div className="bg-[#2A2927] border border-[#638A70]/20 rounded-lg p-8 shadow-[0_4px_12px_rgba(0,0,0,0.2)] flex flex-col items-center justify-center text-center">
+        <Sparkles className="w-5 h-5 text-[#638A70] mb-4" />
+        <h3 className="text-sm font-mono text-[#E6E1D8]/50 uppercase tracking-widest mb-2">{title}</h3>
+        <div className="text-5xl font-heading font-bold text-[#E6E1D8] tracking-tighter">
+          {typeof val === 'number' ? val.toLocaleString() : val}
+        </div>
+      </div>
+    );
+  }
+
+  // Common data extraction for charts
+  const xIdx = data.columns.indexOf(x_axis);
+  const yIdx = Array.isArray(y_axis) ? data.columns.indexOf(y_axis[0]) : data.columns.indexOf(y_axis);
+  
+  const chartData = data.rows.slice(0, 10).map((row: any[]) => ({
+    label: String(row[xIdx] || ''),
+    value: Number(row[yIdx] || 0)
+  }));
+
+  const maxValue = Math.max(...chartData.map((d: any) => d.value), 1);
+
+  return (
+    <div className="bg-[#2A2927] border border-[#638A70]/20 rounded-lg p-6 shadow-[0_4px_12px_rgba(0,0,0,0.2)]">
+      <div className="flex items-center gap-2 mb-8">
+        <Sparkles className="w-4 h-4 text-[#638A70]" />
+        <h3 className="text-lg font-heading font-semibold text-[#E6E1D8] tracking-tight">
+          {title}
+        </h3>
+      </div>
+
+      <div className="h-72 w-full relative flex items-end gap-2 px-2 pb-14">
+        {plot_type === 'bar' && chartData.map((d: any, i: number) => (
+          <div key={i} className="flex-1 flex flex-col items-center gap-2 group h-full justify-end relative">
+            <div 
+              className="w-full bg-[#638A70]/80 rounded-t-sm transition-all duration-500 hover:bg-[#638A70] relative"
+              style={{ height: `${(d.value / maxValue) * 100}%` }}
+            >
+              <div className="absolute -top-6 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity text-[10px] font-mono text-[#E6E1D8] bg-[#1E1E1C] px-1.5 py-0.5 rounded border border-white/5 whitespace-nowrap z-10">
+                {d.value.toLocaleString()}
+              </div>
+            </div>
+            {/* Rotated & Truncated Labels - Fixed Positioning */}
+            <div className="absolute top-full w-full flex justify-center h-14">
+              <div 
+                className="text-[10px] font-mono text-[#E6E1D8]/50 uppercase tracking-tighter whitespace-nowrap overflow-hidden text-ellipsis max-w-[80px] text-right rotate-[-45deg] origin-top-right translate-x-[-50%] mt-2"
+                title={d.label}
+              >
+                {d.label}
+              </div>
+            </div>
+          </div>
+        ))}
+
+        {plot_type === 'line' && (
+          <div className="w-full h-full relative">
+            <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="w-full h-full">
+              <path 
+                d={`M ${chartData.map((d: any, i: number) => `${(i / (chartData.length - 1)) * 100},${100 - (d.value / maxValue) * 100}`).join(' L ')}`}
+                fill="none"
+                stroke="#638A70"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+              {chartData.map((d: any, i: number) => (
+                <circle 
+                  key={i}
+                  cx={(i / (chartData.length - 1)) * 100} 
+                  cy={100 - (d.value / maxValue) * 100} 
+                  r="1.5" 
+                  fill="#E6E1D8" 
+                  className="hover:r-3 transition-all cursor-crosshair"
+                />
+              ))}
+            </svg>
+            <div className="absolute bottom-0 left-0 right-0 flex justify-between pt-2">
+              {chartData.filter((_: any, i: number) => i % 2 === 0).map((d: any, i: number) => (
+                <div key={i} className="text-[9px] font-mono text-[#E6E1D8]/40 uppercase tracking-tighter">
+                  {d.label}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {(plot_type !== 'bar' && plot_type !== 'line') && (
+          <div className="flex-1 flex items-center justify-center bg-[#1E1E1C] rounded border border-[rgba(255,255,255,0.05)] text-[#E6E1D8]/40 text-sm italic font-mono">
+             [ {plot_type.toUpperCase()} CHART ]
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function AxiomBrainUI() {
   const [tenantId, setTenantId] = useState<string | null>(null);
   const [sources, setSources] = useState<Source[]>([]);
   const [selectedSourceId, setSelectedSourceId] = useState<string>("");
   const [mounted, setMounted] = useState(false);
   const [isVerifying, setIsVerifying] = useState(true);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
 
   const router = useRouter();
 
-  useEffect(() => {
-    setMounted(true);
-    const checkTenant = async () => {
-      const supabase = createClient();
-      const { data: { session } } = await supabase.auth.getSession();
-      
-      if (!session) {
-        router.push("/login");
-        return;
-      }
+  const checkTenant = async () => {
+    setIsVerifying(true);
+    setConnectionError(null);
+    
+    const supabase = createClient();
+    const { data: { session } } = await supabase.auth.getSession();
+    
+    if (!session) {
+      router.push("/login");
+      return;
+    }
 
-      try {
-        const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
-        const res = await fetch(`${API_URL}/api/tenant`, {
-          headers: {
-            "Authorization": `Bearer ${session.access_token}`
-          }
-        });
-        if (res.ok) {
-          const tenant = await res.json();
-          if (tenant) {
-            setTenantId(tenant.id);
-          } else {
-            router.push("/onboard");
-          }
+    try {
+      const hostname = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
+      const API_URL = process.env.NEXT_PUBLIC_API_URL || `http://${hostname}:8080`;
+      
+      // Use AbortController for a 5-second timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+      
+      const res = await fetch(`${API_URL}/api/tenant`, {
+        headers: {
+          "Authorization": `Bearer ${session.access_token}`
+        },
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+
+      if (res.ok) {
+        const tenant = await res.json();
+        if (tenant) {
+          setTenantId(tenant.id);
         } else {
           router.push("/onboard");
         }
-      } catch (err) {
-        console.error("Auth check failed", err);
-      } finally {
-        setIsVerifying(false);
+      } else {
+        router.push("/onboard");
       }
-    };
+    } catch (err: any) {
+      console.error("Auth check failed", err);
+      if (err.name === 'AbortError') {
+        setConnectionError("Connection timed out. Ensure the backend server is running.");
+      } else {
+        setConnectionError("Unable to reach the Axiom Orchestrator. Check your network connection.");
+      }
+    } finally {
+      setIsVerifying(false);
+    }
+  };
 
+  useEffect(() => {
+    setMounted(true);
     checkTenant();
   }, [router]);
 
@@ -202,7 +326,7 @@ export default function AxiomBrainUI() {
     }
   }, [tenantId, selectedSourceId]);
 
-  const { messages, isLoading, sendMessage, handleApprove } = useAxiomChat(tenantId || "default", selectedSourceId);
+  const { messages, isLoading, sendMessage, handleApprove, selectedModel, setSelectedModel } = useAxiomChat(tenantId || "default", selectedSourceId);
   const [input, setInput] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -222,9 +346,27 @@ export default function AxiomBrainUI() {
   if (!mounted || isVerifying || !tenantId) {
     return (
       <div className="h-full w-full flex items-center justify-center bg-[#1E1E1C]">
-        <div className="flex flex-col items-center gap-4">
-          <Loader2 className="w-8 h-8 animate-spin text-[#638A70]" />
-          <p className="text-sm font-mono text-[#E6E1D8]/30 uppercase tracking-widest">Securing Connection...</p>
+        <div className="flex flex-col items-center gap-6 max-w-xs text-center">
+          {connectionError ? (
+            <>
+              <div className="w-12 h-12 rounded-full bg-[rgba(194,109,92,0.1)] flex items-center justify-center text-[#C26D5C] mb-2">
+                <AlertCircle className="w-6 h-6" />
+              </div>
+              <div className="space-y-2">
+                <p className="text-sm font-mono text-[#E6E1D8] uppercase tracking-widest font-bold">Orchestrator Offline</p>
+                <p className="text-xs text-[#E6E1D8]/50 leading-relaxed">{connectionError}</p>
+              </div>
+              <TactileButton variant="outline" onClick={checkTenant} className="mt-2">
+                <RefreshCw className="w-3.5 h-3.5 mr-2" />
+                Retry Connection
+              </TactileButton>
+            </>
+          ) : (
+            <>
+              <Loader2 className="w-8 h-8 animate-spin text-[#638A70]" />
+              <p className="text-sm font-mono text-[#E6E1D8]/30 uppercase tracking-widest">Securing Connection...</p>
+            </>
+          )}
         </div>
       </div>
     );
@@ -252,6 +394,21 @@ export default function AxiomBrainUI() {
             </select>
             <ChevronDown className="w-3 h-3 text-[#E6E1D8]/30 -ml-3 pointer-events-none" />
           </div>
+
+          <div className="flex items-center gap-2 px-3 py-1.5 bg-[#2A2927] border border-[rgba(255,255,255,0.05)] rounded-md">
+            <Cpu className="w-3.5 h-3.5 text-[#638A70]" />
+            <select 
+              className="bg-transparent border-0 outline-none text-xs font-mono font-semibold text-[#E6E1D8] cursor-pointer appearance-none pr-4"
+              value={selectedModel}
+              onChange={(e) => setSelectedModel(e.target.value)}
+            >
+              <option value="">Default (Settings)</option>
+              <option value="gemini-1.5-flash">Gemini 1.5 Flash</option>
+              <option value="gpt-4o-mini">GPT-4o Mini</option>
+            </select>
+            <ChevronDown className="w-3 h-3 text-[#E6E1D8]/30 -ml-3 pointer-events-none" />
+          </div>
+
           <div className="h-4 w-px bg-[rgba(255,255,255,0.05)]" />
           <div className="flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-[#638A70] animate-pulse" />
@@ -260,6 +417,15 @@ export default function AxiomBrainUI() {
         </div>
 
         <div className="flex items-center gap-3">
+          <TactileButton 
+            variant="outline" 
+            className="h-9 px-3 border-0 bg-transparent hover:bg-white/5"
+            onClick={() => router.push("/data-sources")}
+          >
+            <Settings className="w-4 h-4 mr-2" />
+            Connectors
+          </TactileButton>
+          <div className="h-4 w-px bg-[rgba(255,255,255,0.05)]" />
           <div className="text-[11px] font-mono text-[#E6E1D8]/30 uppercase tracking-tighter">
             User_ID: {tenantId?.slice(0, 8)}...
           </div>
@@ -353,6 +519,9 @@ export default function AxiomBrainUI() {
 
                       {msg.status === "completed" && !msg.isError && (
                         <div className="space-y-6">
+                          {msg.metadata?.visualization && msg.metadata?.result && (
+                             <VisualizationRenderer visualization={msg.metadata.visualization} result={msg.metadata.result} />
+                          )}
                           {msg.metadata?.sql && (
                             <SqlBlock sql={msg.metadata.sql} />
                           )}

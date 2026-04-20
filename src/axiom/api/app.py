@@ -1,25 +1,36 @@
 import logging
 import uuid
-
+import json
+from datetime import datetime
 from typing import List, Optional, Dict, Any
+
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from axiom.agent.graph import build_graph
 from axiom.agent.thread import ThreadManager
 from axiom.security.guard import LakeraGuard
 from axiom.api.onboard import run_ingestion
 from axiom.security.auth import verify_token
+from axiom.config import settings
 
 logging.basicConfig(level="INFO")
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Axiom Brain", version="0.1.0")
 
+# --- Security: Robust CORS ---
+# When allow_credentials=True, origins MUST be explicit (no wildcards)
+origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://10.154.99.145:3000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,12 +51,15 @@ async def startup() -> None:
     _rag = SchemaRAG()
 
 
+# --- Models ---
+
 class QueryRequest(BaseModel):
     question: str
     session_id: str = ""
     thread_id: str = ""
     tenant_id: str = "default_tenant"
     source_id: Optional[str] = None
+    model: Optional[str] = None
 
 
 class ApproveRequest(BaseModel):
@@ -53,15 +67,18 @@ class ApproveRequest(BaseModel):
     session_id: str = ""
     tenant_id: str = "default_tenant"
     approved: bool = True
+    model: Optional[str] = None
 
 
 class QueryResponse(BaseModel):
     sql: str
     result: str
+    visualization: Optional[Dict[str, Any]] = None
     session_id: str
     thread_id: str
     tenant_id: str
     status: str = "completed"
+
 
 class SourceIn(BaseModel):
     tenant_id: str
@@ -69,7 +86,18 @@ class SourceIn(BaseModel):
     db_url: str
     db_type: str = "postgresql"
     description: str = ""
-    mcp_config: Optional[Dict[str, Any]] = None
+    mcp_config: Any = None # Use Any to allow raw string from frontend
+
+    @field_validator("mcp_config", mode="before")
+    @classmethod
+    def parse_json_config_in(cls, v: Any) -> Any:
+        if isinstance(v, str) and v.strip():
+            try:
+                return json.loads(v)
+            except Exception:
+                return v
+        return v
+
 
 class SourceOut(BaseModel):
     source_id: str
@@ -79,10 +107,23 @@ class SourceOut(BaseModel):
     db_type: str
     status: str = "active"
     error_message: Optional[str] = None
+    mcp_config: Any = None # CRITICAL: Must be Any to receive raw DB string
+
+    @field_validator("mcp_config", mode="before")
+    @classmethod
+    def parse_json_config_out(cls, v: Any) -> Any:
+        if isinstance(v, str) and v.strip():
+            try:
+                return json.loads(v)
+            except Exception:
+                return v
+        return v
+
 
 class TenantIn(BaseModel):
     name: str
     id: str # Slug
+
 
 class TenantOut(BaseModel):
     id: str
@@ -90,27 +131,30 @@ class TenantOut(BaseModel):
     owner_id: str
     created_at: datetime
 
+
+# --- Internal Helpers ---
+
 import asyncpg
-from axiom.config import settings
 
 async def get_tenant_rules(tenant_id: str) -> str:
     """Database lookup for tenant-specific SQL rules aggregated across all data sources."""
     try:
         conn = await asyncpg.connect(settings.database_url)
         try:
-            # Aggregate custom rules from all data sources for this tenant
             rows = await conn.fetch(
                 "SELECT custom_rules FROM data_sources WHERE tenant_id = $1", 
                 tenant_id
             )
             rules = [r["custom_rules"] for r in rows if r["custom_rules"]]
-            # Deduplicate and join
             return "\n".join(list(set(rules)))
         finally:
             await conn.close()
     except Exception as exc:
         logger.warning("Failed to fetch tenant rules: %s", exc)
         return ""
+
+
+# --- API Endpoints ---
 
 @app.get("/health")
 async def health() -> dict:
@@ -162,27 +206,38 @@ async def create_tenant(req: TenantIn, user_id: str = Depends(verify_token)) -> 
         logger.exception("Failed to create tenant: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
+
 @app.get("/api/sources/{tenant_id}", response_model=List[SourceOut])
 async def list_sources(tenant_id: str, user_id: str = Depends(verify_token)) -> List[SourceOut]:
     try:
         conn = await asyncpg.connect(settings.database_url)
         try:
-            # Security check: Does this user own this tenant?
             owner = await conn.fetchval("SELECT owner_id FROM tenants WHERE id = $1", tenant_id)
+            logger.info("DEBUG: owner=%s, user_id=%s, tenant=%s", owner, user_id, tenant_id)
             if owner != user_id:
                 raise HTTPException(status_code=403, detail="Forbidden: Access to this workspace is restricted.")
 
             rows = await conn.fetch(
-                "SELECT source_id, tenant_id, name, description, db_type, status, error_message FROM data_sources WHERE tenant_id = $1", 
+                "SELECT source_id, tenant_id, name, description, db_type, status, error_message, mcp_config FROM data_sources WHERE tenant_id = $1", 
                 tenant_id
             )
-            return [SourceOut(**dict(r)) for r in rows]
+            # Explicitly parse the rows to ensure mcp_config is dictionary-ready
+            results = []
+            for r in rows:
+                d = dict(r)
+                # If mcp_config is a string, parse it manually here too as a backup
+                if isinstance(d.get("mcp_config"), str):
+                    try:
+                        d["mcp_config"] = json.loads(d["mcp_config"])
+                    except:
+                        pass
+                results.append(SourceOut(**d))
+            return results
         finally:
             await conn.close()
     except HTTPException:
         raise
     except Exception as exc:
-...
         logger.exception("Failed to list sources: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to fetch data sources")
 
@@ -190,7 +245,6 @@ async def list_sources(tenant_id: str, user_id: str = Depends(verify_token)) -> 
 @app.post("/api/sources")
 async def create_source(req: SourceIn, background_tasks: BackgroundTasks, user_id: str = Depends(verify_token)) -> dict:
     try:
-        # Trigger ingestion in background
         background_tasks.add_task(
             run_ingestion,
             tenant_id=req.tenant_id,
@@ -208,13 +262,13 @@ async def create_source(req: SourceIn, background_tasks: BackgroundTasks, user_i
 
 @app.post("/api/sources/{tenant_id}/{source_id}/sync")
 async def sync_source(tenant_id: str, source_id: str, background_tasks: BackgroundTasks, user_id: str = Depends(verify_token)) -> dict:
-    # Security check
-    if tenant_id != user_id:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
     try:
         conn = await asyncpg.connect(settings.database_url)
         try:
+            owner = await conn.fetchval("SELECT owner_id FROM tenants WHERE id = $1", tenant_id)
+            if owner != user_id:
+                raise HTTPException(status_code=403, detail="Forbidden: Access to this workspace is restricted.")
+
             row = await conn.fetchrow(
                 "SELECT db_url, db_type, description, mcp_config FROM data_sources WHERE tenant_id = $1 AND source_id = $2",
                 tenant_id, source_id
@@ -222,7 +276,13 @@ async def sync_source(tenant_id: str, source_id: str, background_tasks: Backgrou
             if not row:
                 raise HTTPException(status_code=404, detail="Source not found")
                 
-            # Trigger ingestion in background
+            mcp_config = row["mcp_config"]
+            if isinstance(mcp_config, str):
+                try:
+                    mcp_config = json.loads(mcp_config)
+                except:
+                    pass
+
             background_tasks.add_task(
                 run_ingestion,
                 tenant_id=tenant_id,
@@ -230,7 +290,7 @@ async def sync_source(tenant_id: str, source_id: str, background_tasks: Backgrou
                 db_url=row["db_url"],
                 db_type=row["db_type"],
                 description=row["description"] or "",
-                mcp_config=json.loads(row["mcp_config"]) if row["mcp_config"] else None
+                mcp_config=mcp_config
             )
             return {"status": "sync_started"}
         finally:
@@ -244,20 +304,23 @@ async def sync_source(tenant_id: str, source_id: str, background_tasks: Backgrou
 
 @app.patch("/api/sources/{tenant_id}/{source_id}")
 async def update_source(tenant_id: str, source_id: str, req: Dict[str, Any], user_id: str = Depends(verify_token)) -> dict:
-    # Security: Ensure user is modifying their own tenant
-    if tenant_id != user_id:
-        raise HTTPException(status_code=403, detail="Forbidden: You can only modify your own sources.")
-        
     try:
         conn = await asyncpg.connect(settings.database_url)
         try:
-            # Dynamically build update query
+            owner = await conn.fetchval("SELECT owner_id FROM tenants WHERE id = $1", tenant_id)
+            logger.info("DEBUG: owner=%s, user_id=%s, tenant=%s", owner, user_id, tenant_id)
+            if owner != user_id:
+                raise HTTPException(status_code=403, detail="Forbidden: You do not have permission to update this source.")
+
             fields = []
             values = []
             for i, (k, v) in enumerate(req.items(), start=1):
-                if k in ["name", "description", "db_url", "db_type", "custom_rules"]:
+                if k in ["name", "description", "db_url", "db_type", "custom_rules", "mcp_config"]:
                     fields.append(f"{k} = ${i}")
-                    values.append(v)
+                    if k == "mcp_config" and v is not None and not isinstance(v, str):
+                        values.append(json.dumps(v))
+                    else:
+                        values.append(v)
             
             if not fields:
                 return {"status": "no_change"}
@@ -270,6 +333,8 @@ async def update_source(tenant_id: str, source_id: str, req: Dict[str, Any], use
             return {"status": "updated", "result": res}
         finally:
             await conn.close()
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Failed to update source: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -277,22 +342,23 @@ async def update_source(tenant_id: str, source_id: str, req: Dict[str, Any], use
 
 @app.delete("/api/sources/{tenant_id}/{source_id}")
 async def delete_source(tenant_id: str, source_id: str, user_id: str = Depends(verify_token)) -> dict:
-    # Security: Ensure user is deleting their own tenant
-    if tenant_id != user_id:
-        raise HTTPException(status_code=403, detail="Forbidden: You can only delete your own sources.")
-
     try:
         conn = await asyncpg.connect(settings.database_url)
         try:
+            owner = await conn.fetchval("SELECT owner_id FROM tenants WHERE id = $1", tenant_id)
+            logger.info("DEBUG: owner=%s, user_id=%s, tenant=%s", owner, user_id, tenant_id)
+            if owner != user_id:
+                raise HTTPException(status_code=403, detail="Forbidden: You do not have permission to delete this source.")
+
             await conn.execute(
                 "DELETE FROM data_sources WHERE tenant_id = $1 AND source_id = $2", 
                 tenant_id, source_id
             )
-            # Optionally: Clean up ChromaDB as well? 
-            # For now, just remove from control plane
             return {"status": "deleted"}
         finally:
             await conn.close()
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Failed to delete source: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -309,13 +375,10 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
         tenant_id = req.tenant_id
         config = {"configurable": {"thread_id": thread_id}}
 
-        # Fetch conversation history and check staleness
         history_context, is_stale = await _thread_mgr.get_context_injection(thread_id, "")
 
-        # Check for exact match in cache
         cached = await _thread_mgr.get_cached_result(thread_id, req.question)
         if cached:
-            logger.info("Cache hit for thread %s", thread_id)
             return QueryResponse(
                 sql=cached["sql"],
                 result=cached["result"],
@@ -324,7 +387,6 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
                 tenant_id=tenant_id
             )
 
-        logger.info("Invoking agent for question: %s [Tenant: %s]", req.question, tenant_id)
         state = await _agent.ainvoke(
             {
                 "question": req.question,
@@ -342,7 +404,9 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
                 "thread_id": thread_id,
                 "history_context": history_context,
                 "is_stale": is_stale,
-                "query_type": "", # Planner will determine this
+                "query_type": "", 
+                "visualization": None,
+                "llm_model": req.model,
             },
             config=config,
         )
@@ -350,24 +414,32 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
         agent_state = await _agent.aget_state(config)
         is_paused = bool(agent_state.next)
 
-        logger.info("Agent execution finished. Paused: %s. Final error: %s", is_paused, state.get("error"))
-        
-        # If there is an error and no result, force a 422 error response
         if state.get("error") and not state.get("sql_result") and not is_paused:
-            logger.error("Agent failed after %d attempts: %s", state.get("attempts", 0), state["error"])
             raise HTTPException(status_code=422, detail=state["error"])
 
         sql = state.get("sql_query") or ""
         result = state.get("sql_result") or ""
         status = "pending_approval" if is_paused else "completed"
+        
+        viz = None
+        if state.get("visualization"):
+            try:
+                viz = json.loads(state["visualization"])
+            except:
+                pass
 
-        # Cache the result for exact match replay
+        # 3. Final Safety Check on generated output
+        if sql and not await _guard.is_safe(sql):
+            logger.warning("Security Violation: Generated SQL blocked by Lakera Guard: %s", sql)
+            raise HTTPException(status_code=400, detail="The generated output violated security policies.")
+
         if sql and result and status == "completed":
             await _thread_mgr.set_cached_result(thread_id, req.question, sql, result)
 
         return QueryResponse(
             sql=sql,
             result=result,
+            visualization=viz,
             session_id=session_id,
             thread_id=thread_id,
             tenant_id=tenant_id,
@@ -385,13 +457,17 @@ async def approve(req: ApproveRequest, user_id: str = Depends(verify_token)) -> 
 
     try:
         config = {"configurable": {"thread_id": req.thread_id}}
+
+        # If a new model is provided during approval, update the state
+        if req.model:
+            await _agent.aupdate_state(config, {"llm_model": req.model})
+
         agent_state = await _agent.aget_state(config)
         
         if not agent_state.next:
             raise HTTPException(status_code=400, detail="No pending action to approve for this thread.")
 
         if not req.approved:
-            # If rejected, we might just want to return a rejected status without continuing
             return QueryResponse(
                 sql=agent_state.values.get("sql_query", ""),
                 result="",
@@ -401,33 +477,42 @@ async def approve(req: ApproveRequest, user_id: str = Depends(verify_token)) -> 
                 status="rejected"
             )
 
-        logger.info("Resuming agent execution for thread %s", req.thread_id)
-        # Pass None to resume from the current state
         state = await _agent.ainvoke(None, config=config)
+        
+        # Check if it paused again (e.g. error -> regenerate -> approval required)
+        agent_state = await _agent.aget_state(config)
+        is_paused = bool(agent_state.next)
 
         sql = state.get("sql_query") or ""
         result = state.get("sql_result") or ""
+        status = "pending_approval" if is_paused else "completed"
+        
+        viz = None
+        if state.get("visualization"):
+            try:
+                viz = json.loads(state["visualization"])
+            except:
+                pass
 
-        if state.get("error") and not state.get("sql_result"):
-            logger.error("Agent failed after %d attempts: %s", state.get("attempts", 0), state["error"])
+        if state.get("error") and not state.get("sql_result") and not is_paused:
             raise HTTPException(status_code=422, detail=state["error"])
 
-        # Cache the result for exact match replay
-        if sql and result:
+        if sql and result and status == "completed":
             question = state.get("question", "")
             source_id = state.get("source_id", "default_source")
             if question:
                 await _thread_mgr.set_cached_result(req.thread_id, question, sql, result)
                 if _rag:
-                    await _rag.ingest_example(source_id, question, sql)
+                    await _rag.search_semantic_cache(req.tenant_id, source_id, question) # Trigger ingest on success
 
         return QueryResponse(
             sql=sql,
             result=result,
+            visualization=viz,
             session_id=req.session_id,
             thread_id=req.thread_id,
             tenant_id=req.tenant_id,
-            status="completed"
+            status=status
         )
     except HTTPException:
         raise

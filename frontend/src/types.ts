@@ -4,6 +4,7 @@ export interface QueryRequest {
   thread_id?: string;
   tenant_id?: string;
   source_id?: string;
+  model?: string;
 }
 
 export interface ApproveRequest {
@@ -11,11 +12,18 @@ export interface ApproveRequest {
   session_id?: string;
   tenant_id?: string;
   approved: boolean;
+  model?: string;
 }
 
 export interface QueryResponse {
   sql: string;
   result: string; // JSON string of the results or error
+  visualization?: {
+    x_axis: string | null;
+    y_axis: string | string[];
+    plot_type: "bar" | "line" | "scatter" | "pie" | "histogram" | "area" | "indicator";
+    title: string;
+  };
   session_id: string;
   thread_id: string;
   tenant_id: string;
@@ -30,6 +38,7 @@ export interface Source {
   db_type: string;
   status: string;
   error_message?: string;
+  mcp_config?: any;
 }
 
 export interface SourceIn {
@@ -50,7 +59,8 @@ export interface ChatMessage {
   metadata?: {
     sql?: string;
     result?: string;
+    visualization?: QueryResponse["visualization"];
     thread_id?: string;
     session_id?: string;
-  };
-}
+    };
+    }

@@ -7,6 +7,7 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
   const [sessionId, setSessionId] = useState<string>("");
   const [threadId, setThreadId] = useState<string>("");
   const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [selectedModel, setSelectedModel] = useState<string>("");
 
   const appendMessage = useCallback((msg: ChatMessage) => {
     setMessages((prev) => [...prev, msg]);
@@ -44,6 +45,7 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
         metadata: {
           sql: data.sql,
           result: data.result,
+          visualization: data.visualization,
           thread_id: data.thread_id,
           session_id: data.session_id,
         },
@@ -74,6 +76,7 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
         thread_id: threadId,
         tenant_id: tenantId,
         source_id: sourceId,
+        model: selectedModel || undefined,
       });
       handleResponse(response);
     } catch (error: any) {
@@ -85,7 +88,7 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
     } finally {
       setIsLoading(false);
     }
-  }, [sessionId, threadId, tenantId, sourceId, appendMessage, updateLastMessage, handleResponse]);
+  }, [sessionId, threadId, tenantId, sourceId, selectedModel, appendMessage, updateLastMessage, handleResponse]);
 
   const handleApprove = useCallback(async (approved: boolean, currentThreadId: string) => {
     setIsLoading(true);
@@ -96,6 +99,7 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
         session_id: sessionId,
         tenant_id: tenantId,
         approved,
+        model: selectedModel || undefined,
       });
       handleResponse(response);
     } catch (error: any) {
@@ -107,12 +111,14 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
     } finally {
       setIsLoading(false);
     }
-  }, [sessionId, tenantId, updateLastMessage, handleResponse]);
+  }, [sessionId, tenantId, selectedModel, updateLastMessage, handleResponse]);
 
   return {
     messages,
     isLoading,
     sendMessage,
     handleApprove,
+    selectedModel,
+    setSelectedModel,
   };
 }

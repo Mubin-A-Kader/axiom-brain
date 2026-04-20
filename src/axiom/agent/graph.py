@@ -2,7 +2,7 @@ import logging
 
 from langgraph.graph import StateGraph, END
 
-from axiom.agent.nodes import SchemaRetrievalNode, SQLGenerationNode, SQLExecutionNode, TableSelectionNode, DatabaseSelectionNode, HumanApprovalNode
+from axiom.agent.nodes import SchemaRetrievalNode, SQLGenerationNode, SQLExecutionNode, TableSelectionNode, DatabaseSelectionNode, HumanApprovalNode, DataStorytellingNode
 from axiom.agent.planner import QueryPlannerNode
 from axiom.agent.state import SQLAgentState
 from axiom.agent.thread import ThreadManager
@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 def _should_correct(state: SQLAgentState) -> str:
     if state.get("error") and state["attempts"] < settings.max_correction_attempts:
         return "generate_sql"
+    if not state.get("error") and state.get("sql_result"):
+        return "visualize_data"
     return END
 
 def _should_approve(state: SQLAgentState) -> str:
@@ -51,6 +53,7 @@ async def build_graph():
     gen_node = SQLGenerationNode(rag)
     exec_node = SQLExecutionNode(thread_mgr)
     approval_node = HumanApprovalNode()
+    viz_node = DataStorytellingNode()
 
     graph = StateGraph(SQLAgentState)
     graph.add_node("route_database", db_routing_node)
@@ -60,6 +63,7 @@ async def build_graph():
     graph.add_node("generate_sql", gen_node)
     graph.add_node("require_approval", approval_node)
     graph.add_node("execute_sql", exec_node)
+    graph.add_node("visualize_data", viz_node)
 
     graph.set_entry_point("route_database")
     graph.add_edge("route_database", "route_tables")
@@ -72,6 +76,7 @@ async def build_graph():
     graph.add_edge("require_approval", "execute_sql")
     
     graph.add_conditional_edges("execute_sql", _should_correct)
+    graph.add_edge("visualize_data", END)
 
     try:
         from langgraph.checkpoint.redis.aio import AsyncRedisSaver

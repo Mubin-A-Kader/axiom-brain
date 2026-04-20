@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     # LLM
     litellm_url: str = "http://localhost:8000"
     litellm_key: str = "sk-axiom-local"
-    llm_model: str = "gemini-2.5-flash"
+    llm_model: str = "gemini-1.5-flash"
     llm_temperature: float = 0.0
 
     # Database
@@ -26,6 +26,7 @@ class Settings(BaseSettings):
 
     # Agent
     max_correction_attempts: int = 3
+    max_schema_tokens: int = 4000
 
     # App
     log_level: str = "info"

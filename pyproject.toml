@@ -23,6 +23,10 @@ dependencies = [
     "aiomysql>=0.3.2",
     "cryptography>=46.0.7",
     "pyjwt>=2.12.1",
+    "sqlglot>=25.0.0",
+    "tiktoken>=0.7.0",
+    "sshtunnel>=0.4.0",
+    "paramiko<4.0.0",
 ]
 
 [project.optional-dependencies]

@@ -15,25 +15,34 @@ export default async function LoginPage({
 
     const email = formData.get('email') as string
     const password = formData.get('password') as string
+    let redirectPath = null;
+    let errorMessage = null;
     
     try {
       const supabase = await createClient()
-
       const { error } = await supabase.auth.signInWithPassword({
         email,
         password,
       })
 
       if (error) {
-        return redirect('/login?message=' + encodeURIComponent(error.message))
+        errorMessage = error.message;
+      } else {
+        redirectPath = '/';
       }
-
-      return redirect('/')
     } catch (err: any) {
       if (err.message?.includes('fetch failed')) {
-        return redirect('/login?message=System Connection Error: Ensure Supabase is running.')
+        errorMessage = 'System Connection Error: Ensure Supabase is running.';
+      } else {
+        throw err;
       }
-      throw err
+    }
+
+    if (errorMessage) {
+      return redirect('/login?message=' + encodeURIComponent(errorMessage));
+    }
+    if (redirectPath) {
+      return redirect(redirectPath);
     }
   }
 
@@ -42,10 +51,10 @@ export default async function LoginPage({
 
     const email = formData.get('email') as string
     const password = formData.get('password') as string
+    let message = null;
     
     try {
       const supabase = await createClient()
-
       const { error } = await supabase.auth.signUp({
         email,
         password,
@@ -55,12 +64,16 @@ export default async function LoginPage({
       })
 
       if (error) {
-        return redirect('/login?message=' + encodeURIComponent(error.message))
+        message = error.message;
+      } else {
+        message = 'Registration successful. You can now authenticate.';
       }
-
-      return redirect('/login?message=Registration successful. You can now authenticate.')
     } catch (err: any) {
-      return redirect('/login?message=Registration failed: ' + encodeURIComponent(err.message))
+      message = 'Registration failed: ' + err.message;
+    }
+
+    if (message) {
+      return redirect('/login?message=' + encodeURIComponent(message));
     }
   }
 
