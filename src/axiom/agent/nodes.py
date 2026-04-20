@@ -334,11 +334,14 @@ class SQLExecutionNode:
     def __init__(self, thread_mgr=None) -> None:
         self._thread_mgr = thread_mgr
 
-    def _is_read_only(self, sql: str) -> bool:
+    def _is_read_only(self, sql: str, db_type: str = "postgresql") -> bool:
         """Use sqlglot to strictly verify the query is a SELECT statement."""
         try:
+            # Map our db_type to sqlglot dialect
+            dialect = "mysql" if db_type.lower() == "mysql" else "postgres"
+            
             # We assume a single statement for now
-            parsed = sqlglot.parse_one(sql, read="postgres") # default to postgres dialect
+            parsed = sqlglot.parse_one(sql, read=dialect)
             
             # Check if it's a SELECT-like statement
             if not isinstance(parsed, (exp.Select, exp.Union, exp.Except, exp.Intersect, exp.With)):
@@ -365,7 +368,8 @@ class SQLExecutionNode:
              return {"sql_result": None, "error": "No SQL query generated."}
         
         # 1. Robust Security Validation
-        safe, sec_error = self._is_read_only(sql)
+        db_type = state.get("db_type", "postgresql")
+        safe, sec_error = self._is_read_only(sql, db_type)
         if not safe:
             logger.error("Security Violation Blocked: %s (Query: %s)", sec_error, sql)
             return {"sql_result": None, "error": f"Security violation: {sec_error}"}
