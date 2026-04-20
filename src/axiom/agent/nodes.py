@@ -345,6 +345,37 @@ class SQLCriticNode:
             api_key=settings.litellm_key,
         )
 
+    async def _execute_investigation(self, state: SQLAgentState, query: str) -> str:
+        """Run a read-only investigation query against the database."""
+        try:
+            from axiom.connectors.factory import ConnectorFactory
+            import asyncpg
+            source_id = state.get("source_id", "default_source")
+            cp_conn = await asyncpg.connect(settings.database_url)
+            try:
+                row = await cp_conn.fetchrow(
+                    "SELECT db_url, db_type, mcp_config FROM data_sources WHERE source_id = $1", 
+                    source_id
+                )
+                if not row: return "Investigation failed: Source not found."
+                db_url = row["db_url"]
+                db_type = row["db_type"]
+                config = json.loads(row["mcp_config"]) if row["mcp_config"] else {}
+            finally:
+                await cp_conn.close()
+
+            connector = await ConnectorFactory.get_connector(source_id, db_type, db_url, config)
+            # Ensure it's a SELECT
+            if not query.strip().upper().startswith("SELECT"):
+                return "Investigation blocked: Only SELECT queries are allowed."
+            
+            result = await connector.execute_query(query)
+            # Limit to 20 rows for context
+            rows = result["rows"][:20]
+            return json.dumps(rows, default=str)
+        except Exception as exc:
+            return f"Investigation execution error: {str(exc)}"
+
     async def __call__(self, state: SQLAgentState) -> dict:
         question = state["question"]
         sql_query = state.get("sql_query", "")
@@ -354,7 +385,35 @@ class SQLCriticNode:
         if not error:
             return {"critic_feedback": None}
 
-        prompt = f"""You are a Senior Database Administrator. Analyze the failed SQL draft against the execution traceback to identify syntax violations, logical errors, or schema mismatches.
+        # If it's a ZERO_RESULTS error, use a specific investigation prompt
+        is_zero_results = "ZERO_RESULTS" in error
+        
+        if is_zero_results:
+            prompt = f"""You are an autonomous SQL Data Engineering Agent diagnosing a "0-Result" (Empty Data) failure.
+The previous query executed successfully but returned zero rows. This often happens because WHERE or JOIN conditions use incorrect literal values (e.g., wrong casing like 'active' vs 'Active', or typos like 'convrted').
+
+### ORIGINAL QUESTION:
+{question}
+
+### SCHEMA CONTEXT:
+{schema_context}
+
+### FAILED (ZERO-RESULT) SQL:
+{sql_query}
+
+### YOUR CAPABILITIES:
+You can investigate the actual data in the database by outputting an investigation query.
+To do this, output exactly this format:
+INVESTIGATE: <your SQL query here>
+
+For example:
+INVESTIGATE: SELECT DISTINCT status FROM orders LIMIT 10
+
+The system will run this query and return the results to you. You can investigate up to 2 times.
+Once you have found the correct values, or if you immediately know how to fix the query, output your final technical instructions for the SQL Generator in exactly this format:
+FEEDBACK: <your actionable instructions here>"""
+        else:
+            prompt = f"""You are a Senior Database Administrator. Analyze the failed SQL draft against the execution traceback to identify syntax violations, logical errors, or schema mismatches.
 Provide exact, technical correction instructions.
 
 ### ORIGINAL QUESTION:
@@ -371,23 +430,44 @@ Provide exact, technical correction instructions.
 
 ### INSTRUCTIONS:
 1. Diagnose the root cause of the error based on the traceback.
-2. Output explicit, technical correction instructions on how to rewrite the query (e.g., "Change the JOIN condition to use user_id instead of id", "Add double quotes around the column name", "Remove the public. prefix").
-3. Do NOT rewrite the full query yourself, just provide the actionable instructions for the SQL Generator.
-4. Keep the feedback concise and strictly technical.
+2. Output explicit, technical correction instructions on how to rewrite the query.
+3. Keep the feedback concise and strictly technical.
+4. Output your final feedback in this format:
+FEEDBACK: <your instructions here>"""
 
-Feedback:"""
-        try:
-            response = await self._client.chat.completions.create(
-                model=state.get("llm_model") or settings.llm_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-            )
-            feedback = response.choices[0].message.content.strip()
-            logger.info("Critic Feedback generated.")
-            return {"critic_feedback": feedback}
-        except Exception as exc:
-            logger.warning("Failed to generate critic feedback: %s", exc)
-            return {"critic_feedback": f"Critic analysis failed. Please fix the original error: {error}"}
+        messages = [{"role": "user", "content": prompt}]
+        
+        max_investigations = 2 if is_zero_results else 0
+        investigations = 0
+        
+        while True:
+            try:
+                response = await self._client.chat.completions.create(
+                    model=state.get("llm_model") or settings.llm_model,
+                    messages=messages,
+                    temperature=0.0,
+                )
+                content = response.choices[0].message.content.strip()
+                messages.append({"role": "assistant", "content": content})
+
+                if content.startswith("INVESTIGATE:") and investigations < max_investigations:
+                    investigations += 1
+                    inv_query = content.replace("INVESTIGATE:", "").strip()
+                    logger.info("Critic investigating: %s", inv_query)
+                    inv_result = await self._execute_investigation(state, inv_query)
+                    logger.info("Critic investigation result: %s", inv_result)
+                    messages.append({
+                        "role": "user", 
+                        "content": f"INVESTIGATION RESULT:\n{inv_result}\n\nIf you need to investigate further, output another INVESTIGATE: query. Otherwise, output your final FEEDBACK: instructions."
+                    })
+                else:
+                    feedback = content.replace("FEEDBACK:", "").strip()
+                    logger.info("Critic Feedback generated.")
+                    return {"critic_feedback": feedback}
+                    
+            except Exception as exc:
+                logger.warning("Failed to generate critic feedback: %s", exc)
+                return {"critic_feedback": f"Critic analysis failed. Please fix the original error: {error}"}
 
 
 class SQLExecutionNode:
@@ -462,21 +542,31 @@ class SQLExecutionNode:
             connector = await ConnectorFactory.get_connector(source_id, db_type, target_db_url, config)
             result = await connector.execute_query(sql)
             
-            # --- RESPONSE LIMITING ---
+            # --- RESPONSE LIMITING & ZERO-RESULT PROTOCOL ---
             all_rows = result["rows"]
-            is_truncated = len(all_rows) > 100
-            display_rows = all_rows[:100] if is_truncated else all_rows
+            attempts = state.get("attempts", 0)
+            
+            # If we get 0 rows and we still have retries left, trigger the investigator
+            if len(all_rows) == 0 and attempts < settings.max_correction_attempts:
+                logger.info("0 rows returned. Triggering Zero-Result Investigation Protocol.")
+                result_update = {
+                    "sql_result": None,
+                    "error": "ZERO_RESULTS: The query executed successfully but returned 0 rows. Please investigate WHERE/JOIN conditions using your investigation tools."
+                }
+            else:
+                is_truncated = len(all_rows) > 100
+                display_rows = all_rows[:100] if is_truncated else all_rows
 
-            # Format to JSON for the LLM/State
-            result_update = {
-                "sql_result": json.dumps({
-                    "columns": result["columns"], 
-                    "rows": display_rows,
-                    "is_truncated": is_truncated,
-                    "total_count": len(all_rows)
-                }, default=str), 
-                "error": None
-            }
+                # Format to JSON for the LLM/State
+                result_update = {
+                    "sql_result": json.dumps({
+                        "columns": result["columns"], 
+                        "rows": display_rows,
+                        "is_truncated": is_truncated,
+                        "total_count": len(all_rows)
+                    }, default=str), 
+                    "error": None
+                }
 
         except Exception as exc:
             logger.warning("SQL execution error: %s", exc)
