@@ -1,4 +1,4 @@
-import { ApproveRequest, QueryRequest, QueryResponse, Source, SourceIn } from "../types";
+import { ApproveRequest, QueryRequest, QueryResponse, Source, SourceIn, Thread, ThreadHistory } from "../types";
 import { createClient } from "./supabase/client";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
@@ -151,5 +151,30 @@ export async function syncSource(tenantId: string, sourceId: string): Promise<{ 
     throw new Error("Failed to sync source");
   }
 
+  return response.json();
+}
+export async function fetchThreads(tenantId: string): Promise<Thread[]> {
+  const headers = await getAuthHeaders();
+  const response = await fetch(`${API_URL}/threads?tenant_id=${tenantId}`, {
+    headers,
+  });
+
+  if (!response.ok) {
+    if (response.status === 401) throw new Error("Unauthorized");
+    throw new Error("Failed to fetch threads");
+  }
+  return response.json();
+}
+
+export async function fetchThreadHistory(threadId: string): Promise<ThreadHistory> {
+  const headers = await getAuthHeaders();
+  const response = await fetch(`${API_URL}/threads/${threadId}`, {
+    headers,
+  });
+
+  if (!response.ok) {
+    if (response.status === 401) throw new Error("Unauthorized");
+    throw new Error("Failed to fetch thread history");
+  }
   return response.json();
 }

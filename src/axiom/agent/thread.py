@@ -2,7 +2,7 @@ import hashlib
 import json
 import logging
 import time
-from typing import TypedDict
+from typing import TypedDict, Any, List
 
 import redis.asyncio as redis
 
@@ -16,6 +16,9 @@ class Turn(TypedDict):
     question: str
     sql: str
     result: str
+    active_filters: list[str]
+    verified_joins: list[str]
+    error_log: list[str]
 
 
 class ThreadManager:
@@ -52,6 +55,9 @@ class ThreadManager:
                     "question": t.get("question", ""),
                     "sql": t.get("sql", ""),
                     "result": t.get("result", ""),
+                    "active_filters": t.get("active_filters", []),
+                    "verified_joins": t.get("verified_joins", []),
+                    "error_log": t.get("error_log", []),
                 }
                 for t in turns if isinstance(t, dict)
             ]
@@ -92,7 +98,17 @@ class ThreadManager:
         context = "\n".join(context_lines)
         return context, is_stale
 
-    async def save_turn(self, thread_id: str, question: str, sql: str, result: str) -> None:
+    async def save_turn(
+        self,
+        thread_id: str,
+        tenant_id: str,
+        question: str,
+        sql: str,
+        result: str,
+        active_filters: list[str] | None = None,
+        verified_joins: list[str] | None = None,
+        error_log: list[str] | None = None,
+    ) -> None:
         """Save a conversation turn to Redis with 24h TTL."""
         client = await self._get_client()
         key = f"axiom:thread:{thread_id}"
@@ -103,12 +119,42 @@ class ThreadManager:
             "question": question,
             "sql": sql,
             "result": result,
+            "active_filters": active_filters or [],
+            "verified_joins": verified_joins or [],
+            "error_log": error_log or [],
         }
         history.append(turn)
         history = history[-self._history_size :]
 
         data = json.dumps({"turns": history, "last_active": time.time()})
         await client.setex(key, 86400, data)
+
+        # Track thread index for listing
+        index_key = f"axiom:tenant:{tenant_id}:threads"
+        await client.sadd(index_key, thread_id)
+        await client.expire(index_key, 86400)
+
+    async def list_threads(self, tenant_id: str) -> list[dict[str, Any]]:
+        """List active threads for a tenant with their last question and timestamp."""
+        client = await self._get_client()
+        index_key = f"axiom:tenant:{tenant_id}:threads"
+        thread_ids = await client.smembers(index_key) # type: ignore
+
+        threads = []
+        for tid in thread_ids:
+            key = f"axiom:thread:{tid}"
+            data = await client.get(key) # type: ignore
+            if data:
+                parsed = json.loads(data)
+                turns = parsed.get("turns", [])
+                last_turn = turns[-1] if turns else {}
+                threads.append({
+                    "thread_id": tid,
+                    "last_question": last_turn.get("question", "New Thread"),
+                    "updated_at": last_turn.get("timestamp", parsed.get("last_active", 0))
+                })
+
+        return sorted(threads, key=lambda x: x["updated_at"], reverse=True)
 
     async def is_stale(self, thread_id: str) -> bool:
         """Check if thread hasn't been active in 30+ minutes."""
@@ -124,14 +170,16 @@ class ThreadManager:
         content = f"{thread_id}:{question}"
         return f"axiom:cache:{hashlib.sha256(content.encode()).hexdigest()}"
 
-    async def get_cached_result(self, thread_id: str, question: str) -> dict | None:
+    async def get_cached_result(self, thread_id: str, question: str) -> dict[str, str] | None:
         """Fetch cached SQL/result if available."""
         client = await self._get_client()
         key = self.cache_key(thread_id, question)
         try:
             data = await client.get(key)
             if data:
-                return json.loads(data)
+                res = json.loads(data)
+                if isinstance(res, dict):
+                    return res
         except Exception:
             pass
         return None

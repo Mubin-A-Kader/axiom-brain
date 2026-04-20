@@ -269,11 +269,12 @@ The target database is {dialect_name.upper()}.
    - Which columns exist in those tables?
    - How do I join them correctly using the foreign keys shown in SCHEMA CONTEXT?
    - Match exact case for identifiers.
-9. Output your thought process inside <thought> tags.
-10. Output the final SQL query inside <sql> tags.
-11. Return ONLY the tags. No other text. No markdown fences.
-12. If you cannot answer the question because the necessary tables/columns do not exist in the schema, output your explanation inside <error> tags and do NOT output any <sql> tags.
-13. DIALECT SPECIFIC RULES:
+9. ZERO-RESULT RECOVERY RULE: If the CRITIC FEEDBACK instructs you to try a completely different JOIN path or to drop a WHERE filter entirely because the previous attempt returned 0 rows, you MUST follow those instructions. Do not stubbornly repeat the exact same JOIN or WHERE clause if it has been proven to fail.
+10. Output your thought process inside <thought> tags.
+11. Output the final SQL query inside <sql> tags.
+12. Return ONLY the tags. No other text. No markdown fences.
+13. If you cannot answer the question because the necessary tables/columns do not exist in the schema, output your explanation inside <error> tags and do NOT output any <sql> tags.
+14. DIALECT SPECIFIC RULES:
 {dialect_rules}
 
 Question: {question}"""
@@ -392,7 +393,7 @@ class SQLCriticNode:
         
         if is_zero_results:
             prompt = f"""You are an autonomous SQL Data Engineering Agent diagnosing a "0-Result" (Empty Data) failure.
-The previous query executed successfully but returned zero rows. This often happens because WHERE or JOIN conditions use incorrect literal values (e.g., wrong casing like 'active' vs 'Active', or typos like 'convrted').
+The previous query executed successfully but returned zero rows. This often happens because WHERE or JOIN conditions use incorrect literal values (e.g., wrong casing like 'active' vs 'Active', or typos like 'convrted'), or because the JOIN keys simply don't match between tables.
 
 ### ORIGINAL QUESTION:
 {question}
@@ -412,18 +413,20 @@ To do this, output exactly this format:
 INVESTIGATE: <your SQL query here>
 
 For example:
-INVESTIGATE: SELECT DISTINCT status FROM orders LIMIT 10
+INVESTIGATE: SELECT * FROM tableA LIMIT 5
 or
-INVESTIGATE: SELECT COUNT(*) FROM tableA a JOIN tableB b ON a.id = b.a_id
+INVESTIGATE: SELECT DISTINCT status FROM orders LIMIT 10
 
 ### INSTRUCTIONS:
-1. You MUST use the INVESTIGATE tool to query the database and check what values actually exist in the filtered columns or if the JOIN keys actually match any rows. DO NOT GUESS.
-2. Identify categorical filters or JOIN conditions that might be too restrictive.
-3. The query might have used a strict formula from the BUSINESS GLOSSARY that doesn't match the actual data.
-4. Output your INVESTIGATE query. The system will run it and give you the results. You can investigate up to 2 times.
-5. Only AFTER you have investigated and found the correct values or the reason for 0 rows, output your final technical instructions for the SQL Generator in exactly this format:
+1. MANDATORY DATA SAMPLING: Your FIRST action MUST be to sample the actual data from the tables involved in the query (especially those in the JOIN clauses). Use `INVESTIGATE: SELECT * FROM <table> LIMIT 5` to see what the data actually looks like.
+2. Are the IDs integers or UUID strings? Are the categorical values capitalized? Do the foreign keys in one table's sample actually exist in the other table's sample? DO NOT GUESS.
+3. Identify categorical filters or JOIN conditions that might be too restrictive or fundamentally broken.
+4. Output your INVESTIGATE query. The system will run it and give you the results. You can investigate up to 3 times.
+5. Only AFTER you have sampled the data and found the correct values or the reason for 0 rows, output your final technical instructions for the SQL Generator in exactly this format:
 FEEDBACK: <your actionable instructions here>
 
+If you discover that a JOIN condition is completely invalid (returns 0 rows), explicitly instruct the SQL Generator to try a different relationship or alternative tables from the schema.
+If you cannot find the correct categorical value, instruct the generator to drop the problematic WHERE filter entirely to at least return some data.
 If you discover the glossary rule is incorrect or too strict based on your investigation, explicitly instruct the SQL Generator to loosen or modify the glossary formula."""
         else:
             prompt = f"""You are a Senior Database Administrator. Analyze the failed SQL draft against the execution traceback to identify syntax violations, logical errors, or schema mismatches.
@@ -453,7 +456,7 @@ FEEDBACK: <your instructions here>"""
 
         messages = [{"role": "user", "content": prompt}]
         
-        max_investigations = 2 if is_zero_results else 0
+        max_investigations = 3 if is_zero_results else 0
         investigations = 0
         
         while True:
@@ -578,9 +581,12 @@ class SQLExecutionNode:
             # If we get 0 rows and we still have retries left, trigger the investigator
             if len(all_rows) == 0 and attempts < settings.max_correction_attempts:
                 logger.info("0 rows returned. Triggering Zero-Result Investigation Protocol.")
+                error_str = "ZERO_RESULTS: The query executed successfully but returned 0 rows. Please investigate WHERE/JOIN conditions using your investigation tools."
+                new_error_log = state.get("error_log", []) + [error_str]
                 result_update = {
                     "sql_result": None,
-                    "error": "ZERO_RESULTS: The query executed successfully but returned 0 rows. Please investigate WHERE/JOIN conditions using your investigation tools."
+                    "error": error_str,
+                    "error_log": new_error_log
                 }
             else:
                 is_truncated = len(all_rows) > 100
@@ -604,9 +610,13 @@ class SQLExecutionNode:
         if self._thread_mgr and state.get("sql_query") and not result_update.get("error"):
             await self._thread_mgr.save_turn(
                 state["thread_id"],
+                state.get("tenant_id", "default"),
                 state["question"],
                 state["sql_query"],
                 result_update.get("sql_result", ""),
+                active_filters=state.get("active_filters", []),
+                verified_joins=state.get("verified_joins", []),
+                error_log=state.get("error_log", []),
             )
         
         return result_update

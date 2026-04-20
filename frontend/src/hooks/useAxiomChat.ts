@@ -1,6 +1,6 @@
 import { useState, useCallback } from "react";
-import { ChatMessage, QueryResponse } from "../types";
-import { askQuestion, approveQuery } from "../lib/api";
+import { ChatMessage, QueryResponse, ThreadHistory } from "../types";
+import { askQuestion, approveQuery, fetchThreadHistory } from "../lib/api";
 
 export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: string) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -11,6 +11,49 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
 
   const appendMessage = useCallback((msg: ChatMessage) => {
     setMessages((prev) => [...prev, msg]);
+  }, []);
+
+  const startNewThread = useCallback(() => {
+    setMessages([]);
+    setThreadId("");
+    // Session ID can persist or be cleared depending on requirements
+  }, []);
+
+  const switchThread = useCallback(async (newThreadId: string) => {
+    setIsLoading(true);
+    setThreadId(newThreadId);
+    setMessages([]);
+    try {
+      const history = await fetchThreadHistory(newThreadId);
+      const newMessages: ChatMessage[] = [];
+      
+      history.turns.forEach((turn, idx) => {
+        // Add user question
+        newMessages.push({
+          id: `history-u-${idx}`,
+          role: "user",
+          content: turn.question
+        });
+        
+        // Add agent response
+        newMessages.push({
+          id: `history-a-${idx}`,
+          role: "agent",
+          content: "", // Content might be in insight or we use thought
+          status: "completed",
+          metadata: {
+            sql: turn.sql,
+            result: turn.result,
+            thread_id: newThreadId
+          }
+        });
+      });
+      setMessages(newMessages);
+    } catch (error) {
+      console.error("Failed to load thread history", error);
+    } finally {
+      setIsLoading(false);
+    }
   }, []);
 
   const updateLastMessage = useCallback((updates: Partial<ChatMessage>) => {
@@ -124,5 +167,8 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
     handleApprove,
     selectedModel,
     setSelectedModel,
+    startNewThread,
+    switchThread,
+    threadId,
   };
-}
+  }

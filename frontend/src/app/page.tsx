@@ -5,9 +5,10 @@ import { useRouter } from "next/navigation";
 import { 
   Database, Check, X, Copy, 
   Terminal, Activity, LayoutDashboard, Settings, 
-  CornerDownLeft, Loader2, AlertCircle, ChevronRight, ChevronDown, Search, Network, Sparkles, Cpu
+  CornerDownLeft, Loader2, AlertCircle, ChevronRight, ChevronDown, Search, Network, Sparkles, Cpu, RefreshCw
 } from "lucide-react";
-import { useAxiomChat } from "../hooks/useAxiomChat";
+import { ChatProvider, useChat } from "../hooks/useAxiomChatContext";
+import { Sidebar } from "../components/Sidebar";
 import { createClient } from "@/lib/supabase/client";
 import { Source } from "../types";
 import {
@@ -266,88 +267,11 @@ function VisualizationRenderer({ visualization, result }: { visualization: any, 
   );
 }
 
-export default function AxiomBrainUI() {
-  const [tenantId, setTenantId] = useState<string | null>(null);
-  const [sources, setSources] = useState<Source[]>([]);
-  const [selectedSourceId, setSelectedSourceId] = useState<string>("");
-  const [mounted, setMounted] = useState(false);
-  const [isVerifying, setIsVerifying] = useState(true);
-  const [connectionError, setConnectionError] = useState<string | null>(null);
-
-  const router = useRouter();
-
-  const checkTenant = async () => {
-    setIsVerifying(true);
-    setConnectionError(null);
-    
-    const supabase = createClient();
-    const { data: { session } } = await supabase.auth.getSession();
-    
-    if (!session) {
-      router.push("/login");
-      return;
-    }
-
-    try {
-      const hostname = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
-      const API_URL = process.env.NEXT_PUBLIC_API_URL || `http://${hostname}:8080`;
-      
-      // Use AbortController for a 5-second timeout
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000);
-      
-      const res = await fetch(`${API_URL}/api/tenant`, {
-        headers: {
-          "Authorization": `Bearer ${session.access_token}`
-        },
-        signal: controller.signal
-      });
-      
-      clearTimeout(timeoutId);
-
-      if (res.ok) {
-        const tenant = await res.json();
-        if (tenant) {
-          setTenantId(tenant.id);
-        } else {
-          router.push("/onboard");
-        }
-      } else {
-        router.push("/onboard");
-      }
-    } catch (err: any) {
-      console.error("Auth check failed", err);
-      if (err.name === 'AbortError') {
-        setConnectionError("Connection timed out. Ensure the backend server is running.");
-      } else {
-        setConnectionError("Unable to reach the Axiom Orchestrator. Check your network connection.");
-      }
-    } finally {
-      setIsVerifying(false);
-    }
-  };
-
-  useEffect(() => {
-    setMounted(true);
-    checkTenant();
-  }, [router]);
-
-  useEffect(() => {
-    if (tenantId) {
-      import("@/lib/api").then(({ fetchSources }) => {
-        fetchSources(tenantId).then((data) => {
-          setSources(data);
-          if (data.length > 0 && !selectedSourceId) {
-            setSelectedSourceId(data[0].source_id);
-          }
-        });
-      });
-    }
-  }, [tenantId, selectedSourceId]);
-
-  const { messages, isLoading, sendMessage, handleApprove, selectedModel, setSelectedModel } = useAxiomChat(tenantId || "default", selectedSourceId);
+function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }: any) {
+  const { messages, isLoading, sendMessage, handleApprove, selectedModel, setSelectedModel } = useChat();
   const [input, setInput] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const router = useRouter();
 
   useEffect(() => {
     if (messagesEndRef.current) {
@@ -361,35 +285,6 @@ export default function AxiomBrainUI() {
     sendMessage(input.trim());
     setInput("");
   };
-
-  if (!mounted || isVerifying || !tenantId) {
-    return (
-      <div className="h-full w-full flex items-center justify-center bg-[#1E1E1C]">
-        <div className="flex flex-col items-center gap-6 max-w-xs text-center">
-          {connectionError ? (
-            <>
-              <div className="w-12 h-12 rounded-full bg-[rgba(194,109,92,0.1)] flex items-center justify-center text-[#C26D5C] mb-2">
-                <AlertCircle className="w-6 h-6" />
-              </div>
-              <div className="space-y-2">
-                <p className="text-sm font-mono text-[#E6E1D8] uppercase tracking-widest font-bold">Orchestrator Offline</p>
-                <p className="text-xs text-[#E6E1D8]/50 leading-relaxed">{connectionError}</p>
-              </div>
-              <TactileButton variant="outline" onClick={checkTenant} className="mt-2">
-                <RefreshCw className="w-3.5 h-3.5 mr-2" />
-                Retry Connection
-              </TactileButton>
-            </>
-          ) : (
-            <>
-              <Loader2 className="w-8 h-8 animate-spin text-[#638A70]" />
-              <p className="text-sm font-mono text-[#E6E1D8]/30 uppercase tracking-widest">Securing Connection...</p>
-            </>
-          )}
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div className="h-full flex flex-col relative overflow-hidden">
@@ -406,7 +301,7 @@ export default function AxiomBrainUI() {
               {sources.length === 0 ? (
                 <option value="">No Sources Onboarded</option>
               ) : (
-                sources.map(s => (
+                sources.map((s: any) => (
                   <option key={s.source_id} value={s.source_id}>{s.name} ({s.source_id})</option>
                 ))
               )}
@@ -545,6 +440,15 @@ export default function AxiomBrainUI() {
 
                       {msg.status === "completed" && !msg.isError && (
                         <div className="space-y-6">
+                          {msg.metadata?.thought && (
+                            <div className="text-sm text-[#E6E1D8]/80 bg-[#1E1E1C]/80 p-5 rounded-lg border border-[rgba(255,255,255,0.05)] shadow-inner font-mono">
+                              <div className="flex items-center gap-2 mb-3 text-[#638A70] text-xs uppercase tracking-wider font-bold">
+                                <Terminal className="w-3.5 h-3.5" />
+                                Agent Reasoning
+                              </div>
+                              <div className="whitespace-pre-wrap leading-relaxed">{msg.metadata.thought}</div>
+                            </div>
+                          )}
                           {msg.content && (
                             <div className="text-[#E6E1D8] text-base leading-relaxed max-w-2xl animate-in fade-in slide-in-from-left-2 duration-500">
                               {msg.content}
@@ -612,5 +516,143 @@ export default function AxiomBrainUI() {
         </div>
       </div>
     </div>
+  );
+}
+
+function SidebarConsumer() {
+  const { threads, isThreadsLoading, activeThreadId, switchThread, startNewThread } = useChat();
+  return (
+    <Sidebar 
+      threads={threads} 
+      isThreadsLoading={isThreadsLoading}
+      activeThreadId={activeThreadId} 
+      onThreadSelect={switchThread} 
+      onNewThread={startNewThread} 
+    />
+  );
+}
+
+export default function AxiomBrainUI() {
+  const [tenantId, setTenantId] = useState<string | null>(null);
+  const [sources, setSources] = useState<Source[]>([]);
+  const [selectedSourceId, setSelectedSourceId] = useState<string>("");
+  const [mounted, setMounted] = useState(false);
+  const [isVerifying, setIsVerifying] = useState(true);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+
+  const router = useRouter();
+
+  const checkTenant = async () => {
+    setIsVerifying(true);
+    setConnectionError(null);
+    
+    const supabase = createClient();
+    const { data: { session } } = await supabase.auth.getSession();
+    
+    if (!session) {
+      router.push("/login");
+      return;
+    }
+
+    try {
+      const hostname = typeof window !== 'undefined' ? window.location.hostname : '127.0.0.1';
+      const API_URL = process.env.NEXT_PUBLIC_API_URL || `http://${hostname}:8080`;
+      
+      // Use AbortController for a 5-second timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+      
+      const res = await fetch(`${API_URL}/api/tenant`, {
+        headers: {
+          "Authorization": `Bearer ${session.access_token}`
+        },
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+
+      if (res.ok) {
+        const tenant = await res.json();
+        if (tenant) {
+          setTenantId(tenant.id);
+        } else {
+          router.push("/onboard");
+        }
+      } else {
+        router.push("/onboard");
+      }
+    } catch (err: any) {
+      console.error("Auth check failed", err);
+      if (err.name === 'AbortError') {
+        setConnectionError("Connection timed out. Ensure the backend server is running.");
+      } else {
+        setConnectionError("Unable to reach the Axiom Orchestrator. Check your network connection.");
+      }
+    } finally {
+      setIsVerifying(false);
+    }
+  };
+
+  useEffect(() => {
+    setMounted(true);
+    checkTenant();
+  }, [router]);
+
+  useEffect(() => {
+    if (tenantId) {
+      import("@/lib/api").then(({ fetchSources }) => {
+        fetchSources(tenantId).then((data) => {
+          setSources(data);
+          if (data.length > 0 && !selectedSourceId) {
+            setSelectedSourceId(data[0].source_id);
+          }
+        });
+      });
+    }
+  }, [tenantId, selectedSourceId]);
+
+  if (!mounted || isVerifying || !tenantId) {
+    return (
+      <div className="h-full w-full flex items-center justify-center bg-[#1E1E1C]">
+        <div className="flex flex-col items-center gap-6 max-w-xs text-center">
+          {connectionError ? (
+            <>
+              <div className="w-12 h-12 rounded-full bg-[rgba(194,109,92,0.1)] flex items-center justify-center text-[#C26D5C] mb-2">
+                <AlertCircle className="w-6 h-6" />
+              </div>
+              <div className="space-y-2">
+                <p className="text-sm font-mono text-[#E6E1D8] uppercase tracking-widest font-bold">Orchestrator Offline</p>
+                <p className="text-xs text-[#E6E1D8]/50 leading-relaxed">{connectionError}</p>
+              </div>
+              <TactileButton variant="outline" onClick={checkTenant} className="mt-2">
+                <RefreshCw className="w-3.5 h-3.5 mr-2" />
+                Retry Connection
+              </TactileButton>
+            </>
+          ) : (
+            <>
+              <Loader2 className="w-8 h-8 animate-spin text-[#638A70]" />
+              <p className="text-sm font-mono text-[#E6E1D8]/30 uppercase tracking-widest">Securing Connection...</p>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <ChatProvider tenantId={tenantId} selectedSourceId={selectedSourceId}>
+      <div className="flex w-full h-screen overflow-hidden">
+        <SidebarConsumer />
+        <main className="flex-1 h-full overflow-hidden">
+          <ChatInner 
+            tenantId={tenantId} 
+            sources={sources} 
+            selectedSourceId={selectedSourceId} 
+            setSelectedSourceId={setSelectedSourceId} 
+          />
+        </main>
+      </div>
+    </ChatProvider>
   );
 }

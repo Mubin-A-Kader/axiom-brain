@@ -3,6 +3,7 @@ import logging
 from langgraph.graph import StateGraph, END
 
 from axiom.agent.nodes import SchemaRetrievalNode, SQLGenerationNode, SQLExecutionNode, TableSelectionNode, DatabaseSelectionNode, HumanApprovalNode, DataStorytellingNode, ResponseSynthesizerNode, SQLCriticNode
+from axiom.agent.memory_manager import MemoryManagerNode
 from axiom.agent.planner import QueryPlannerNode
 from axiom.agent.state import SQLAgentState
 from axiom.agent.thread import ThreadManager
@@ -49,6 +50,7 @@ async def build_graph():
     rag = SchemaRAG()
     thread_mgr = ThreadManager()
 
+    memory_node = MemoryManagerNode()
     db_routing_node = DatabaseSelectionNode()
     routing_node = TableSelectionNode(rag)
     schema_node = SchemaRetrievalNode(rag)
@@ -61,6 +63,7 @@ async def build_graph():
     synthesizer_node = ResponseSynthesizerNode()
 
     graph = StateGraph(SQLAgentState)
+    graph.add_node("memory_manager", memory_node)
     graph.add_node("route_database", db_routing_node)
     graph.add_node("route_tables", routing_node)
     graph.add_node("retrieve_schema", schema_node)
@@ -72,7 +75,8 @@ async def build_graph():
     graph.add_node("visualize_data", viz_node)
     graph.add_node("synthesize_response", synthesizer_node)
 
-    graph.set_entry_point("route_database")
+    graph.set_entry_point("memory_manager")
+    graph.add_edge("memory_manager", "route_database")
     graph.add_edge("route_database", "route_tables")
     graph.add_edge("route_tables", "retrieve_schema")
     graph.add_edge("retrieve_schema", "plan_query")

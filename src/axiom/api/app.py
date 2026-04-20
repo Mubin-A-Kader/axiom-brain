@@ -409,6 +409,30 @@ async def delete_source(tenant_id: str, source_id: str, user_id: str = Depends(v
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/threads")
+async def list_threads(tenant_id: str = "default_tenant", user_id: str = Depends(verify_token)) -> List[Dict[str, Any]]:
+    try:
+        if _thread_mgr is None:
+             raise HTTPException(status_code=500, detail="Thread manager not initialized")
+        threads = await _thread_mgr.list_threads(tenant_id)
+        return threads
+    except Exception as exc:
+        logger.exception("Failed to list threads: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/threads/{thread_id}")
+async def get_thread_history(thread_id: str, user_id: str = Depends(verify_token)) -> Dict[str, Any]:
+    try:
+        if _thread_mgr is None:
+             raise HTTPException(status_code=500, detail="Thread manager not initialized")
+        history = await _thread_mgr.get_history(thread_id)
+        return {"turns": history}
+    except Exception as exc:
+        logger.exception("Failed to fetch thread history: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @app.post("/query", response_model=QueryResponse)
 async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> QueryResponse:
     try:
@@ -558,6 +582,17 @@ async def approve(req: ApproveRequest, user_id: str = Depends(verify_token)) -> 
             source_id = state.get("source_id", "default_source")
             if question:
                 await _thread_mgr.set_cached_result(req.thread_id, question, sql, result)
+                # Ensure we index this thread for the tenant if it was a successful execution
+                await _thread_mgr.save_turn(
+                    req.thread_id,
+                    req.tenant_id,
+                    question,
+                    sql,
+                    result,
+                    active_filters=state.get("active_filters", []),
+                    verified_joins=state.get("verified_joins", []),
+                    error_log=state.get("error_log", []),
+                )
                 if _rag:
                     await _rag.search_semantic_cache(req.tenant_id, source_id, question) # Trigger ingest on success
 

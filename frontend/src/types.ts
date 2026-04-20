@@ -70,3 +70,21 @@ export interface ChatMessage {
     session_id?: string;
   };
 }
+
+export interface Thread {
+  thread_id: string;
+  last_question: string;
+  updated_at: number;
+}
+
+export interface ThreadHistory {
+  turns: {
+    timestamp: number;
+    question: string;
+    sql: string;
+    result: any;
+    active_filters?: string[];
+    verified_joins?: string[];
+    error_log?: string[];
+  }[];
+}

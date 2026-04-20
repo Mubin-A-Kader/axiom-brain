@@ -26,3 +26,6 @@ class SQLAgentState(TypedDict):
     agent_thought: Optional[str]
     critic_feedback: Optional[str]
     logical_blueprint: Optional[str]
+    active_filters: list[str]
+    verified_joins: list[str]
+    error_log: list[str]
