@@ -37,7 +37,19 @@ class DatabaseSelectionNode:
     async def __call__(self, state: SQLAgentState) -> dict:
         # If source_id is already provided (explicitly via API), skip routing
         if state.get("source_id"):
-            return {"source_id": state["source_id"]}
+            source_id = state["source_id"]
+            logger.info("Skipping database routing, source_id already provided: %s", source_id)
+
+            # We still need to know the db_type for the generator
+            cp_conn = await asyncpg.connect(settings.database_url)
+            try:
+                db_type = await cp_conn.fetchval(
+                    "SELECT db_type FROM data_sources WHERE source_id = $1", 
+                    source_id
+                )
+                return {"source_id": source_id, "db_type": db_type or "postgresql"}
+            finally:
+                await cp_conn.close()
 
         tenant_id = state["tenant_id"]
         question = state["question"]
@@ -46,44 +58,47 @@ class DatabaseSelectionNode:
         cp_conn = await asyncpg.connect(settings.database_url)
         try:
             sources = await cp_conn.fetch(
-                "SELECT source_id, description FROM data_sources WHERE tenant_id = $1", 
+                "SELECT source_id, description, db_type FROM data_sources WHERE tenant_id = $1 AND status = 'active'", 
                 tenant_id
             )
         finally:
             await cp_conn.close()
 
         if not sources:
-            return {"source_id": "default_tenant"} # Fallback
-        
+            logger.warning("No active sources found for tenant %s. Falling back.", tenant_id)
+            return {"source_id": "default_tenant", "db_type": "postgresql"} # Fallback
+
         if len(sources) == 1:
-            return {"source_id": sources[0]["source_id"]}
+            logger.info("Single source found for tenant, auto-selecting: %s", sources[0]["source_id"])
+            return {"source_id": sources[0]["source_id"], "db_type": sources[0]["db_type"]}
 
         # 2. Let the LLM pick the best source based on descriptions
-        source_list = "\n".join([f"- {s['source_id']}: {s['description']}" for s in sources])
+        source_list = "\n".join([f"- {s['source_id']} ({s['db_type']}): {s['description']}" for s in sources])
         prompt = f"""You are a database router.
-A user asked: "{question}"
-Which of the following databases is most likely to contain the answer?
+    A user asked: "{question}"
+    Which of the following databases is most likely to contain the answer?
 
-### AVAILABLE DATABASES:
-{source_list}
+    ### AVAILABLE DATABASES:
+    {source_list}
 
-Respond ONLY with the source_id. No other text."""
+    Respond ONLY with the source_id. No other text."""
 
         response = await self._client.chat.completions.create(
             model=state.get("llm_model") or settings.llm_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
         )
-        
-        selected_id = response.choices[0].message.content.strip()
-        
-        # Verify it's a valid ID from our list
-        valid_ids = [s["source_id"] for s in sources]
-        if selected_id not in valid_ids:
-            selected_id = valid_ids[0] # Fallback to first
 
-        logger.info("Routed query to database source: %s", selected_id)
-        return {"source_id": selected_id}
+        selected_id = response.choices[0].message.content.strip()
+
+        # Verify it's a valid ID from our list and get its db_type
+        selected_source = next((s for s in sources if s["source_id"] == selected_id), sources[0])
+        selected_id = selected_source["source_id"]
+        db_type = selected_source["db_type"]
+
+        logger.info("Routed query to database source: %s (%s)", selected_id, db_type)
+        return {"source_id": selected_id, "db_type": db_type}
+
 
 
 class TableSelectionNode:
@@ -205,8 +220,10 @@ class SQLGenerationNode:
         query_type = state.get("query_type", "NEW_TOPIC")
         custom_rules = state.get("custom_rules", "")
         few_shot_examples = state.get("few_shot_examples", "")
+        db_type = state.get("db_type", "postgresql")
 
         base = f"""You are a precise SQL expert and Enterprise Data Analyst. 
+The target database is {db_type.upper()}.
 
 ### SCHEMA CONTEXT:
 {schema_context}
@@ -241,17 +258,18 @@ class SQLGenerationNode:
 11. Output the final SQL query inside <sql> tags.
 12. Return ONLY the tags. No other text. No markdown fences.
 13. If you cannot answer the question because the necessary tables/columns do not exist in the schema, output your explanation inside <error> tags and do NOT output any <sql> tags.
-14. SCHEMA QUALIFICATION (STRICT): Always use the fully qualified table name (e.g., "public"."users" or "auth"."sessions") as shown in the SCHEMA CONTEXT. Never assume a default schema.
-15. STRICT QUOTING RULE: Identify if the target database is PostgreSQL or MySQL.
+14. SCHEMA QUALIFICATION (STRICT): 
+    - In PostgreSQL, use the fully qualified table name (e.g., "public"."users" or "auth"."sessions") as shown in the SCHEMA CONTEXT.
+    - In MySQL, do NOT use "public" or other schema prefixes unless they are explicitly part of the database name in the SCHEMA CONTEXT.
+15. STRICT QUOTING RULE: 
     - In PostgreSQL, you MUST enclose any column or table name that contains an uppercase letter in double quotes (e.g., "packageId", "UserOrders"). 
-    - Do NOT double-quote standard snake_case columns or lowercase table names (e.g., use user_id, not "user_id").
     - In MySQL, use backticks (`) for mixed-case identifiers.
     - Always match the EXACT case shown in the SCHEMA CONTEXT.
 16. PREFER NAMES OVER IDs (STRICT): Technical IDs and UUIDs (e.g., "userId", "f47ac10b...") are useless to human users.
     - You MUST NOT return technical IDs/UUIDs in your final SELECT list if a human-readable name, email, or label exists in a related table.
     - If your primary table only has technical IDs, you MUST JOIN with the corresponding entity table (e.g., "users", "customers", "profiles") to retrieve descriptive columns like "name", "full_name", or "email".
     - Even if the user doesn't explicitly ask for a "name", assume they want human-readable labels instead of technical hashes.
-17. QUOTING IDENTIFIERS: Always wrap schema, table, and column names in double quotes (e.g., "public"."Users") if they are shown as such in the SCHEMA CONTEXT.
+17. QUOTING IDENTIFIERS: Always wrap schema, table, and column names in double quotes (for Postgres) or backticks (for MySQL) if they are shown as such in the SCHEMA CONTEXT.
 
 Question: {question}"""
         if error:

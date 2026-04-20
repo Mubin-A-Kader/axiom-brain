@@ -13,40 +13,53 @@ class SchemaRAG:
             headers={"X-Chroma-Token": settings.chroma_token}
         )
         self._collection = self._client.get_or_create_collection(settings.chroma_collection)
+        # key: f"{tenant_id}_{source_id}"
         self._graphs: dict[str, nx.Graph] = {}
         self._encoding = tiktoken.get_encoding("cl100k_base")
-        self._load_from_chroma()
 
     def _count_tokens(self, text: str) -> int:
         return len(self._encoding.encode(text))
 
-    def _load_from_chroma(self) -> None:
+    def _ensure_graph_loaded(self, tenant_id: str, source_id: str) -> nx.Graph:
+        graph_key = f"{tenant_id}_{source_id}"
+        if graph_key in self._graphs:
+            return self._graphs[graph_key]
+        
+        graph = nx.Graph()
         try:
-            existing = self._collection.get(where={"type": "schema"}, include=["metadatas"])
-            if not existing or not existing["metadatas"]:
-                return
-            for table_id, meta in zip(existing["ids"], existing["metadatas"]):
-                source_id = meta.get("source_id", "default")
-                table_name = meta.get("table", table_id)
-                if source_id not in self._graphs:
-                    self._graphs[source_id] = nx.Graph()
-                cols = meta.get("columns", "").split(",") if meta.get("columns") else []
-                self._graphs[source_id].add_node(table_name, columns=[c.strip() for c in cols if c.strip()])
-        except Exception:
-            pass
+            # Only load schema metadata for this specific tenant + source
+            existing = self._collection.get(
+                where={"$and": [
+                    {"type": "schema"},
+                    {"tenant_id": tenant_id},
+                    {"source_id": source_id}
+                ]}, 
+                include=["metadatas"]
+            )
+            if existing and existing["metadatas"]:
+                for table_id, meta in zip(existing["ids"], existing["metadatas"]):
+                    table_name = meta.get("table", table_id)
+                    cols = meta.get("columns", "").split(",") if meta.get("columns") else []
+                    graph.add_node(table_name, columns=[c.strip() for c in cols if c.strip()])
+                    # We might need to store edges in metadata too if we want full recovery from Chroma
+        except Exception as e:
+            logger.warning("Failed to load graph from Chroma for %s: %s", graph_key, e)
+            
+        self._graphs[graph_key] = graph
+        return graph
 
     def ingest(self, tenant_id: str, source_id: str, tables: dict) -> None:
         """Load table DDL strings and foreign-key relationships into ChromaDB + NetworkX."""
-        if source_id not in self._graphs:
-            self._graphs[source_id] = nx.Graph()
+        graph_key = f"{tenant_id}_{source_id}"
+        graph = self._ensure_graph_loaded(tenant_id, source_id)
             
         docs, ids, metas = [], [], []
         summary_docs, summary_ids, summary_metas = [], [], []
         
         for table_name, meta in tables.items():
-            self._graphs[source_id].add_node(table_name, columns=meta.get("columns", []))
+            graph.add_node(table_name, columns=meta.get("columns", []))
             for fk in meta.get("foreign_keys", []):
-                self._graphs[source_id].add_edge(table_name, fk["references"], via=fk["column"])
+                graph.add_edge(table_name, fk["references"], via=fk["column"])
             
             # Full DDL for precise generation
             docs.append(meta["ddl"])
@@ -183,7 +196,7 @@ class SchemaRAG:
             return "No schema context found."
             
         related: set[str] = set(tables)
-        graph = self._graphs.get(source_id, nx.Graph())
+        graph = self._ensure_graph_loaded(tenant_id, source_id)
         
         # Priority 1: Exact tables
         # Priority 2: Direct neighbors

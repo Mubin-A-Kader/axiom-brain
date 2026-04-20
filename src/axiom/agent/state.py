@@ -10,6 +10,7 @@ class SQLAgentState(TypedDict):
     custom_rules: str
     tenant_id: str
     source_id: Optional[str]
+    db_type: Optional[str]
     sql_query: Optional[str]
     sql_result: Optional[str]
     error: Optional[str]
