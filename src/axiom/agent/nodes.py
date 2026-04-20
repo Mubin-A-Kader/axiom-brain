@@ -221,6 +221,7 @@ class SQLGenerationNode:
         custom_rules = state.get("custom_rules", "")
         few_shot_examples = state.get("few_shot_examples", "")
         db_type = state.get("db_type", "postgresql")
+        critic_feedback = state.get("critic_feedback")
 
         from axiom.connectors.factory import ConnectorFactory
         dialect_name, dialect_rules = await ConnectorFactory.get_dialect_info(db_type)
@@ -264,7 +265,9 @@ The target database is {dialect_name.upper()}.
 {dialect_rules}
 
 Question: {question}"""
-        if error:
+        if critic_feedback:
+            base += f"\n\n### CRITIC FEEDBACK (PREVIOUS ATTEMPT FAILED):\n{critic_feedback}\n\nUpdate your query strictly following this technical feedback."
+        elif error:
             base += f"\n\n### PREVIOUS ATTEMPT FAILED:\n{error}\n\nReview the SCHEMA CONTEXT carefully. \n- If the error is \"relation ... does not exist\", you likely forgot the schema prefix (e.g. use \"public\".\"tableName\" instead of \"tableName\").\n- If the error suggests a column or table name that exists but with different capitalization, you MUST use double quotes around that name (e.g., \"membershipFees\")."
         return base
 
@@ -320,6 +323,60 @@ Question: {question}"""
             sql = content.replace("```sql", "").replace("```", "").strip()
             
         return {"sql_query": sql, "error": None, "agent_thought": thought, "attempts": state["attempts"] + 1}
+
+
+class SQLCriticNode:
+    """Analyze failed SQL drafts against execution tracebacks to identify errors and provide feedback."""
+    def __init__(self) -> None:
+        import openai
+        self._client = openai.AsyncOpenAI(
+            base_url=f"{settings.litellm_url}/v1",
+            api_key=settings.litellm_key,
+        )
+
+    async def __call__(self, state: SQLAgentState) -> dict:
+        question = state["question"]
+        sql_query = state.get("sql_query", "")
+        error = state.get("error", "")
+        schema_context = state.get("schema_context", "")
+
+        if not error:
+            return {"critic_feedback": None}
+
+        prompt = f"""You are a Senior Database Administrator. Analyze the failed SQL draft against the execution traceback to identify syntax violations, logical errors, or schema mismatches.
+Provide exact, technical correction instructions.
+
+### ORIGINAL QUESTION:
+{question}
+
+### SCHEMA CONTEXT:
+{schema_context}
+
+### FAILED SQL DRAFT:
+{sql_query}
+
+### EXECUTION TRACEBACK ERROR:
+{error}
+
+### INSTRUCTIONS:
+1. Diagnose the root cause of the error based on the traceback.
+2. Output explicit, technical correction instructions on how to rewrite the query (e.g., "Change the JOIN condition to use user_id instead of id", "Add double quotes around the column name", "Remove the public. prefix").
+3. Do NOT rewrite the full query yourself, just provide the actionable instructions for the SQL Generator.
+4. Keep the feedback concise and strictly technical.
+
+Feedback:"""
+        try:
+            response = await self._client.chat.completions.create(
+                model=state.get("llm_model") or settings.llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+            )
+            feedback = response.choices[0].message.content.strip()
+            logger.info("Critic Feedback generated.")
+            return {"critic_feedback": feedback}
+        except Exception as exc:
+            logger.warning("Failed to generate critic feedback: %s", exc)
+            return {"critic_feedback": f"Critic analysis failed. Please fix the original error: {error}"}
 
 
 class SQLExecutionNode:

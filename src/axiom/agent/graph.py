@@ -2,7 +2,7 @@ import logging
 
 from langgraph.graph import StateGraph, END
 
-from axiom.agent.nodes import SchemaRetrievalNode, SQLGenerationNode, SQLExecutionNode, TableSelectionNode, DatabaseSelectionNode, HumanApprovalNode, DataStorytellingNode, ResponseSynthesizerNode
+from axiom.agent.nodes import SchemaRetrievalNode, SQLGenerationNode, SQLExecutionNode, TableSelectionNode, DatabaseSelectionNode, HumanApprovalNode, DataStorytellingNode, ResponseSynthesizerNode, SQLCriticNode
 from axiom.agent.planner import QueryPlannerNode
 from axiom.agent.state import SQLAgentState
 from axiom.agent.thread import ThreadManager
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 def _should_correct(state: SQLAgentState) -> str:
     if state.get("error") and state["attempts"] < settings.max_correction_attempts:
-        return "generate_sql"
+        return "critic"
     if not state.get("error") and state.get("sql_result"):
         return "visualize_data"
     return END
@@ -54,6 +54,7 @@ async def build_graph():
     schema_node = SchemaRetrievalNode(rag)
     planner_node = QueryPlannerNode()
     gen_node = SQLGenerationNode(rag)
+    critic_node = SQLCriticNode()
     exec_node = SQLExecutionNode(thread_mgr)
     approval_node = HumanApprovalNode()
     viz_node = DataStorytellingNode()
@@ -65,6 +66,7 @@ async def build_graph():
     graph.add_node("retrieve_schema", schema_node)
     graph.add_node("plan_query", planner_node)
     graph.add_node("generate_sql", gen_node)
+    graph.add_node("critic", critic_node)
     graph.add_node("require_approval", approval_node)
     graph.add_node("execute_sql", exec_node)
     graph.add_node("visualize_data", viz_node)
@@ -81,6 +83,7 @@ async def build_graph():
     graph.add_edge("require_approval", "execute_sql")
     
     graph.add_conditional_edges("execute_sql", _should_correct)
+    graph.add_edge("critic", "generate_sql")
     graph.add_edge("visualize_data", "synthesize_response")
     graph.add_edge("synthesize_response", END)
 

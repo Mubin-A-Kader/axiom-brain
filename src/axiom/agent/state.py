@@ -24,3 +24,4 @@ class SQLAgentState(TypedDict):
     llm_model: Optional[str]
     response_text: Optional[str]
     agent_thought: Optional[str]
+    critic_feedback: Optional[str]
