@@ -413,15 +413,18 @@ INVESTIGATE: <your SQL query here>
 
 For example:
 INVESTIGATE: SELECT DISTINCT status FROM orders LIMIT 10
+or
+INVESTIGATE: SELECT COUNT(*) FROM tableA a JOIN tableB b ON a.id = b.a_id
 
 ### INSTRUCTIONS:
-1. Identify categorical filters or JOIN conditions that might be too restrictive.
-2. The query might have used a strict formula from the BUSINESS GLOSSARY that doesn't match the actual data (e.g., the glossary says status = 'paid' but the database uses 'PAID').
-3. Investigate the actual data using the INVESTIGATE tool. You can investigate up to 2 times.
-4. Once you find the correct values, output your final technical instructions for the SQL Generator in exactly this format:
+1. You MUST use the INVESTIGATE tool to query the database and check what values actually exist in the filtered columns or if the JOIN keys actually match any rows. DO NOT GUESS.
+2. Identify categorical filters or JOIN conditions that might be too restrictive.
+3. The query might have used a strict formula from the BUSINESS GLOSSARY that doesn't match the actual data.
+4. Output your INVESTIGATE query. The system will run it and give you the results. You can investigate up to 2 times.
+5. Only AFTER you have investigated and found the correct values or the reason for 0 rows, output your final technical instructions for the SQL Generator in exactly this format:
 FEEDBACK: <your actionable instructions here>
 
-If you discover the glossary rule is incorrect or too strict based on your investigation, explicitly instruct the SQL Generator to loosen or modify the glossary formula (e.g. "Modify the glossary rule to use 'PAID' instead of 'paid'")."""
+If you discover the glossary rule is incorrect or too strict based on your investigation, explicitly instruct the SQL Generator to loosen or modify the glossary formula."""
         else:
             prompt = f"""You are a Senior Database Administrator. Analyze the failed SQL draft against the execution traceback to identify syntax violations, logical errors, or schema mismatches.
 Provide exact, technical correction instructions.
@@ -463,9 +466,20 @@ FEEDBACK: <your instructions here>"""
                 content = response.choices[0].message.content.strip()
                 messages.append({"role": "assistant", "content": content})
 
-                if content.startswith("INVESTIGATE:") and investigations < max_investigations:
+                import re
+                
+                # Look for INVESTIGATE followed optionally by markdown sql block
+                inv_match = re.search(r"INVESTIGATE:\s*```(?:sql)?\s*(.*?)\s*```", content, re.IGNORECASE | re.DOTALL)
+                if not inv_match:
+                    # Fallback to capturing the rest of the line if no markdown block
+                    inv_match = re.search(r"INVESTIGATE:\s*([^\n]+)", content, re.IGNORECASE)
+                
+                # If the content explicitly contains FEEDBACK: block, prioritize that over investigation if it's the final output
+                feedback_match = re.search(r"FEEDBACK:\s*(.*)", content, re.IGNORECASE | re.DOTALL)
+                
+                if inv_match and not feedback_match and investigations < max_investigations:
                     investigations += 1
-                    inv_query = content.replace("INVESTIGATE:", "").strip()
+                    inv_query = inv_match.group(1).strip()
                     logger.info("Critic investigating: %s", inv_query)
                     inv_result = await self._execute_investigation(state, inv_query)
                     logger.info("Critic investigation result: %s", inv_result)
@@ -474,7 +488,9 @@ FEEDBACK: <your instructions here>"""
                         "content": f"INVESTIGATION RESULT:\n{inv_result}\n\nIf you need to investigate further, output another INVESTIGATE: query. Otherwise, output your final FEEDBACK: instructions."
                     })
                 else:
-                    feedback = content.replace("FEEDBACK:", "").strip()
+                    feedback = content
+                    if feedback_match:
+                        feedback = feedback_match.group(1).strip()
                     logger.info("Critic Feedback generated.")
                     return {"critic_feedback": feedback}
                     
