@@ -74,6 +74,21 @@ class ConnectorFactory:
             logger.warning("MCP dependencies not found. MCPConnector disabled.")
 
     @classmethod
+    async def get_dialect_info(cls, db_type: str) -> tuple[str, str]:
+        """Get dialect name and instructions for a specific database type without connecting."""
+        if db_type not in cls._registry:
+            await cls._lazy_load_registry()
+            
+        if db_type not in cls._registry:
+            logger.warning(f"Unsupported database type '{db_type}' for dialect info, falling back to postgresql")
+            db_type = "postgresql"
+            
+        connector_class = cls._registry[db_type]
+        # Instantiate a dummy connector just to read properties
+        dummy = connector_class("dummy", "dummy://")
+        return dummy.dialect_name, dummy.llm_prompt_instructions
+
+    @classmethod
     async def shutdown(cls):
         """Shut down all active connectors."""
         for source_id, connector in cls._connectors.items():

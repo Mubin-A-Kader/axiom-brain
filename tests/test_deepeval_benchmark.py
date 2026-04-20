@@ -137,11 +137,11 @@ async def test_agent_performance(test_data):
             "sql_result": None,
             "error": None,
             "attempts": 0,
-            "thread_id": "benchmark_thread"
+            "thread_id": "benchmark_thread",
+            "tenant_id": "default_tenant"
         },
         config={"configurable": {"thread_id": "benchmark_thread"}}
-    )
-    
+    )    
     actual_sql = state.get("sql_query", "")
     
     # DeepEval Test Case

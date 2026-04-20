@@ -67,6 +67,19 @@ class MySQLConnector(BaseConnector):
             return str(v)
         return v
 
+    @property
+    def dialect_name(self) -> str:
+        return "mysql"
+
+    @property
+    def llm_prompt_instructions(self) -> str:
+        return """
+    - SCHEMA QUALIFICATION (STRICT): Do NOT use "public" or other schema prefixes unless they are explicitly part of the database name in the SCHEMA CONTEXT.
+    - STRICT QUOTING RULE: Use backticks (`) for all identifiers (tables, columns) to avoid keyword conflicts, especially for mixed-case names.
+    - For partial text searches on string columns, ALWAYS use `LIKE '%<text>%'` for case-insensitive search.
+    - Always wrap schema, table, and column names in backticks if they are shown as such in the SCHEMA CONTEXT.
+        """.strip()
+
     async def execute_query(self, sql: str) -> Dict[str, Any]:
         """Execute a SELECT query and return formatted results."""
         if not self._pool:

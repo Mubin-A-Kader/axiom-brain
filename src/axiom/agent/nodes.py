@@ -210,7 +210,7 @@ class SQLGenerationNode:
             api_key=settings.litellm_key,
         )
 
-    def _build_prompt(
+    async def _build_prompt(
         self, state: SQLAgentState
     ) -> str:
         schema_context = state["schema_context"]
@@ -222,8 +222,11 @@ class SQLGenerationNode:
         few_shot_examples = state.get("few_shot_examples", "")
         db_type = state.get("db_type", "postgresql")
 
+        from axiom.connectors.factory import ConnectorFactory
+        dialect_name, dialect_rules = await ConnectorFactory.get_dialect_info(db_type)
+
         base = f"""You are a precise SQL expert and Enterprise Data Analyst. 
-The target database is {db_type.upper()}.
+The target database is {dialect_name.upper()}.
 
 ### SCHEMA CONTEXT:
 {schema_context}
@@ -245,31 +248,20 @@ The target database is {db_type.upper()}.
 5. If Query Type is REFINEMENT, use the CONVERSATION HISTORY to resolve entities and pronouns, and to understand the base dataset being queried.
    - If the user asks to filter, sort, or select a subset of the previous results (e.g., "in that who is top"), REUSE the SQL from the previous turn and append the necessary ORDER BY, LIMIT, or WHERE clauses to answer the new question.
    - If resolving pronouns or partial names, look for the EXACT literal values (IDs, full names, emails) in the "Result" field of the CONVERSATION HISTORY and use them directly in your SQL.
-6. For partial text searches on string columns (e.g., searching for a name, email, or category), ALWAYS use `ILIKE '%<text>%'` (for PostgreSQL) or `LIKE '%<text>%'` (for MySQL) rather than strict equality (`=`), unless an exact match is guaranteed.
-7. If the user asks for a "date", find the closest column like "created_at" or "timestamp". Do NOT use "order_date" if it is not in the schema.
-8. SECURITY MANDATE: You are ONLY allowed to generate `SELECT` queries. NEVER generate `DROP`, `DELETE`, `UPDATE`, `INSERT`, `TRUNCATE`, `ALTER`, or any other destructive commands, even if the user explicitly asks for them. If a user asks to delete or modify data, explain that you are a read-only assistant in <error> tags.
-9. Think step-by-step: 
+6. If the user asks for a "date", find the closest column like "created_at" or "timestamp". Do NOT use "order_date" if it is not in the schema.
+7. SECURITY MANDATE: You are ONLY allowed to generate `SELECT` queries. NEVER generate `DROP`, `DELETE`, `UPDATE`, `INSERT`, `TRUNCATE`, `ALTER`, or any other destructive commands, even if the user explicitly asks for them. If a user asks to delete or modify data, explain that you are a read-only assistant in <error> tags.
+8. Think step-by-step: 
    - Which tables do I need?
    - Do these tables only contain technical IDs? If yes, find the descriptive table to JOIN with.
    - Which columns exist in those tables?
    - How do I join them correctly using the foreign keys shown in SCHEMA CONTEXT?
-   - Match exact case for identifiers (PostgreSQL double quotes for capitals).
-10. Output your thought process inside <thought> tags.
-11. Output the final SQL query inside <sql> tags.
-12. Return ONLY the tags. No other text. No markdown fences.
-13. If you cannot answer the question because the necessary tables/columns do not exist in the schema, output your explanation inside <error> tags and do NOT output any <sql> tags.
-14. SCHEMA QUALIFICATION (STRICT): 
-    - In PostgreSQL, use the fully qualified table name (e.g., "public"."users" or "auth"."sessions") as shown in the SCHEMA CONTEXT.
-    - In MySQL, do NOT use "public" or other schema prefixes unless they are explicitly part of the database name in the SCHEMA CONTEXT.
-15. STRICT QUOTING RULE: 
-    - In PostgreSQL, you MUST enclose any column or table name that contains an uppercase letter in double quotes (e.g., "packageId", "UserOrders"). 
-    - In MySQL, use backticks (`) for mixed-case identifiers.
-    - Always match the EXACT case shown in the SCHEMA CONTEXT.
-16. PREFER NAMES OVER IDs (STRICT): Technical IDs and UUIDs (e.g., "userId", "f47ac10b...") are useless to human users.
-    - You MUST NOT return technical IDs/UUIDs in your final SELECT list if a human-readable name, email, or label exists in a related table.
-    - If your primary table only has technical IDs, you MUST JOIN with the corresponding entity table (e.g., "users", "customers", "profiles") to retrieve descriptive columns like "name", "full_name", or "email".
-    - Even if the user doesn't explicitly ask for a "name", assume they want human-readable labels instead of technical hashes.
-17. QUOTING IDENTIFIERS: Always wrap schema, table, and column names in double quotes (for Postgres) or backticks (for MySQL) if they are shown as such in the SCHEMA CONTEXT.
+   - Match exact case for identifiers.
+9. Output your thought process inside <thought> tags.
+10. Output the final SQL query inside <sql> tags.
+11. Return ONLY the tags. No other text. No markdown fences.
+12. If you cannot answer the question because the necessary tables/columns do not exist in the schema, output your explanation inside <error> tags and do NOT output any <sql> tags.
+13. DIALECT SPECIFIC RULES:
+{dialect_rules}
 
 Question: {question}"""
         if error:
@@ -294,7 +286,7 @@ Question: {question}"""
                 "attempts": attempts
             }
 
-        prompt = self._build_prompt(state)
+        prompt = await self._build_prompt(state)
         response = await self._client.chat.completions.create(
             model=state.get("llm_model") or settings.llm_model,
             messages=[{"role": "user", "content": prompt}],
@@ -334,14 +326,14 @@ class SQLExecutionNode:
     def __init__(self, thread_mgr=None) -> None:
         self._thread_mgr = thread_mgr
 
-    def _is_read_only(self, sql: str, db_type: str = "postgresql") -> bool:
+    async def _is_read_only(self, sql: str, db_type: str = "postgresql") -> tuple[bool, str | None]:
         """Use sqlglot to strictly verify the query is a SELECT statement."""
         try:
-            # Map our db_type to sqlglot dialect
-            dialect = "mysql" if db_type.lower() == "mysql" else "postgres"
+            from axiom.connectors.factory import ConnectorFactory
+            dialect_name, _ = await ConnectorFactory.get_dialect_info(db_type)
             
             # We assume a single statement for now
-            parsed = sqlglot.parse_one(sql, read=dialect)
+            parsed = sqlglot.parse_one(sql, read=dialect_name)
             
             # Check if it's a SELECT-like statement
             if not isinstance(parsed, (exp.Select, exp.Union, exp.Except, exp.Intersect, exp.With)):
@@ -369,7 +361,7 @@ class SQLExecutionNode:
         
         # 1. Robust Security Validation
         db_type = state.get("db_type", "postgresql")
-        safe, sec_error = self._is_read_only(sql, db_type)
+        safe, sec_error = await self._is_read_only(sql, db_type)
         if not safe:
             logger.error("Security Violation Blocked: %s (Query: %s)", sec_error, sql)
             return {"sql_result": None, "error": f"Security violation: {sec_error}"}

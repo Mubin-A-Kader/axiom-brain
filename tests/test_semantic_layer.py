@@ -24,7 +24,7 @@ async def test_semantic_layer_enforcement():
     }
 
     # Generate the prompt
-    prompt = node._build_prompt(state)
+    prompt = await node._build_prompt(state)
 
     # Verify the custom rules (Business Glossary) are injected correctly
     assert "BUSINESS GLOSSARY (SEMANTIC LAYER):" in prompt

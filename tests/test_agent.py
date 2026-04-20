@@ -132,14 +132,15 @@ async def test_sql_generation_node_with_error_correction(
         assert "PREVIOUS ATTEMPT FAILED" in prompt
 
 
-def test_sql_generation_prompt_building(mock_rag: AsyncMock, sample_state: SQLAgentState, sample_schema_context: str) -> None:
+@pytest.mark.asyncio
+async def test_sql_generation_prompt_building(mock_rag: AsyncMock, sample_state: SQLAgentState, sample_schema_context: str) -> None:
     """Test SQL generation prompt structure."""
     node = SQLGenerationNode(mock_rag)
     state = sample_state.copy()
     state["schema_context"] = sample_schema_context
     state["question"] = "Count active users"
     state["error"] = None
-    prompt = node._build_prompt(state)
+    prompt = await node._build_prompt(state)
 
     assert "SQL expert" in prompt
     assert "TABLE users" in prompt
@@ -147,7 +148,8 @@ def test_sql_generation_prompt_building(mock_rag: AsyncMock, sample_state: SQLAg
     assert "PREVIOUS ATTEMPT FAILED" not in prompt
 
 
-def test_sql_generation_prompt_with_error(mock_rag: AsyncMock, sample_state: SQLAgentState, sample_schema_context: str) -> None:
+@pytest.mark.asyncio
+async def test_sql_generation_prompt_with_error(mock_rag: AsyncMock, sample_state: SQLAgentState, sample_schema_context: str) -> None:
     """Test SQL prompt includes error context."""
     node = SQLGenerationNode(mock_rag)
     error = "Syntax error near 'WHERE'"
@@ -155,7 +157,7 @@ def test_sql_generation_prompt_with_error(mock_rag: AsyncMock, sample_state: SQL
     state["schema_context"] = sample_schema_context
     state["question"] = "Get user emails"
     state["error"] = error
-    prompt = node._build_prompt(state)
+    prompt = await node._build_prompt(state)
 
     assert error in prompt
     assert "PREVIOUS ATTEMPT FAILED" in prompt
@@ -327,17 +329,19 @@ async def test_schema_retrieval_with_special_characters(
 
     mock_rag.retrieve.assert_called_once_with("default_tenant", "default_source", special_question)
 
-
-def test_sql_generation_with_empty_schema(sample_state: SQLAgentState) -> None:
+@pytest.mark.asyncio
+async def test_sql_generation_with_empty_schema(sample_state: SQLAgentState) -> None:
     """Test SQL generation gracefully handles empty schema."""
+    mock_rag = AsyncMock()
     node = SQLGenerationNode(mock_rag)
     state = sample_state.copy()
     state["schema_context"] = ""
     state["question"] = "Get users"
     state["error"] = None
-    prompt = node._build_prompt(state)
+    prompt = await node._build_prompt(state)
 
     assert len(prompt) > 0
+
     assert "SQL expert" in prompt
 
 

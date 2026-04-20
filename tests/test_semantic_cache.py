@@ -43,7 +43,7 @@ async def test_semantic_cache_hit(sample_state: SQLAgentState):
         assert result["error"] is None
         
         # Verify RAG was checked
-        mock_rag.search_semantic_cache.assert_called_once_with("test_source", "Show me the best customers")
+        mock_rag.search_semantic_cache.assert_called_once_with("default_tenant", "test_source", "Show me the best customers")
 
 @pytest.mark.asyncio
 async def test_semantic_cache_miss(sample_state: SQLAgentState):
@@ -68,7 +68,7 @@ async def test_semantic_cache_miss(sample_state: SQLAgentState):
         assert result["sql_query"] == "SELECT name FROM customers"
         
         # Verify RAG was checked
-        mock_rag.search_semantic_cache.assert_called_once_with("test_source", "Show me the best customers")
+        mock_rag.search_semantic_cache.assert_called_once_with("default_tenant", "test_source", "Show me the best customers")
 
 @pytest.mark.asyncio
 async def test_semantic_cache_skip_on_refinement(sample_state: SQLAgentState):

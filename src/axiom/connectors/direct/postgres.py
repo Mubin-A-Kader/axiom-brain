@@ -50,6 +50,20 @@ class PostgresConnector(BaseConnector):
             return str(v)
         return v
 
+    @property
+    def dialect_name(self) -> str:
+        return "postgres"
+
+    @property
+    def llm_prompt_instructions(self) -> str:
+        return """
+    - SCHEMA QUALIFICATION (STRICT): Always use the fully qualified table name (e.g., "public"."users" or "auth"."sessions") as shown in the SCHEMA CONTEXT. Never assume a default schema.
+    - STRICT QUOTING RULE: You MUST enclose any column or table name that contains an uppercase letter in double quotes (e.g., "packageId", "UserOrders").
+    - Do NOT double-quote standard snake_case columns or lowercase table names (e.g., use user_id, not "user_id").
+    - For partial text searches on string columns, ALWAYS use `ILIKE '%<text>%'` for case-insensitive search.
+    - Always wrap schema, table, and column names in double quotes (e.g., "public"."Users") if they are shown as such in the SCHEMA CONTEXT.
+        """.strip()
+
     async def execute_query(self, sql: str) -> Dict[str, Any]:
         """Execute a SELECT query and return formatted results."""
         if not self._pool:

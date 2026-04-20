@@ -115,3 +115,16 @@ class BaseConnector(ABC):
     async def get_schema(self) -> Dict[str, Any]:
         """Extract database schema (tables, columns, foreign keys)."""
         pass
+
+    @property
+    @abstractmethod
+    def dialect_name(self) -> str:
+        """The identifier used by sqlglot (e.g., 'postgres', 'mysql', 'snowflake')."""
+        pass
+
+    @property
+    @abstractmethod
+    def llm_prompt_instructions(self) -> str:
+        """Specific instructions to inject into the LLM prompt for this database."""
+        pass
+

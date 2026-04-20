@@ -29,6 +29,19 @@ class MCPConnector(BaseConnector):
         self._exit_stack = AsyncExitStack()
         self._session: Optional[ClientSession] = None
 
+    @property
+    def dialect_name(self) -> str:
+        return "postgres" # Default fallback for generic MCP
+
+    @property
+    def llm_prompt_instructions(self) -> str:
+        return """
+    - Note: This is an MCP-connected database. Ensure queries are standard ANSI SQL.
+    - PREFER NAMES OVER IDs (STRICT): Technical IDs and UUIDs (e.g., "userId") are useless to human users.
+    - You MUST NOT return technical IDs in your final SELECT list if a human-readable name or label exists in a related table.
+    - For partial text searches on string columns, use standard case-insensitive search techniques.
+        """.strip()
+
     async def connect(self) -> None:
         """Launch the MCP server and initialize session."""
         if self._session:
