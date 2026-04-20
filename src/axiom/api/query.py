@@ -7,27 +7,9 @@ from typing import Optional
 from axiom.agent.graph import build_graph
 from axiom.agent.thread import ThreadManager
 from axiom.config import settings
-import asyncpg
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-async def get_tenant_rules(tenant_id: str) -> str:
-    """Database lookup for tenant-specific SQL rules aggregated across all data sources."""
-    try:
-        conn = await asyncpg.connect(settings.database_url)
-        try:
-            rows = await conn.fetch(
-                "SELECT custom_rules FROM data_sources WHERE tenant_id = $1", 
-                tenant_id
-            )
-            rules = [r["custom_rules"] for r in rows if r["custom_rules"]]
-            return "\n".join(list(set(rules)))
-        finally:
-            await conn.close()
-    except Exception as exc:
-        logger.warning("Failed to fetch tenant rules: %s", exc)
-        return ""
 
 async def run_query(
     question: str, 
@@ -52,7 +34,7 @@ async def run_query(
         "selected_tables": [],
         "schema_context": "",
         "few_shot_examples": "",
-        "custom_rules": await get_tenant_rules(tenant_id),
+        "custom_rules": "",
         "tenant_id": tenant_id,
         "source_id": source_id, # Can be None for auto-routing
         "sql_query": None,

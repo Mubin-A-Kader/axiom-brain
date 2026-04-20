@@ -40,14 +40,16 @@ class DatabaseSelectionNode:
             source_id = state["source_id"]
             logger.info("Skipping database routing, source_id already provided: %s", source_id)
 
-            # We still need to know the db_type for the generator
+            # We still need to know the db_type and custom_rules for the generator
             cp_conn = await asyncpg.connect(settings.database_url)
             try:
-                db_type = await cp_conn.fetchval(
-                    "SELECT db_type FROM data_sources WHERE source_id = $1", 
+                row = await cp_conn.fetchrow(
+                    "SELECT db_type, custom_rules FROM data_sources WHERE source_id = $1", 
                     source_id
                 )
-                return {"source_id": source_id, "db_type": db_type or "postgresql"}
+                db_type = row["db_type"] if row else "postgresql"
+                custom_rules = row["custom_rules"] if row and row["custom_rules"] else ""
+                return {"source_id": source_id, "db_type": db_type, "custom_rules": custom_rules}
             finally:
                 await cp_conn.close()
 
@@ -58,7 +60,7 @@ class DatabaseSelectionNode:
         cp_conn = await asyncpg.connect(settings.database_url)
         try:
             sources = await cp_conn.fetch(
-                "SELECT source_id, description, db_type FROM data_sources WHERE tenant_id = $1 AND status = 'active'", 
+                "SELECT source_id, description, db_type, custom_rules FROM data_sources WHERE tenant_id = $1 AND status = 'active'", 
                 tenant_id
             )
         finally:
@@ -66,11 +68,15 @@ class DatabaseSelectionNode:
 
         if not sources:
             logger.warning("No active sources found for tenant %s. Falling back.", tenant_id)
-            return {"source_id": "default_tenant", "db_type": "postgresql"} # Fallback
+            return {"source_id": "default_tenant", "db_type": "postgresql", "custom_rules": ""} # Fallback
 
         if len(sources) == 1:
             logger.info("Single source found for tenant, auto-selecting: %s", sources[0]["source_id"])
-            return {"source_id": sources[0]["source_id"], "db_type": sources[0]["db_type"]}
+            return {
+                "source_id": sources[0]["source_id"], 
+                "db_type": sources[0]["db_type"],
+                "custom_rules": sources[0]["custom_rules"] or ""
+            }
 
         # 2. Let the LLM pick the best source based on descriptions
         source_list = "\n".join([f"- {s['source_id']} ({s['db_type']}): {s['description']}" for s in sources])
@@ -95,9 +101,10 @@ class DatabaseSelectionNode:
         selected_source = next((s for s in sources if s["source_id"] == selected_id), sources[0])
         selected_id = selected_source["source_id"]
         db_type = selected_source["db_type"]
+        custom_rules = selected_source["custom_rules"] or ""
 
         logger.info("Routed query to database source: %s (%s)", selected_id, db_type)
-        return {"source_id": selected_id, "db_type": db_type}
+        return {"source_id": selected_id, "db_type": db_type, "custom_rules": custom_rules}
 
 
 

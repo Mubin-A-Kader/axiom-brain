@@ -183,24 +183,6 @@ class TenantOut(BaseModel):
 
 import asyncpg
 
-async def get_tenant_rules(tenant_id: str) -> str:
-    """Database lookup for tenant-specific SQL rules aggregated across all data sources."""
-    try:
-        conn = await asyncpg.connect(settings.database_url)
-        try:
-            rows = await conn.fetch(
-                "SELECT custom_rules FROM data_sources WHERE tenant_id = $1", 
-                tenant_id
-            )
-            rules = [r["custom_rules"] for r in rows if r["custom_rules"]]
-            return "\n".join(list(set(rules)))
-        finally:
-            await conn.close()
-    except Exception as exc:
-        logger.warning("Failed to fetch tenant rules: %s", exc)
-        return ""
-
-
 # --- API Endpoints ---
 
 @app.get("/health")
@@ -456,7 +438,7 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
                 "selected_tables": [],
                 "schema_context": "",
                 "few_shot_examples": "",
-                "custom_rules": await get_tenant_rules(tenant_id),
+                "custom_rules": "",
                 "tenant_id": tenant_id,
                 "source_id": req.source_id,
                 "sql_query": None,
