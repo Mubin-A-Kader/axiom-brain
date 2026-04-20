@@ -255,6 +255,7 @@ The target database is {dialect_name.upper()}.
 ### INSTRUCTIONS:
 1. Review the SCHEMA CONTEXT carefully. Identify the EXACT table and column names.
 2. SEMANTIC LAYER ENFORCEMENT: Adhere STRICTLY to the BUSINESS GLOSSARY metrics if any are provided. If the user asks for a metric defined in the glossary (e.g., "Revenue", "Active Users"), you MUST use the EXACT SQL formula provided in the glossary. Do not invent your own calculation.
+   - EXCEPTION: If the CRITIC FEEDBACK explicitly instructs you to modify a literal value from the glossary (e.g., changing 'paid' to 'PAID' because of a 0-result failure), you MUST follow the CRITIC'S advice and adjust the literal value to match the actual database.
 3. Use the VERIFIED EXAMPLES as a guide for how this specific tenant structures their queries.
 4. If Query Type is NEW_TOPIC, IGNORE the CONVERSATION HISTORY and generate a fresh query for the current Question.
 5. If Query Type is REFINEMENT, use the CONVERSATION HISTORY to resolve entities and pronouns, and to understand the base dataset being queried.
@@ -381,6 +382,7 @@ class SQLCriticNode:
         sql_query = state.get("sql_query", "")
         error = state.get("error", "")
         schema_context = state.get("schema_context", "")
+        custom_rules = state.get("custom_rules", "")
 
         if not error:
             return {"critic_feedback": None}
@@ -398,6 +400,9 @@ The previous query executed successfully but returned zero rows. This often happ
 ### SCHEMA CONTEXT:
 {schema_context}
 
+### BUSINESS GLOSSARY (SEMANTIC LAYER):
+{custom_rules if custom_rules else "None"}
+
 ### FAILED (ZERO-RESULT) SQL:
 {sql_query}
 
@@ -409,9 +414,14 @@ INVESTIGATE: <your SQL query here>
 For example:
 INVESTIGATE: SELECT DISTINCT status FROM orders LIMIT 10
 
-The system will run this query and return the results to you. You can investigate up to 2 times.
-Once you have found the correct values, or if you immediately know how to fix the query, output your final technical instructions for the SQL Generator in exactly this format:
-FEEDBACK: <your actionable instructions here>"""
+### INSTRUCTIONS:
+1. Identify categorical filters or JOIN conditions that might be too restrictive.
+2. The query might have used a strict formula from the BUSINESS GLOSSARY that doesn't match the actual data (e.g., the glossary says status = 'paid' but the database uses 'PAID').
+3. Investigate the actual data using the INVESTIGATE tool. You can investigate up to 2 times.
+4. Once you find the correct values, output your final technical instructions for the SQL Generator in exactly this format:
+FEEDBACK: <your actionable instructions here>
+
+If you discover the glossary rule is incorrect or too strict based on your investigation, explicitly instruct the SQL Generator to loosen or modify the glossary formula (e.g. "Modify the glossary rule to use 'PAID' instead of 'paid'")."""
         else:
             prompt = f"""You are a Senior Database Administrator. Analyze the failed SQL draft against the execution traceback to identify syntax violations, logical errors, or schema mismatches.
 Provide exact, technical correction instructions.
@@ -421,6 +431,9 @@ Provide exact, technical correction instructions.
 
 ### SCHEMA CONTEXT:
 {schema_context}
+
+### BUSINESS GLOSSARY (SEMANTIC LAYER):
+{custom_rules if custom_rules else "None"}
 
 ### FAILED SQL DRAFT:
 {sql_query}
