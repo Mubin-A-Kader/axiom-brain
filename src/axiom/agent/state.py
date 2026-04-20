@@ -21,3 +21,5 @@ class SQLAgentState(TypedDict):
     query_type: str
     visualization: Optional[str]
     llm_model: Optional[str]
+    response_text: Optional[str]
+    agent_thought: Optional[str]

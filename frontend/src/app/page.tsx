@@ -85,6 +85,7 @@ function SqlBlock({ sql }: { sql: string }) {
 }
 
 function DataTable({ result }: { result: any }) {
+  const [showAll, setShowAll] = useState(false);
   let data = result;
   if (typeof result === 'string') {
     try {
@@ -101,6 +102,9 @@ function DataTable({ result }: { result: any }) {
       </div>
     );
   }
+
+  const rowsToDisplay = showAll ? data.rows : data.rows.slice(0, 15);
+  const isTruncated = data.is_truncated || (data.rows.length > 15 && !showAll);
   
   return (
     <div className="border border-[rgba(255,255,255,0.05)] rounded-lg bg-[#2A2927] overflow-hidden flex flex-col shadow-[0_4px_12px_rgba(0,0,0,0.2)]">
@@ -116,7 +120,7 @@ function DataTable({ result }: { result: any }) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {data.rows.map((row: any[], i: number) => (
+            {rowsToDisplay.map((row: any[], i: number) => (
               <TableRow key={i} className="border-[rgba(255,255,255,0.05)] hover:bg-[#32312F] transition-colors">
                 {row.map((cell: any, j: number) => {
                   const isNumber = typeof cell === 'number';
@@ -134,8 +138,18 @@ function DataTable({ result }: { result: any }) {
           </TableBody>
         </Table>
       </div>
-      <div className="bg-[#1E1E1C] px-4 py-2 border-t border-[rgba(255,255,255,0.05)] text-xs font-mono text-[#E6E1D8]/70 flex justify-between items-center">
-        <span>{data.rows.length} RECORD(S)</span>
+      <div className="bg-[#1E1E1C] px-4 py-3 border-t border-[rgba(255,255,255,0.05)] text-xs font-mono text-[#E6E1D8]/70 flex justify-between items-center">
+        <div className="flex items-center gap-4">
+          <span>{showAll ? data.total_count || data.rows.length : Math.min(data.rows.length, 15)} OF {data.total_count || data.rows.length} RECORD(S)</span>
+          {isTruncated && !showAll && (
+            <button 
+              onClick={() => setShowAll(true)}
+              className="text-[#638A70] hover:underline font-bold uppercase tracking-widest cursor-pointer"
+            >
+              Show all data
+            </button>
+          )}
+        </div>
         <span className="flex items-center gap-2"><Activity className="w-3 h-3 text-[#638A70]" /> LIVE</span>
       </div>
     </div>
@@ -163,15 +177,20 @@ function VisualizationRenderer({ visualization, result }: { visualization: any, 
   }
 
   // Common data extraction for charts
-  const xIdx = data.columns.indexOf(x_axis);
-  const yIdx = Array.isArray(y_axis) ? data.columns.indexOf(y_axis[0]) : data.columns.indexOf(y_axis);
+  const xIdx = data.columns.findIndex((c: string) => c.toLowerCase() === x_axis?.toLowerCase());
+  const yAxisName = Array.isArray(y_axis) ? y_axis[0] : y_axis;
+  const yIdx = data.columns.findIndex((c: string) => c.toLowerCase() === yAxisName?.toLowerCase());
   
-  const chartData = data.rows.slice(0, 10).map((row: any[]) => ({
-    label: String(row[xIdx] || ''),
-    value: Number(row[yIdx] || 0)
+  // DEBUG/FALLBACK: If the LLM failed to match column names exactly, try to guess
+  const safeXIdx = xIdx === -1 ? 0 : xIdx;
+  const safeYIdx = yIdx === -1 ? (data.columns.length > 1 ? 1 : 0) : yIdx;
+
+  const chartData = data.rows.slice(0, 15).map((row: any[]) => ({
+    label: String(row[safeXIdx] || ''),
+    value: Number(row[safeYIdx] || 0)
   }));
 
-  const maxValue = Math.max(...chartData.map((d: any) => d.value), 1);
+  const maxValue = Math.max(...chartData.map((d: any) => d.value), 0.000001);
 
   return (
     <div className="bg-[#2A2927] border border-[#638A70]/20 rounded-lg p-6 shadow-[0_4px_12px_rgba(0,0,0,0.2)]">
@@ -182,12 +201,12 @@ function VisualizationRenderer({ visualization, result }: { visualization: any, 
         </h3>
       </div>
 
-      <div className="h-72 w-full relative flex items-end gap-2 px-2 pb-14">
+      <div className="h-72 w-full relative flex items-end gap-2 px-2 pb-14 min-h-[200px]">
         {plot_type === 'bar' && chartData.map((d: any, i: number) => (
           <div key={i} className="flex-1 flex flex-col items-center gap-2 group h-full justify-end relative">
             <div 
               className="w-full bg-[#638A70]/80 rounded-t-sm transition-all duration-500 hover:bg-[#638A70] relative"
-              style={{ height: `${(d.value / maxValue) * 100}%` }}
+              style={{ height: `${Math.max((d.value / maxValue) * 100, 2)}%` }}
             >
               <div className="absolute -top-6 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity text-[10px] font-mono text-[#E6E1D8] bg-[#1E1E1C] px-1.5 py-0.5 rounded border border-white/5 whitespace-nowrap z-10">
                 {d.value.toLocaleString()}
@@ -487,6 +506,13 @@ export default function AxiomBrainUI() {
                           <p className="text-sm text-[#E6E1D8]/90 leading-relaxed">
                             System halted. Proposed operation crosses security threshold. Verify execution path.
                           </p>
+
+                          {msg.metadata?.thought && (
+                            <div className="text-xs text-[#E6E1D8]/60 italic bg-[#1E1E1C]/50 p-3 rounded border border-white/5">
+                               <span className="font-bold text-[#638A70] uppercase mr-2">Agent Reasoning:</span>
+                               {msg.metadata.thought}
+                            </div>
+                          )}
                           
                           {msg.metadata?.sql && (
                             <div className="p-4 rounded-md bg-[#1E1E1C] border border-[rgba(255,255,255,0.05)] overflow-x-auto shadow-inner">
@@ -519,6 +545,11 @@ export default function AxiomBrainUI() {
 
                       {msg.status === "completed" && !msg.isError && (
                         <div className="space-y-6">
+                          {msg.content && (
+                            <div className="text-[#E6E1D8] text-base leading-relaxed max-w-2xl animate-in fade-in slide-in-from-left-2 duration-500">
+                              {msg.content}
+                            </div>
+                          )}
                           {msg.metadata?.visualization && msg.metadata?.result && (
                              <VisualizationRenderer visualization={msg.metadata.visualization} result={msg.metadata.result} />
                           )}

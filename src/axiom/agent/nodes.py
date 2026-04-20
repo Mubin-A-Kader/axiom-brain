@@ -120,7 +120,8 @@ Given the user's question, review the following candidate tables and their descr
 Select up to 3 tables that are most likely needed to answer the question.
 
 ### IMPORTANT:
-Table names are CASE-SENSITIVE. You MUST return the names EXACTLY as they appear in the list below.
+Table names may be schema-qualified (e.g., "public.users" or "auth.accounts"). 
+You MUST return the names EXACTLY as they appear in the list below.
 
 ### CANDIDATE TABLES:
 {summary_text}
@@ -205,7 +206,7 @@ class SQLGenerationNode:
         custom_rules = state.get("custom_rules", "")
         few_shot_examples = state.get("few_shot_examples", "")
 
-        base = f"""You are a precise SQL expert. 
+        base = f"""You are a precise SQL expert and Enterprise Data Analyst. 
 
 ### SCHEMA CONTEXT:
 {schema_context}
@@ -213,7 +214,7 @@ class SQLGenerationNode:
 ### CONVERSATION HISTORY:
 {history_context if history_context else "No prior history."}
 
-### TENANT CUSTOM RULES:
+### BUSINESS GLOSSARY (SEMANTIC LAYER):
 {custom_rules if custom_rules else "None"}
 
 ### VERIFIED EXAMPLES:
@@ -221,7 +222,7 @@ class SQLGenerationNode:
 
 ### INSTRUCTIONS:
 1. Review the SCHEMA CONTEXT carefully. Identify the EXACT table and column names.
-2. Adhere strictly to the TENANT CUSTOM RULES if any are provided.
+2. SEMANTIC LAYER ENFORCEMENT: Adhere STRICTLY to the BUSINESS GLOSSARY metrics if any are provided. If the user asks for a metric defined in the glossary (e.g., "Revenue", "Active Users"), you MUST use the EXACT SQL formula provided in the glossary. Do not invent your own calculation.
 3. Use the VERIFIED EXAMPLES as a guide for how this specific tenant structures their queries.
 4. If Query Type is NEW_TOPIC, IGNORE the CONVERSATION HISTORY and generate a fresh query for the current Question.
 5. If Query Type is REFINEMENT, use the CONVERSATION HISTORY to resolve entities and pronouns, and to understand the base dataset being queried.
@@ -240,19 +241,21 @@ class SQLGenerationNode:
 11. Output the final SQL query inside <sql> tags.
 12. Return ONLY the tags. No other text. No markdown fences.
 13. If you cannot answer the question because the necessary tables/columns do not exist in the schema, output your explanation inside <error> tags and do NOT output any <sql> tags.
-14. STRICT QUOTING RULE: Identify if the target database is PostgreSQL or MySQL.
+14. SCHEMA QUALIFICATION (STRICT): Always use the fully qualified table name (e.g., "public"."users" or "auth"."sessions") as shown in the SCHEMA CONTEXT. Never assume a default schema.
+15. STRICT QUOTING RULE: Identify if the target database is PostgreSQL or MySQL.
     - In PostgreSQL, you MUST enclose any column or table name that contains an uppercase letter in double quotes (e.g., "packageId", "UserOrders"). 
     - Do NOT double-quote standard snake_case columns or lowercase table names (e.g., use user_id, not "user_id").
     - In MySQL, use backticks (`) for mixed-case identifiers.
     - Always match the EXACT case shown in the SCHEMA CONTEXT.
-15. PREFER NAMES OVER IDs (STRICT): Technical IDs and UUIDs (e.g., "userId", "f47ac10b...") are useless to human users.
+16. PREFER NAMES OVER IDs (STRICT): Technical IDs and UUIDs (e.g., "userId", "f47ac10b...") are useless to human users.
     - You MUST NOT return technical IDs/UUIDs in your final SELECT list if a human-readable name, email, or label exists in a related table.
     - If your primary table only has technical IDs, you MUST JOIN with the corresponding entity table (e.g., "users", "customers", "profiles") to retrieve descriptive columns like "name", "full_name", or "email".
     - Even if the user doesn't explicitly ask for a "name", assume they want human-readable labels instead of technical hashes.
+17. QUOTING IDENTIFIERS: Always wrap schema, table, and column names in double quotes (e.g., "public"."Users") if they are shown as such in the SCHEMA CONTEXT.
 
 Question: {question}"""
         if error:
-            base += f"\n\n### PREVIOUS ATTEMPT FAILED:\n{error}\n\nReview the SCHEMA CONTEXT carefully. If the error suggests a column or table name that exists but with different capitalization, you MUST use double quotes around that name (e.g., \"membershipFees\")."
+            base += f"\n\n### PREVIOUS ATTEMPT FAILED:\n{error}\n\nReview the SCHEMA CONTEXT carefully. \n- If the error is \"relation ... does not exist\", you likely forgot the schema prefix (e.g. use \"public\".\"tableName\" instead of \"tableName\").\n- If the error suggests a column or table name that exists but with different capitalization, you MUST use double quotes around that name (e.g., \"membershipFees\")."
         return base
 
     async def __call__(self, state: SQLAgentState) -> dict:
@@ -282,14 +285,21 @@ Question: {question}"""
         content = response.choices[0].message.content.strip()
         
         # Log thought process for debugging
+        thought = ""
         thought_match = re.search(r"<thought>(.*?)</thought>", content, re.DOTALL)
         if thought_match:
-            logger.info("Agent Thought: %s", thought_match.group(1).strip())
+            thought = thought_match.group(1).strip()
+            logger.info("Agent Thought: %s", thought)
 
         # Extract error from <error> tags if present (e.g. semantic impossibility)
         error_match = re.search(r"<error>(.*?)</error>", content, re.DOTALL)
         if error_match:
-            return {"sql_query": "", "error": error_match.group(1).strip(), "attempts": settings.max_correction_attempts}
+            return {
+                "sql_query": "", 
+                "error": error_match.group(1).strip(), 
+                "agent_thought": thought,
+                "attempts": settings.max_correction_attempts
+            }
 
         # Extract SQL from <sql> tags
         sql_match = re.search(r"<sql>(.*?)</sql>", content, re.DOTALL)
@@ -299,7 +309,7 @@ Question: {question}"""
             # Fallback if tags are missing
             sql = content.replace("```sql", "").replace("```", "").strip()
             
-        return {"sql_query": sql, "error": None, "attempts": state["attempts"] + 1}
+        return {"sql_query": sql, "error": None, "agent_thought": thought, "attempts": state["attempts"] + 1}
 
 
 class SQLExecutionNode:
@@ -370,11 +380,18 @@ class SQLExecutionNode:
             connector = await ConnectorFactory.get_connector(source_id, db_type, target_db_url, config)
             result = await connector.execute_query(sql)
             
+            # --- RESPONSE LIMITING ---
+            all_rows = result["rows"]
+            is_truncated = len(all_rows) > 100
+            display_rows = all_rows[:100] if is_truncated else all_rows
+
             # Format to JSON for the LLM/State
             result_update = {
                 "sql_result": json.dumps({
                     "columns": result["columns"], 
-                    "rows": result["rows"]
+                    "rows": display_rows,
+                    "is_truncated": is_truncated,
+                    "total_count": len(all_rows)
                 }, default=str), 
                 "error": None
             }
@@ -447,7 +464,11 @@ Given the user's question and the SQL result set, generate a visualization speci
   "x_axis": "<column_name | null>",
   "y_axis": "<column_name | list_of_column_names>",
   "plot_type": "<bar | line | scatter | pie | histogram | area | indicator>",
-  "title": "<insightful_title>"
+  "title": "<insightful_title>",
+  "config": {{
+    "show_legend": <true | false>,
+    "stack": <true | false>
+  }}
 }}
 
 Respond ONLY with the JSON object. No markdown, no filler."""
@@ -455,8 +476,9 @@ Respond ONLY with the JSON object. No markdown, no filler."""
         try:
             response = await self._client.chat.completions.create(
                 model=state.get("llm_model") or settings.llm_model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "system", "content": "You are a helpful assistant that only outputs JSON."}, {"role": "user", "content": prompt}],
                 temperature=0.0,
+                response_format={"type": "json_object"}
             )
             content = response.choices[0].message.content.strip()
 
@@ -471,3 +493,62 @@ Respond ONLY with the JSON object. No markdown, no filler."""
         except Exception as exc:
             logger.warning("Failed to generate visualization spec: %s", exc)
             return {"visualization": None}
+class ResponseSynthesizerNode:
+    """Synthesize a human-readable answer/insight based on the SQL result."""
+    def __init__(self) -> None:
+        import openai
+        self._client = openai.AsyncOpenAI(
+            base_url=f"{settings.litellm_url}/v1",
+            api_key=settings.litellm_key,
+        )
+
+    async def __call__(self, state: SQLAgentState) -> dict:
+        if state.get("error"):
+            return {"response_text": f"I encountered an error: {state['error']}"}
+        
+        if not state.get("sql_result"):
+            return {"response_text": "I couldn't find any data to answer your question."}
+
+        question = state["question"]
+        result_json = json.loads(state["sql_result"])
+        columns = result_json.get("columns", [])
+        rows = result_json.get("rows", [])
+        viz_spec = state.get("visualization")
+
+        if not rows:
+            return {"response_text": "The query returned no results."}
+
+        # Data sample for synthesis
+        sample = rows[:10]
+        
+        prompt = f"""You are a helpful Data Assistant. 
+Based on the user's question and the data results provided, write a concise, professional response.
+
+### USER QUESTION:
+{question}
+
+### DATA RESULTS (Columns: {columns}):
+{sample}
+
+### TOTAL ROW COUNT: {result_json.get('total_count', len(rows))}
+
+### INSTRUCTIONS:
+1. Summarize the answer directly.
+2. If there's an obvious trend or significant data point (e.g., "Product X sold the most"), highlight it.
+3. If a visualization was generated (Spec: {viz_spec}), mention it (e.g., "I've generated a chart below to show this trend").
+4. Keep it under 3 sentences. Do not show raw JSON. 
+5. Be precise but conversational.
+
+Response:"""
+
+        try:
+            response = await self._client.chat.completions.create(
+                model=state.get("llm_model") or settings.llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+            )
+            content = response.choices[0].message.content.strip()
+            return {"response_text": content}
+        except Exception as exc:
+            logger.warning("Failed to synthesize response: %s", exc)
+            return {"response_text": "Here are the results for your query:"}

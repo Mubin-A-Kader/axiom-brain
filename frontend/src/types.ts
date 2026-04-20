@@ -24,6 +24,8 @@ export interface QueryResponse {
     plot_type: "bar" | "line" | "scatter" | "pie" | "histogram" | "area" | "indicator";
     title: string;
   };
+  insight?: string;
+  thought?: string;
   session_id: string;
   thread_id: string;
   tenant_id: string;
@@ -39,6 +41,7 @@ export interface Source {
   status: string;
   error_message?: string;
   mcp_config?: any;
+  custom_rules?: any;
 }
 
 export interface SourceIn {
@@ -48,6 +51,7 @@ export interface SourceIn {
   db_type: string;
   description: string;
   mcp_config?: any;
+  custom_rules?: any;
 }
 
 export interface ChatMessage {
@@ -59,8 +63,10 @@ export interface ChatMessage {
   metadata?: {
     sql?: string;
     result?: string;
+    insight?: string;
+    thought?: string;
     visualization?: QueryResponse["visualization"];
     thread_id?: string;
     session_id?: string;
-    };
-    }
+  };
+}

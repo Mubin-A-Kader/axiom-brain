@@ -4,7 +4,7 @@ import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { 
   Database, Plus, Loader2, AlertCircle, Check, 
-  Terminal, Activity, Trash2, Globe, Server, Shield, Edit, RefreshCw
+  Terminal, Activity, Trash2, Globe, Server, Shield, Edit, RefreshCw, Code
 } from "lucide-react";
 import { fetchSources, onboardSource, deleteSource, updateSource, syncSource } from "../../lib/api";
 import { Source, SourceIn } from "../../types";
@@ -41,13 +41,16 @@ const initialFormData = {
   ssh_host: "",
   ssh_port: "22",
   ssh_user: "",
-  ssh_key: ""
+  ssh_key: "",
+  metrics: [] as { name: string, formula: string, description: string }[]
 };
 
 export default function DataSourcesPage() {
   const [sources, setSources] = useState<Source[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isAdding, setIsAdding] = useState(false);
+  const [isCodeView, setIsCodeView] = useState(false);
+  const [localJson, setLocalJson] = useState("");
   const [editingSourceId, setEditingSourceId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -139,12 +142,15 @@ export default function DataSourcesPage() {
         };
       }
 
+      let custom_rules = formData.metrics.length > 0 ? formData.metrics : undefined;
+
       if (editingSourceId) {
         await updateSource(tenantId, editingSourceId, {
           description: formData.description,
           db_url: finalUrl,
           db_type: formData.db_type,
-          mcp_config: mcp_config
+          mcp_config: mcp_config,
+          custom_rules: custom_rules
         });
         setSuccess("Source updated successfully.");
       } else {
@@ -152,7 +158,8 @@ export default function DataSourcesPage() {
           ...formData,
           db_url: finalUrl,
           tenant_id: tenantId,
-          mcp_config: mcp_config
+          mcp_config: mcp_config,
+          custom_rules: custom_rules
         };
         await onboardSource(payload);
         setSuccess("Ingestion started successfully. It may take a minute to process the schema.");
@@ -200,6 +207,17 @@ export default function DataSourcesPage() {
 
   function startEdit(source: Source) {
     const ssh = source.mcp_config?.ssh || {};
+    
+    let metrics = [];
+    if (source.custom_rules) {
+        try {
+            metrics = Array.isArray(source.custom_rules) ? source.custom_rules : JSON.parse(source.custom_rules);
+            if (!Array.isArray(metrics)) metrics = [];
+        } catch(e) {
+            metrics = [];
+        }
+    }
+
     setEditingSourceId(source.source_id);
     setFormData({
       source_id: source.source_id,
@@ -211,8 +229,10 @@ export default function DataSourcesPage() {
       ssh_host: ssh.host || "",
       ssh_port: String(ssh.port || "22"),
       ssh_user: ssh.username || "",
-      ssh_key: ssh.private_key || ""
+      ssh_key: ssh.private_key || "",
+      metrics: metrics
     });
+    setIsCodeView(false);
     setIsAdding(true);
   }
 
@@ -246,6 +266,7 @@ export default function DataSourcesPage() {
               <TactileButton onClick={() => {
                 setEditingSourceId(null);
                 setFormData(initialFormData);
+                setIsCodeView(false);
                 setIsAdding(true);
               }}>
                 <Plus className="w-4 h-4 mr-2" />
@@ -422,6 +443,130 @@ export default function DataSourcesPage() {
                     </p>
                   </div>
                 )}
+
+                {/* Business Glossary Section */}
+                <div className="space-y-4 border-t border-[rgba(255,255,255,0.05)] pt-6">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Database className="w-4 h-4 text-[#638A70]" />
+                      <h3 className="text-sm font-semibold text-[#E6E1D8] uppercase tracking-wider">Business Glossary (Semantic Layer)</h3>
+                    </div>
+                    <div className="flex items-center gap-4">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const nextMode = !isCodeView;
+                          if (nextMode) {
+                            setLocalJson(JSON.stringify(formData.metrics, null, 2));
+                          }
+                          setIsCodeView(nextMode);
+                        }}
+                        className={`text-[10px] font-mono flex items-center gap-1.5 px-2 py-1 rounded border transition-all ${
+                          isCodeView ? 'bg-[#638A70]/20 border-[#638A70] text-[#638A70]' : 'bg-[#1E1E1C] border-white/5 text-[#E6E1D8]/40 hover:text-[#E6E1D8]'
+                        }`}
+                      >
+                        <Code className="w-3 h-3" /> {isCodeView ? 'SWITCH TO BUILDER' : 'SWITCH TO CODE'}
+                      </button>
+                      {!isCodeView && (
+                        <button
+                          type="button"
+                          onClick={() => setFormData({...formData, metrics: [...formData.metrics, {name: "", formula: "", description: ""}]})}
+                          className="text-xs font-semibold text-[#638A70] hover:text-[#729E81] flex items-center gap-1 transition-all cursor-pointer"
+                        >
+                          <Plus className="w-3 h-3" /> Add Metric
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <p className="text-[10px] text-[#E6E1D8]/40">Define common metrics to ensure the agent calculates them accurately every time.</p>
+                  
+                  {isCodeView ? (
+                    <div className="space-y-2">
+                      <textarea
+                        className="w-full bg-[#1E1E1C] border border-[rgba(255,255,255,0.05)] rounded-lg px-4 py-3 text-[#E6E1D8] font-mono text-xs focus:border-[#638A70]/50 outline-none transition-all shadow-inner h-64 resize-none"
+                        value={localJson}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setLocalJson(val);
+                          try {
+                            const parsed = JSON.parse(val);
+                            if (Array.isArray(parsed)) {
+                              setFormData({ ...formData, metrics: parsed });
+                            }
+                          } catch (err) {
+                            // Allow invalid JSON while typing, don't update state yet
+                          }
+                        }}
+                        placeholder='[{"name": "Revenue", "formula": "SUM(amount)", "description": "Total sales"}]'
+                      />
+                      <p className="text-[9px] text-[#E6E1D8]/20 font-mono">PASTE VALID JSON ARRAY OF METRICS ABOVE</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {formData.metrics.map((metric, idx) => (
+                        <div key={idx} className="bg-[#1E1E1C] border border-[rgba(255,255,255,0.05)] rounded-lg p-4 space-y-3 relative group animate-in fade-in duration-200">
+                          <button 
+                            type="button"
+                            onClick={() => {
+                              const newMetrics = [...formData.metrics];
+                              newMetrics.splice(idx, 1);
+                              setFormData({...formData, metrics: newMetrics});
+                            }}
+                            className="absolute top-2 right-2 text-[#E6E1D8]/20 hover:text-[#C26D5C] opacity-0 group-hover:opacity-100 transition-all cursor-pointer"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                          <div className="grid grid-cols-2 gap-4">
+                            <div className="space-y-1">
+                              <label className="text-[10px] font-mono text-[#E6E1D8]/30 uppercase tracking-widest block ml-1">Metric Name</label>
+                              <input 
+                                placeholder="e.g. Active Users"
+                                className="w-full bg-[#2A2927] border border-[rgba(255,255,255,0.05)] rounded px-3 py-1.5 text-xs text-[#E6E1D8] focus:border-[#638A70]/50 outline-none shadow-inner"
+                                value={metric.name}
+                                onChange={e => {
+                                  const newMetrics = [...formData.metrics];
+                                  newMetrics[idx].name = e.target.value;
+                                  setFormData({...formData, metrics: newMetrics});
+                                }}
+                              />
+                            </div>
+                            <div className="space-y-1">
+                              <label className="text-[10px] font-mono text-[#E6E1D8]/30 uppercase tracking-widest block ml-1">SQL Formula / Logic</label>
+                              <input 
+                                placeholder="e.g. SUM(price * qty)"
+                                className="w-full bg-[#2A2927] border border-[rgba(255,255,255,0.05)] rounded px-3 py-1.5 text-xs font-mono text-[#E6E1D8] focus:border-[#638A70]/50 outline-none shadow-inner"
+                                value={metric.formula}
+                                onChange={e => {
+                                  const newMetrics = [...formData.metrics];
+                                  newMetrics[idx].formula = e.target.value;
+                                  setFormData({...formData, metrics: newMetrics});
+                                }}
+                              />
+                            </div>
+                            <div className="col-span-full space-y-1">
+                              <label className="text-[10px] font-mono text-[#E6E1D8]/30 uppercase tracking-widest block ml-1">Description (When to use this)</label>
+                              <input 
+                                placeholder="e.g. Use this when asked for revenue, sales, or total income."
+                                className="w-full bg-[#2A2927] border border-[rgba(255,255,255,0.05)] rounded px-3 py-1.5 text-xs text-[#E6E1D8] focus:border-[#638A70]/50 outline-none shadow-inner"
+                                value={metric.description}
+                                onChange={e => {
+                                  const newMetrics = [...formData.metrics];
+                                  newMetrics[idx].description = e.target.value;
+                                  setFormData({...formData, metrics: newMetrics});
+                                }}
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                      {formData.metrics.length === 0 && (
+                        <div className="py-8 border border-dashed border-white/5 rounded-lg text-center">
+                           <p className="text-xs text-[#E6E1D8]/20 italic">No business metrics defined yet.</p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
 
                 <div className="flex gap-4 pt-4">
                   <TactileButton type="submit" disabled={isLoading}>

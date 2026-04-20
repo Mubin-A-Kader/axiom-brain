@@ -56,6 +56,12 @@ class PostgresConnector(BaseConnector):
             await self.connect()
         
         async with self._pool.acquire() as conn:
+            # --- AUTO SEARCH PATH ---
+            # Dynamically find all schemas that aren't system schemas and add them to search path
+            schemas = await conn.fetch("SELECT nspname FROM pg_namespace WHERE nspname NOT IN ('information_schema', 'pg_catalog')")
+            path = ", ".join([f'"{s["nspname"]}"' for s in schemas])
+            await conn.execute(f"SET search_path TO {path}, public")
+
             # Wrap the execution in a strictly read-only transaction
             async with conn.transaction(readonly=True):
                 rows = await conn.fetch(sql)
@@ -106,8 +112,8 @@ class PostgresConnector(BaseConnector):
                 table_name = table_record['table_name']
                 table_type = table_record['table_type']
                 
-                # Use fully qualified name if not in public
-                full_name = f"{schema_name}.{table_name}" if schema_name != 'public' else table_name
+                # ALWAYS use fully qualified name to avoid ambiguity in LLM routing
+                full_name = f"{schema_name}.{table_name}"
                 logger.debug(f"Extracting metadata for {table_type}: {full_name}")
                 
                 # 2. Get columns for this table
@@ -122,8 +128,8 @@ class PostgresConnector(BaseConnector):
                 
                 # Formulate a basic DDL approximation with quoted identifiers
                 col_defs = [f'"{col["column_name"]}" {col["data_type"]}' for col in columns]
-                # Quote each part of the full_name if it contains a schema
-                quoted_full_name = ".".join([f'"{p}"' for p in full_name.split(".")])
+                # Quote each part of the full_name: "schema"."table"
+                quoted_full_name = f'"{schema_name}"."{table_name}"'
                 ddl = f"CREATE TABLE {quoted_full_name} ({', '.join(col_defs)})"
                 
                 # 3. Get foreign keys
@@ -147,7 +153,7 @@ class PostgresConnector(BaseConnector):
                 fks = await conn.fetch(fk_query, schema_name, table_name)
                 foreign_keys = []
                 for fk in fks:
-                    ref_name = f"{fk['foreign_table_schema']}.{fk['foreign_table_name']}" if fk['foreign_table_schema'] != 'public' else fk['foreign_table_name']
+                    ref_name = f"{fk['foreign_table_schema']}.{fk['foreign_table_name']}"
                     foreign_keys.append({"column": fk["column_name"], "references": ref_name})
                 
                 schema[full_name] = {

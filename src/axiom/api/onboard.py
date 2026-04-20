@@ -18,19 +18,21 @@ async def run_ingestion(
     db_url: str, 
     db_type: str = "postgresql",
     description: str = "",
-    mcp_config: Optional[Dict[str, Any]] = None
+    mcp_config: Optional[Dict[str, Any]] = None,
+    custom_rules: Any = None
 ):
     logger.info(f"Connecting to {db_type} database for source {source_id} (Tenant: {tenant_id})...")
     
     # 1. Update status to 'syncing' immediately
     cp_conn = await asyncpg.connect(settings.database_url)
     try:
+        custom_rules_str = json.dumps(custom_rules) if custom_rules and not isinstance(custom_rules, str) else custom_rules
         await cp_conn.execute("""
-            INSERT INTO data_sources (source_id, tenant_id, name, description, db_url, db_type, mcp_config, status)
-            VALUES ($1, $2, $1, $3, $4, $5, $6, 'syncing')
+            INSERT INTO data_sources (source_id, tenant_id, name, description, db_url, db_type, mcp_config, custom_rules, status)
+            VALUES ($1, $2, $1, $3, $4, $5, $6, $7, 'syncing')
             ON CONFLICT (source_id) DO UPDATE 
-            SET status = 'syncing', error_message = NULL;
-        """, source_id, tenant_id, description, db_url, db_type, json.dumps(mcp_config) if mcp_config else None)
+            SET status = 'syncing', error_message = NULL, custom_rules = EXCLUDED.custom_rules;
+        """, source_id, tenant_id, description, db_url, db_type, json.dumps(mcp_config) if mcp_config else None, custom_rules_str if custom_rules_str else "")
 
         # 2. Get the appropriate connector
         connector = await ConnectorFactory.get_connector(source_id, db_type, db_url, mcp_config)

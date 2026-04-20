@@ -35,6 +35,7 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
         status: "pending_approval",
         metadata: {
           sql: data.sql,
+          thought: data.thought,
           thread_id: data.thread_id,
           session_id: data.session_id,
         },
@@ -42,9 +43,12 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
     } else if (data.status === "completed") {
       updateLastMessage({
         status: "completed",
+        content: data.insight || "",
         metadata: {
           sql: data.sql,
           result: data.result,
+          insight: data.insight,
+          thought: data.thought,
           visualization: data.visualization,
           thread_id: data.thread_id,
           session_id: data.session_id,

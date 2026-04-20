@@ -24,8 +24,11 @@ app = FastAPI(title="Axiom Brain", version="0.1.0")
 # When allow_credentials=True, origins MUST be explicit (no wildcards)
 origins = [
     "http://localhost:3000",
+    "http://localhost:3001",
     "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
     "http://10.154.99.145:3000",
+    "http://10.154.99.145:3001",
 ]
 
 app.add_middleware(
@@ -72,12 +75,21 @@ class ApproveRequest(BaseModel):
 
 class QueryResponse(BaseModel):
     sql: str
-    result: str
+    result: Any # Use Any to allow dict/str, then validate to string
     visualization: Optional[Dict[str, Any]] = None
+    insight: Optional[str] = None
+    thought: Optional[str] = None
     session_id: str
     thread_id: str
     tenant_id: str
     status: str = "completed"
+
+    @field_validator("result", mode="before")
+    @classmethod
+    def ensure_json_string(cls, v: Any) -> str:
+        if isinstance(v, (dict, list)):
+            return json.dumps(v, default=str)
+        return str(v) if v is not None else ""
 
 
 class SourceIn(BaseModel):
@@ -87,6 +99,7 @@ class SourceIn(BaseModel):
     db_type: str = "postgresql"
     description: str = ""
     mcp_config: Any = None # Use Any to allow raw string from frontend
+    custom_rules: Any = None
 
     @field_validator("mcp_config", mode="before")
     @classmethod
@@ -94,6 +107,18 @@ class SourceIn(BaseModel):
         if isinstance(v, str) and v.strip():
             try:
                 return json.loads(v)
+            except Exception:
+                return v
+        return v
+
+    @field_validator("custom_rules", mode="before")
+    @classmethod
+    def parse_custom_rules_in(cls, v: Any) -> Any:
+        if isinstance(v, str) and v.strip():
+            try:
+                # Store as JSON string if it's a valid JSON object/array
+                json.loads(v)
+                return v
             except Exception:
                 return v
         return v
@@ -108,10 +133,21 @@ class SourceOut(BaseModel):
     status: str = "active"
     error_message: Optional[str] = None
     mcp_config: Any = None # CRITICAL: Must be Any to receive raw DB string
+    custom_rules: Any = None
 
     @field_validator("mcp_config", mode="before")
     @classmethod
     def parse_json_config_out(cls, v: Any) -> Any:
+        if isinstance(v, str) and v.strip():
+            try:
+                return json.loads(v)
+            except Exception:
+                return v
+        return v
+
+    @field_validator("custom_rules", mode="before")
+    @classmethod
+    def parse_custom_rules_out(cls, v: Any) -> Any:
         if isinstance(v, str) and v.strip():
             try:
                 return json.loads(v)
@@ -218,7 +254,7 @@ async def list_sources(tenant_id: str, user_id: str = Depends(verify_token)) -> 
                 raise HTTPException(status_code=403, detail="Forbidden: Access to this workspace is restricted.")
 
             rows = await conn.fetch(
-                "SELECT source_id, tenant_id, name, description, db_type, status, error_message, mcp_config FROM data_sources WHERE tenant_id = $1", 
+                "SELECT source_id, tenant_id, name, description, db_type, status, error_message, mcp_config, custom_rules FROM data_sources WHERE tenant_id = $1", 
                 tenant_id
             )
             # Explicitly parse the rows to ensure mcp_config is dictionary-ready
@@ -229,6 +265,13 @@ async def list_sources(tenant_id: str, user_id: str = Depends(verify_token)) -> 
                 if isinstance(d.get("mcp_config"), str):
                     try:
                         d["mcp_config"] = json.loads(d["mcp_config"])
+                    except:
+                        pass
+                
+                # Parse custom_rules string if needed
+                if isinstance(d.get("custom_rules"), str):
+                    try:
+                        d["custom_rules"] = json.loads(d["custom_rules"])
                     except:
                         pass
                 results.append(SourceOut(**d))
@@ -252,7 +295,8 @@ async def create_source(req: SourceIn, background_tasks: BackgroundTasks, user_i
             db_url=req.db_url,
             db_type=req.db_type,
             description=req.description,
-            mcp_config=req.mcp_config
+            mcp_config=req.mcp_config,
+            custom_rules=req.custom_rules
         )
         return {"status": "ingestion_started", "source_id": req.source_id}
     except Exception as exc:
@@ -270,7 +314,7 @@ async def sync_source(tenant_id: str, source_id: str, background_tasks: Backgrou
                 raise HTTPException(status_code=403, detail="Forbidden: Access to this workspace is restricted.")
 
             row = await conn.fetchrow(
-                "SELECT db_url, db_type, description, mcp_config FROM data_sources WHERE tenant_id = $1 AND source_id = $2",
+                "SELECT db_url, db_type, description, mcp_config, custom_rules FROM data_sources WHERE tenant_id = $1 AND source_id = $2",
                 tenant_id, source_id
             )
             if not row:
@@ -282,6 +326,13 @@ async def sync_source(tenant_id: str, source_id: str, background_tasks: Backgrou
                     mcp_config = json.loads(mcp_config)
                 except:
                     pass
+            
+            custom_rules = row["custom_rules"]
+            if isinstance(custom_rules, str):
+                try:
+                    custom_rules = json.loads(custom_rules)
+                except:
+                    pass
 
             background_tasks.add_task(
                 run_ingestion,
@@ -290,7 +341,8 @@ async def sync_source(tenant_id: str, source_id: str, background_tasks: Backgrou
                 db_url=row["db_url"],
                 db_type=row["db_type"],
                 description=row["description"] or "",
-                mcp_config=mcp_config
+                mcp_config=mcp_config,
+                custom_rules=custom_rules
             )
             return {"status": "sync_started"}
         finally:
@@ -317,7 +369,7 @@ async def update_source(tenant_id: str, source_id: str, req: Dict[str, Any], use
             for i, (k, v) in enumerate(req.items(), start=1):
                 if k in ["name", "description", "db_url", "db_type", "custom_rules", "mcp_config"]:
                     fields.append(f"{k} = ${i}")
-                    if k == "mcp_config" and v is not None and not isinstance(v, str):
+                    if k in ["mcp_config", "custom_rules"] and v is not None and not isinstance(v, str):
                         values.append(json.dumps(v))
                     else:
                         values.append(v)
@@ -414,8 +466,9 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
         agent_state = await _agent.aget_state(config)
         is_paused = bool(agent_state.next)
 
-        if state.get("error") and not state.get("sql_result") and not is_paused:
-            raise HTTPException(status_code=422, detail=state["error"])
+        # If there is an error (like "table not found"), return it as a valid response
+        # so the frontend can show the specific DB error.
+        error = state.get("error")
 
         sql = state.get("sql_query") or ""
         result = state.get("sql_result") or ""
@@ -431,15 +484,25 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
         # 3. Final Safety Check on generated output
         if sql and not await _guard.is_safe(sql):
             logger.warning("Security Violation: Generated SQL blocked by Lakera Guard: %s", sql)
-            raise HTTPException(status_code=400, detail="The generated output violated security policies.")
+            return QueryResponse(
+                sql=sql,
+                result="",
+                insight="Security Violation: The generated query was blocked.",
+                session_id=session_id,
+                thread_id=thread_id,
+                tenant_id=tenant_id,
+                status="completed"
+            )
 
         if sql and result and status == "completed":
             await _thread_mgr.set_cached_result(thread_id, req.question, sql, result)
 
         return QueryResponse(
             sql=sql,
-            result=result,
+            result=result or error or "", # Pass error if no result
             visualization=viz,
+            insight=state.get("response_text") if not error else f"I encountered a database error: {error}",
+            thought=state.get("agent_thought"),
             session_id=session_id,
             thread_id=thread_id,
             tenant_id=tenant_id,
@@ -509,6 +572,8 @@ async def approve(req: ApproveRequest, user_id: str = Depends(verify_token)) -> 
             sql=sql,
             result=result,
             visualization=viz,
+            insight=state.get("response_text"),
+            thought=state.get("agent_thought"),
             session_id=req.session_id,
             thread_id=req.thread_id,
             tenant_id=req.tenant_id,
