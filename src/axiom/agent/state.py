@@ -25,3 +25,4 @@ class SQLAgentState(TypedDict):
     response_text: Optional[str]
     agent_thought: Optional[str]
     critic_feedback: Optional[str]
+    logical_blueprint: Optional[str]

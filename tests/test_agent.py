@@ -239,9 +239,8 @@ async def test_sql_execution_node_error(sample_state: SQLAgentState) -> None:
 @pytest.mark.asyncio
 async def test_graph_full_flow(sample_state: SQLAgentState, mock_rag: AsyncMock) -> None:
     """Test full agent graph execution."""
-    graph = await build_graph()
-
     with patch("axiom.agent.graph.SchemaRAG", return_value=mock_rag):
+        graph = await build_graph()
         with patch.object(SQLGenerationNode, "__call__") as mock_gen:
             mock_gen.return_value = {
                 "sql_query": "SELECT COUNT(*) FROM users WHERE active = true",

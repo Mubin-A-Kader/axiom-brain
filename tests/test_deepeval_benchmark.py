@@ -124,6 +124,12 @@ sql_correctness_metric = GEval(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("test_data", GOLD_DATASET)
 async def test_agent_performance(test_data):
+    try:
+        from chromadb import HttpClient
+        HttpClient()
+    except Exception:
+        pytest.skip("ChromaDB server is unavailable. Skipping end-to-end benchmark.")
+
     # Initialize agent
     agent = await build_graph()
     

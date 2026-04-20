@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 class QueryPlannerNode:
-    """Categorize query as REFINEMENT or NEW_TOPIC based on history."""
+    """Decompose intent and categorize query as REFINEMENT or NEW_TOPIC."""
 
     def __init__(self) -> None:
         import openai
@@ -22,44 +22,66 @@ class QueryPlannerNode:
         history_context = state.get("history_context", "No prior context.")
         question = state["question"]
         is_stale = state.get("is_stale", True)
+        schema_context = state.get("schema_context", "")
+        custom_rules = state.get("custom_rules", "")
 
-        if not history_context or "No prior" in history_context or is_stale:
-            return {"query_type": "NEW_TOPIC"}
+        is_refinement_possible = not (not history_context or "No prior" in history_context or is_stale)
 
-        prompt = f"""Analyze this query in the context of recent conversation history.
+        prompt = f"""You are an elite Data Strategist. Your function is to decompose natural language user queries into a logical execution plan before any code is generated.
 
-History:
-{history_context}
+### BUSINESS GLOSSARY (SEMANTIC LAYER):
+{custom_rules if custom_rules else "None"}
 
-New Query: {question}
+### SCHEMA CONTEXT:
+{schema_context}
 
-Is this query a REFINEMENT (follow-up to the previous query/result) or a NEW_TOPIC (asking about something different)?
+### RECENT CONVERSATION HISTORY:
+{history_context if is_refinement_possible else "No prior history to consider for this query."}
 
-Guidelines:
-- If the query uses phrases like "in that", "of those", "from that list", or refers to the previous result using pronouns ("their", "them", "it", "his", "her", "that", "those") or relative terms ("more", "higher", "latest", "recent"), it is ALWAYS a REFINEMENT.
-- Even if a new name or entity is mentioned (e.g., "anyone with name bob"), if it is contextualized by "in that" or refers to the previous results, it is a REFINEMENT.
-- If the query is completely unrelated and stands alone without needing prior context, it is a NEW_TOPIC.
-- If in doubt, choose NEW_TOPIC.
+### NEW USER QUERY:
+{question}
 
-Respond with ONLY JSON: {{"query_type": "REFINEMENT" or "NEW_TOPIC", "reason": "brief explanation"}}"""
+### INSTRUCTIONS:
+1. Determine the Query Type:
+   - If the new query relies on the conversation history (e.g., uses pronouns like "their", "it", or relative terms like "in that list", "of those", "top 5 of them"), it is a "REFINEMENT".
+   - If it stands alone and introduces a completely new analytical request, it is a "NEW_TOPIC".
+   - If {not is_refinement_possible}, it MUST be a "NEW_TOPIC".
 
-        response = await self._client.chat.completions.create(
-            model=state.get("llm_model") or settings.llm_model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-        )
+2. Define the Logical Blueprint:
+   - Break down the user's intent into a step-by-step strategy.
+   - Identify required data entities (tables).
+   - Define exact mathematical formulas for metrics (especially referring to the BUSINESS GLOSSARY if applicable).
+   - Specify grouping and sorting parameters.
+   - DO NOT write actual SQL code. Output a clear, structured natural language pseudo-code plan.
+
+Respond strictly with valid JSON in this format:
+{{
+  "query_type": "REFINEMENT" or "NEW_TOPIC",
+  "logical_blueprint": "Step 1: ... \\nStep 2: ... \\nStep 3: ..."
+}}"""
 
         try:
-            content = response.choices[0].message.content
-            import re
-            match = re.search(r"\{.*\}", content, re.DOTALL)
-            if match:
-                result = json.loads(match.group(0))
-                query_type = result.get("query_type", "NEW_TOPIC")
-            else:
-                query_type = "NEW_TOPIC"
-        except Exception as exc:
-            logger.warning("Failed to parse planner response: %s", exc)
-            query_type = "NEW_TOPIC"
+            response = await self._client.chat.completions.create(
+                model=state.get("llm_model") or settings.llm_model,
+                messages=[{"role": "system", "content": "You output only JSON."}, {"role": "user", "content": prompt}],
+                temperature=0.0,
+                response_format={"type": "json_object"}
+            )
 
-        return {"query_type": query_type}
+            content = response.choices[0].message.content.strip()
+            result = json.loads(content)
+            query_type = result.get("query_type", "NEW_TOPIC")
+            logical_blueprint = result.get("logical_blueprint", "No blueprint generated.")
+            
+            logger.info(f"Query Planner strategy: {query_type}")
+            logger.debug(f"Logical Blueprint: {logical_blueprint}")
+
+        except Exception as exc:
+            logger.warning("Failed to generate or parse planner strategy: %s", exc)
+            query_type = "NEW_TOPIC" if not is_refinement_possible else "REFINEMENT"
+            logical_blueprint = "Fallback: Direct execution requested."
+
+        return {
+            "query_type": query_type,
+            "logical_blueprint": logical_blueprint
+        }

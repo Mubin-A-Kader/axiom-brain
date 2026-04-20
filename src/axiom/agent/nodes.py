@@ -222,6 +222,7 @@ class SQLGenerationNode:
         few_shot_examples = state.get("few_shot_examples", "")
         db_type = state.get("db_type", "postgresql")
         critic_feedback = state.get("critic_feedback")
+        logical_blueprint = state.get("logical_blueprint")
 
         from axiom.connectors.factory import ConnectorFactory
         dialect_name, dialect_rules = await ConnectorFactory.get_dialect_info(db_type)
@@ -237,6 +238,9 @@ The target database is {dialect_name.upper()}.
 
 ### BUSINESS GLOSSARY (SEMANTIC LAYER):
 {custom_rules if custom_rules else "None"}
+
+### LOGICAL BLUEPRINT:
+{logical_blueprint if logical_blueprint else "No blueprint provided. Determine logic directly."}
 
 ### VERIFIED EXAMPLES:
 {few_shot_examples if few_shot_examples else "No past examples available."}

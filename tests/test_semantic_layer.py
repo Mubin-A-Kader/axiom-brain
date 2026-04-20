@@ -1,10 +1,10 @@
 import pytest
+from unittest.mock import AsyncMock
 from axiom.agent.nodes import SQLGenerationNode
-from axiom.rag.schema import SchemaRAG
 
 @pytest.mark.asyncio
 async def test_semantic_layer_enforcement():
-    rag = SchemaRAG()
+    rag = AsyncMock()
     node = SQLGenerationNode(rag)
 
     # Simulate a state where a custom metric "Net Revenue" is defined in the semantic layer
