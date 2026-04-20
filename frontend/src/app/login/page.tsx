@@ -31,10 +31,11 @@ export default async function LoginPage({
         redirectPath = '/';
       }
     } catch (err: any) {
+      console.error('Login error:', err);
       if (err.message?.includes('fetch failed')) {
-        errorMessage = 'System Connection Error: Ensure Supabase is running.';
+        errorMessage = 'System Connection Error: Ensure Supabase (Docker) is running and accessible at ' + process.env.NEXT_PUBLIC_SUPABASE_URL;
       } else {
-        throw err;
+        errorMessage = err.message || 'An unexpected error occurred.';
       }
     }
 

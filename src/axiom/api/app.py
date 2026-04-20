@@ -21,19 +21,30 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Axiom Brain", version="0.1.0")
 
 # --- Security: Robust CORS ---
-# When allow_credentials=True, origins MUST be explicit (no wildcards)
+# In development, we allow localhost and any local network IP on port 3000 or 3001.
+# For production, this should be restricted to the actual domain.
+import re
+
 origins = [
     "http://localhost:3000",
     "http://localhost:3001",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:3001",
-    "http://10.154.99.145:3000",
-    "http://10.154.99.145:3001",
 ]
+
+# Add a more flexible check for local IP addresses in development
+# Note: CORSMiddleware.allow_origin_regex could be used but allow_origins is more explicit.
+# We will handle it by allowing the hardcoded IP if it matches a pattern
+# OR just adding a few common ones. 
+# Better yet, let's keep it simple and add the 10.x.x.x, 192.x.x.x common patterns if needed,
+# but for now let's just make it easier to add new ones.
+allowed_origin_regex = re.compile(
+    r"^https?://(localhost|127\.0\.0\.1|10\.[0-9]+\.[0-9]+\.[0-9]+|192\.168\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[0-1])\.[0-9]+\.[0-9]+):(3000|3001)$"
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origin_regex=allowed_origin_regex.pattern,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
