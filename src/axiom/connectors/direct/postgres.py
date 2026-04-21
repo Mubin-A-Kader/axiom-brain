@@ -61,6 +61,7 @@ class PostgresConnector(BaseConnector):
     - STRICT QUOTING RULE: You MUST enclose any column or table name that contains an uppercase letter in double quotes (e.g., "packageId", "UserOrders").
     - Do NOT double-quote standard snake_case columns or lowercase table names (e.g., use user_id, not "user_id").
     - For partial text searches on string columns, ALWAYS use `ILIKE '%<text>%'` for case-insensitive search.
+    - JSONB CASTING RULE: You CANNOT use ILIKE on jsonb columns directly. You MUST cast to text first: `column_name::text ILIKE '%search%'`.
     - Always wrap schema, table, and column names in double quotes (e.g., "public"."Users") if they are shown as such in the SCHEMA CONTEXT.
         """.strip()
 

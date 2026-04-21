@@ -1,6 +1,6 @@
 import { useState, useCallback } from "react";
-import { ChatMessage, QueryResponse, ThreadHistory } from "../types";
-import { askQuestion, approveQuery, fetchThreadHistory } from "../lib/api";
+import { ChatMessage, QueryResponse, ThreadHistory, ReasoningStep } from "../types";
+import { askQuestion, askQuestionStream, approveQuery, fetchThreadHistory } from "../lib/api";
 
 export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: string) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -25,6 +25,14 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
     setMessages([]);
     try {
       const history = await fetchThreadHistory(newThreadId);
+
+      // Restore metadata (model, source)
+      if (history.metadata) {
+        if (history.metadata.llm_model) {
+          setSelectedModel(history.metadata.llm_model);
+        }
+      }
+
       const newMessages: ChatMessage[] = [];
       
       history.turns.forEach((turn, idx) => {
@@ -113,29 +121,146 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
     appendMessage({ id: userMsgId, role: "user", content: question });
 
     const agentMsgId = (Date.now() + 1).toString();
-    appendMessage({ id: agentMsgId, role: "agent", content: "", status: "loading" });
+    appendMessage({ 
+      id: agentMsgId, 
+      role: "agent", 
+      content: "", 
+      status: "loading",
+      reasoning_steps: []
+    });
 
     setIsLoading(true);
+    let currentSteps: ReasoningStep[] = [];
+
+    const formatNodeName = (node: string) => {
+      const parts = node.split("_");
+      return parts.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(" ");
+    };
+
+    const getStepDescription = (node: string, data: any) => {
+      if (node === "retrieve_schema") return "Scanning schema for relevant tables...";
+      if (node === "plan_query") return "Formulating logical execution plan...";
+      if (node === "generate_sql") return "Writing SQL dialect...";
+      if (node === "execute_sql") return "Executing query against database...";
+      if (node === "critic_sql") return "Validating query semantics...";
+      if (node === "synthesize_response") return "Cleaning data & generating summary...";
+      return `Processing ${formatNodeName(node)}...`;
+    };
+
     try {
-      const response = await askQuestion({
+      await askQuestionStream({
         question,
         session_id: sessionId,
         thread_id: threadId,
         tenant_id: tenantId,
         source_id: sourceId,
         model: selectedModel || undefined,
+      }, (chunk) => {
+        if (chunk.__final__) {
+           const finalState = chunk.__final__;
+           const isPaused = chunk.__is_paused__;
+
+           // Mark last step completed
+           if (currentSteps.length > 0) {
+             currentSteps[currentSteps.length - 1].status = 'completed';
+           }
+
+           const responseObj: QueryResponse = {
+              sql: finalState.sql_query || "",
+              result: finalState.sql_result || finalState.error || "",
+              insight: finalState.response_text || (finalState.error ? `Database error: ${finalState.error}` : undefined),
+              thought: finalState.agent_thought,
+              visualization: finalState.visualization ? JSON.parse(finalState.visualization) : undefined,
+              layout: finalState.layout || "default",
+              action_bar: finalState.action_bar || [],
+              probing_options: finalState.probing_options || [],
+              session_id: sessionId || finalState.session_id || "",
+              thread_id: threadId || finalState.thread_id || "",
+              tenant_id: tenantId,
+              status: isPaused ? "pending_approval" : "completed"
+           };
+           
+           // Apply final update
+           setMessages((prev) => {
+             const newMessages = [...prev];
+             const idx = newMessages.findIndex(m => m.id === agentMsgId);
+             if (idx !== -1) {
+               newMessages[idx] = {
+                 ...newMessages[idx],
+                 status: responseObj.status,
+                 content: responseObj.insight || "",
+                 reasoning_steps: currentSteps,
+                 metadata: {
+                   sql: responseObj.sql,
+                   result: responseObj.result,
+                   insight: responseObj.insight,
+                   thought: responseObj.thought,
+                   visualization: responseObj.visualization,
+                   layout: responseObj.layout,
+                   action_bar: responseObj.action_bar,
+                   probing_options: responseObj.probing_options,
+                   thread_id: responseObj.thread_id,
+                   session_id: responseObj.session_id,
+                 }
+               };
+             }
+             return newMessages;
+           });
+
+           if (!sessionId && responseObj.session_id) setSessionId(responseObj.session_id);
+           if (!threadId && responseObj.thread_id) setThreadId(responseObj.thread_id);
+
+           return;
+        }
+
+        // Process active nodes
+        const nodeNames = Object.keys(chunk);
+        if (nodeNames.length > 0) {
+          const nodeName = nodeNames[0]; // Usually one node per chunk
+          const stateData = chunk[nodeName];
+
+          // Mark previous step as completed
+          if (currentSteps.length > 0) {
+            currentSteps[currentSteps.length - 1].status = 'completed';
+          }
+          
+          // Add new step
+          currentSteps = [
+            ...currentSteps, 
+            { 
+              node: formatNodeName(nodeName), 
+              description: getStepDescription(nodeName, stateData),
+              status: 'active' 
+            }
+          ];
+
+          setMessages((prev) => {
+            const newMessages = [...prev];
+            const idx = newMessages.findIndex(m => m.id === agentMsgId);
+            if (idx !== -1) {
+              newMessages[idx] = {
+                ...newMessages[idx],
+                reasoning_steps: [...currentSteps]
+              };
+            }
+            return newMessages;
+          });
+        }
       });
-      handleResponse(response);
     } catch (error: any) {
+      if (currentSteps.length > 0) {
+        currentSteps[currentSteps.length - 1].status = 'error';
+      }
       updateLastMessage({
         status: "completed",
         isError: true,
         content: error.message || "An error occurred.",
+        reasoning_steps: currentSteps
       });
     } finally {
       setIsLoading(false);
     }
-  }, [sessionId, threadId, tenantId, sourceId, selectedModel, appendMessage, updateLastMessage, handleResponse]);
+  }, [sessionId, threadId, tenantId, sourceId, selectedModel, appendMessage, updateLastMessage]);
 
   const handleApprove = useCallback(async (approved: boolean, currentThreadId: string) => {
     setIsLoading(true);

@@ -2,9 +2,14 @@ import logging
 
 from langgraph.graph import StateGraph, END
 
-from axiom.agent.nodes import SchemaRetrievalNode, SQLGenerationNode, SQLExecutionNode, TableSelectionNode, DatabaseSelectionNode, HumanApprovalNode, DataStorytellingNode, ResponseSynthesizerNode, SQLCriticNode
+from axiom.agent.nodes import (
+    SchemaRetrievalNode, SQLGenerationNode, SQLExecutionNode, 
+    TableSelectionNode, DatabaseSelectionNode, HumanApprovalNode, 
+    DataStorytellingNode, ResponseSynthesizerNode, SQLCriticNode, DiscoveryNode
+)
 from axiom.agent.memory_manager import MemoryManagerNode
 from axiom.agent.planner import QueryPlannerNode
+from axiom.agent.probing import IntentProberNode
 from axiom.agent.state import SQLAgentState
 from axiom.agent.thread import ThreadManager
 from axiom.config import settings
@@ -14,36 +19,44 @@ logger = logging.getLogger(__name__)
 
 
 def _should_correct(state: SQLAgentState) -> str:
-    if state.get("error") and state["attempts"] < settings.max_correction_attempts:
+    error = state.get("error")
+    sql_result = state.get("sql_result")
+    attempts = state.get("attempts", 0)
+    
+    if attempts >= settings.max_correction_attempts:
+        if not error and sql_result:
+            return "visualize_data"
+        return END
+
+    if error:
+        if "does not exist" in error.lower():
+            return "discovery"
         return "critic"
-    if not state.get("error") and state.get("sql_result"):
+    
+    if sql_result:
+        import json
+        try:
+            res = json.loads(sql_result)
+            if res.get("total_count") == 0:
+                return "discovery"
+        except Exception:
+            pass
         return "visualize_data"
+        
     return END
+
+def _should_probe(state: SQLAgentState) -> str:
+    # If the user has NOT yet confirmed a source, and we found alternative candidates, we MUST probe.
+    has_confirmed = len(state.get("confirmed_tables", [])) > 0
+    
+    if not has_confirmed and state.get("probing_options") and len(state["probing_options"]) >= 2:
+        logger.info("Mandatory Probing Triggered: User must confirm business intent.")
+        return "require_probing"
+        
+    return "plan_query"
 
 def _should_synthesize(state: SQLAgentState) -> str:
     return "synthesize_response"
-
-def _should_approve(state: SQLAgentState) -> str:
-    if state.get("error"):
-        return "execute_sql"
-
-    sql = (state.get("sql_query") or "").upper()
-    
-    # Non-SELECT queries always require approval
-    if not sql.strip().startswith("SELECT"):
-        return "require_approval"
-        
-    # Complex queries with 3 or more JOINs require approval
-    if sql.count("JOIN") >= 3:
-        return "require_approval"
-        
-    # Queries hitting potentially sensitive tables require approval
-    sensitive_tables = ["USERS", "CUSTOMERS", "PASSWORDS", "CREDENTIALS", "PAYMENTS"]
-    if any(table in sql for table in sensitive_tables):
-        return "require_approval"
-        
-    # Otherwise, execute immediately
-    return "execute_sql"
 
 
 async def build_graph():
@@ -54,9 +67,11 @@ async def build_graph():
     db_routing_node = DatabaseSelectionNode()
     routing_node = TableSelectionNode(rag)
     schema_node = SchemaRetrievalNode(rag)
+    prober_node = IntentProberNode()
     planner_node = QueryPlannerNode()
     gen_node = SQLGenerationNode(rag)
     critic_node = SQLCriticNode()
+    discovery_node = DiscoveryNode()
     exec_node = SQLExecutionNode(thread_mgr)
     approval_node = HumanApprovalNode()
     viz_node = DataStorytellingNode()
@@ -67,10 +82,12 @@ async def build_graph():
     graph.add_node("route_database", db_routing_node)
     graph.add_node("route_tables", routing_node)
     graph.add_node("retrieve_schema", schema_node)
+    graph.add_node("intent_prober", prober_node)
+    graph.add_node("require_probing", approval_node) # Reuse pass-through
     graph.add_node("plan_query", planner_node)
     graph.add_node("generate_sql", gen_node)
     graph.add_node("critic", critic_node)
-    graph.add_node("require_approval", approval_node)
+    graph.add_node("discovery", discovery_node)
     graph.add_node("execute_sql", exec_node)
     graph.add_node("visualize_data", viz_node)
     graph.add_node("synthesize_response", synthesizer_node)
@@ -79,15 +96,21 @@ async def build_graph():
     graph.add_edge("memory_manager", "route_database")
     graph.add_edge("route_database", "route_tables")
     graph.add_edge("route_tables", "retrieve_schema")
-    graph.add_edge("retrieve_schema", "plan_query")
+
+    # Proactive Probing Loop
+    graph.add_edge("retrieve_schema", "intent_prober")
+    graph.add_conditional_edges("intent_prober", _should_probe)
+    graph.add_edge("require_probing", "plan_query")
+
     graph.add_edge("plan_query", "generate_sql")
-    
-    # Conditional logic for human-in-the-loop
-    graph.add_conditional_edges("generate_sql", _should_approve)
-    graph.add_edge("require_approval", "execute_sql")
-    
+
+    # Execution & Correction Loop
+    graph.add_edge("generate_sql", "execute_sql")
+
     graph.add_conditional_edges("execute_sql", _should_correct)
     graph.add_edge("critic", "generate_sql")
+
+    graph.add_edge("discovery", "generate_sql")
     graph.add_edge("visualize_data", "synthesize_response")
     graph.add_edge("synthesize_response", END)
 
@@ -103,5 +126,5 @@ async def build_graph():
 
     return graph.compile(
         checkpointer=checkpointer,
-        interrupt_before=["require_approval"],
+        interrupt_before=["require_probing"],
     )

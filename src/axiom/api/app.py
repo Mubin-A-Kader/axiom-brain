@@ -6,6 +6,7 @@ from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 
 from axiom.agent.graph import build_graph
@@ -90,6 +91,9 @@ class QueryResponse(BaseModel):
     visualization: Optional[Dict[str, Any]] = None
     insight: Optional[str] = None
     thought: Optional[str] = None
+    layout: str = "default"
+    action_bar: List[str] = []
+    probing_options: List[Dict[str, Any]] = []
     session_id: str
     thread_id: str
     tenant_id: str
@@ -101,6 +105,13 @@ class QueryResponse(BaseModel):
         if isinstance(v, (dict, list)):
             return json.dumps(v, default=str)
         return str(v) if v is not None else ""
+
+
+class FeedbackRequest(BaseModel):
+    thread_id: str
+    message_id: str
+    is_correct: bool
+    comment: Optional[str] = None
 
 
 class SourceIn(BaseModel):
@@ -188,6 +199,54 @@ import asyncpg
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+@app.post("/api/feedback")
+async def save_feedback(req: FeedbackRequest, user_id: str = Depends(verify_token)) -> dict:
+    try:
+        # Load the turn from history to identify the "Wrong Path"
+        if _thread_mgr is None: raise HTTPException(status_code=500)
+        history = await _thread_mgr.get_history(req.thread_id)
+        
+        # In a real app, we'd find the specific message by ID. 
+        # For now, we'll use the last turn since it's the one usually being flagged.
+        if not history: raise HTTPException(status_code=404, detail="History not found")
+        
+        last_turn = history[-1]
+        
+        if not req.is_correct:
+            # Generate the Negative Constraint Graft
+            # Identify the tables used in the wrong SQL
+            from sqlglot import exp, parse_one
+            wrong_tables = []
+            try:
+                parsed = parse_one(last_turn["sql"])
+                for table in parsed.find_all(exp.Table):
+                    wrong_tables.append(table.name)
+            except:
+                pass
+            
+            constraint = f"FAIL_PATH: Query '{last_turn['question']}' using tables {wrong_tables} was flagged WRONG. Reason: {req.comment or 'Incorrect result'}. DO NOT USE THESE TABLES FOR THIS INTENT AGAIN."
+            
+            # Persist this to the thread metadata so the next turn's MemoryManager picks it up
+            metadata = await _thread_mgr.get_thread_metadata(req.thread_id)
+            constraints = metadata.get("negative_constraints", [])
+            constraints.append(constraint)
+            metadata["negative_constraints"] = constraints
+            
+            # Update Redis
+            client = await _thread_mgr._get_client()
+            key = f"axiom:thread:{req.thread_id}"
+            data = await client.get(key)
+            if data:
+                parsed_data = json.loads(data)
+                parsed_data["metadata"] = metadata
+                await client.setex(key, 86400, json.dumps(parsed_data))
+                
+        return {"status": "feedback_recorded"}
+    except Exception as exc:
+        logger.exception("Failed to record feedback")
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/api/tenant", response_model=Optional[TenantOut])
@@ -427,10 +486,92 @@ async def get_thread_history(thread_id: str, user_id: str = Depends(verify_token
         if _thread_mgr is None:
              raise HTTPException(status_code=500, detail="Thread manager not initialized")
         history = await _thread_mgr.get_history(thread_id)
-        return {"turns": history}
+        metadata = await _thread_mgr.get_thread_metadata(thread_id)
+        return {"turns": history, "metadata": metadata}
     except Exception as exc:
         logger.exception("Failed to fetch thread history: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/query/stream")
+async def query_stream(req: QueryRequest, user_id: str = Depends(verify_token)):
+    if not await _guard.is_safe(req.question):
+        raise HTTPException(status_code=400, detail="Input blocked by security policy.")
+
+    session_id = req.session_id or str(uuid.uuid4())
+    thread_id = req.thread_id or str(uuid.uuid4())
+    tenant_id = req.tenant_id
+    config = {"configurable": {"thread_id": thread_id}}
+
+    history_context, is_stale = await _thread_mgr.get_context_injection(thread_id, "")
+
+    initial_state = {
+        "question": req.question,
+        "selected_tables": [],
+        "schema_context": "",
+        "few_shot_examples": "",
+        "custom_rules": "",
+        "tenant_id": tenant_id,
+        "source_id": req.source_id,
+        "sql_query": None,
+        "sql_result": None,
+        "error": None,
+        "attempts": 0,
+        "session_id": session_id,
+        "thread_id": thread_id,
+        "history_context": history_context,
+        "is_stale": is_stale,
+        "query_type": "", 
+        "visualization": None,
+        "llm_model": req.model,
+    }
+
+    async def event_generator():
+        def _json_serial(obj):
+            if isinstance(obj, (datetime, date)):
+                return obj.isoformat()
+            raise TypeError(f"Type {type(obj)} not serializable")
+
+        def _strip_heavy_data(data):
+            """Remove base64, SVG, or massive strings from streaming chunks to save tokens."""
+            if isinstance(data, dict):
+                return {k: _strip_heavy_data(v) for k, v in data.items()}
+            if isinstance(data, list):
+                return [_strip_heavy_data(i) for i in data]
+            if isinstance(data, str) and (len(data) > 2000 or data.startswith("data:image") or "<svg" in data.lower()):
+                return "[... Large Binary/Image Data Truncated ...]"
+            return data
+
+        try:
+            async for chunk in _agent.astream(initial_state, config=config, stream_mode="updates"):
+                clean_chunk = _strip_heavy_data(chunk)
+                yield f"data: {json.dumps(clean_chunk, default=_json_serial)}\n\n"
+            
+            agent_state = await _agent.aget_state(config)
+            is_paused = bool(agent_state.next)
+            final_data = agent_state.values
+            
+            safe_final = {k: v for k, v in final_data.items() if k not in ['error_log', 'verified_joins']} # Exclude non-serializable if any
+            
+            # 3. Final Safety Check on generated output
+            sql = safe_final.get("sql_query")
+            if sql and not await _guard.is_safe(sql):
+                logger.warning("Security Violation: Generated SQL blocked by Lakera Guard: %s", sql)
+                safe_final["sql_query"] = sql
+                safe_final["sql_result"] = ""
+                safe_final["response_text"] = "Security Violation: The generated query was blocked."
+            
+            if sql and safe_final.get("sql_result") and not is_paused:
+                await _thread_mgr.set_cached_result(thread_id, req.question, sql, safe_final["sql_result"])
+
+            yield f"data: {json.dumps({'__final__': safe_final, '__is_paused__': is_paused}, default=_json_serial)}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logger.exception("Error in stream")
+            yield f"data: {json.dumps({'error': str(e)}, default=_json_serial)}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.post("/query", response_model=QueryResponse)
@@ -498,13 +639,18 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
             except:
                 pass
 
-        # 3. Final Safety Check on generated output
+        layout = state.get("layout", "default")
+        action_bar = state.get("action_bar", [])
+        probing_options = state.get("probing_options", [])
+
         if sql and not await _guard.is_safe(sql):
             logger.warning("Security Violation: Generated SQL blocked by Lakera Guard: %s", sql)
             return QueryResponse(
                 sql=sql,
                 result="",
                 insight="Security Violation: The generated query was blocked.",
+                layout=layout,
+                action_bar=action_bar,
                 session_id=session_id,
                 thread_id=thread_id,
                 tenant_id=tenant_id,
@@ -520,6 +666,9 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
             visualization=viz,
             insight=state.get("response_text") if not error else f"I encountered a database error: {error}",
             thought=state.get("agent_thought"),
+            layout=layout,
+            action_bar=action_bar,
+            probing_options=probing_options,
             session_id=session_id,
             thread_id=thread_id,
             tenant_id=tenant_id,
@@ -574,6 +723,10 @@ async def approve(req: ApproveRequest, user_id: str = Depends(verify_token)) -> 
             except:
                 pass
 
+        layout = state.get("layout", "default")
+        action_bar = state.get("action_bar", [])
+        probing_options = state.get("probing_options", [])
+
         if state.get("error") and not state.get("sql_result") and not is_paused:
             raise HTTPException(status_code=422, detail=state["error"])
 
@@ -592,6 +745,8 @@ async def approve(req: ApproveRequest, user_id: str = Depends(verify_token)) -> 
                     active_filters=state.get("active_filters", []),
                     verified_joins=state.get("verified_joins", []),
                     error_log=state.get("error_log", []),
+                    llm_model=req.model,
+                    source_id=source_id,
                 )
                 if _rag:
                     await _rag.search_semantic_cache(req.tenant_id, source_id, question) # Trigger ingest on success
@@ -602,6 +757,9 @@ async def approve(req: ApproveRequest, user_id: str = Depends(verify_token)) -> 
             visualization=viz,
             insight=state.get("response_text"),
             thought=state.get("agent_thought"),
+            layout=layout,
+            action_bar=action_bar,
+            probing_options=probing_options,
             session_id=req.session_id,
             thread_id=req.thread_id,
             tenant_id=req.tenant_id,

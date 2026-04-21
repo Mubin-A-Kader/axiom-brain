@@ -21,6 +21,8 @@ class SQLAgentState(TypedDict):
     is_stale: bool
     query_type: str
     visualization: Optional[str]
+    layout: str
+    action_bar: list[str]
     llm_model: Optional[str]
     response_text: Optional[str]
     agent_thought: Optional[str]
@@ -29,3 +31,7 @@ class SQLAgentState(TypedDict):
     active_filters: list[str]
     verified_joins: list[str]
     error_log: list[str]
+    negative_constraints: list[str]
+    probing_options: list[dict]
+    confirmed_tables: list[str]
+    history_tables: list[str]

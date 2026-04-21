@@ -45,6 +45,61 @@ export async function askQuestion(req: QueryRequest): Promise<QueryResponse> {
   return resData;
 }
 
+export async function askQuestionStream(
+  req: QueryRequest,
+  onChunk: (data: any) => void
+): Promise<void> {
+  const headers = await getAuthHeaders();
+
+  const response = await fetch(`${API_URL}/query/stream`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      question: req.question,
+      session_id: req.session_id || "",
+      thread_id: req.thread_id || "",
+      tenant_id: req.tenant_id || "default_tenant",
+      source_id: req.source_id,
+      model: req.model,
+    }),
+  });
+
+  if (!response.ok) {
+    if (response.status === 401) throw new Error("Unauthorized. Please log in again.");
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.detail || "An error occurred during the query.");
+  }
+
+  if (!response.body) throw new Error("No response body");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || ""; // keep incomplete line
+
+    for (const line of lines) {
+      if (line.startsWith("data: ")) {
+        const dataStr = line.replace("data: ", "").trim();
+        if (dataStr === "[DONE]") {
+          return;
+        }
+        try {
+          const data = JSON.parse(dataStr);
+          onChunk(data);
+        } catch (e) {
+          // parse error, wait for more data
+        }
+      }
+    }
+  }
+}
+
 export async function approveQuery(req: ApproveRequest): Promise<QueryResponse> {
   console.log("approveQuery req:", req);
   const headers = await getAuthHeaders();
@@ -177,4 +232,22 @@ export async function fetchThreadHistory(threadId: string): Promise<ThreadHistor
     throw new Error("Failed to fetch thread history");
   }
   return response.json();
+}
+
+export async function sendFeedback(data: { 
+  thread_id: string, 
+  message_id: string, 
+  is_correct: boolean, 
+  comment?: string 
+}): Promise<void> {
+  const headers = await getAuthHeaders();
+  const response = await fetch(`${API_URL}/api/feedback`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(data),
+  });
+
+  if (!response.ok) {
+    throw new Error("Failed to send feedback");
+  }
 }

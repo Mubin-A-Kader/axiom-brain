@@ -1,6 +1,6 @@
 "use client";
 
-import React, { createContext, useContext, useState, useEffect, useCallback } from "react";
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from "react";
 import { ChatMessage, Thread } from "../types";
 import { useAxiomChat } from "./useAxiomChat";
 import { fetchThreads } from "../lib/api";
@@ -22,35 +22,78 @@ interface ChatContextType {
 
 const ChatContext = createContext<ChatContextType | undefined>(undefined);
 
-export function ChatProvider({ children, tenantId, selectedSourceId }: { children: React.ReactNode, tenantId: string | null, selectedSourceId: string }) {
+export function ChatProvider({ 
+  children, 
+  tenantId, 
+  selectedSourceId, 
+  onSourceRestored 
+}: { 
+  children: React.ReactNode, 
+  tenantId: string | null, 
+  selectedSourceId: string, 
+  onSourceRestored?: (sourceId: string) => void 
+}) {
   const chat = useAxiomChat(tenantId || "default", selectedSourceId);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [isThreadsLoading, setIsThreadsLoading] = useState(false);
+  const [refreshSignal, setRefreshSignal] = useState(0);
+
+  /**
+   * Global Re-validate Signal
+   * Triggers a thread fetch across the application
+   */
+  const triggerRefresh = useCallback(() => {
+    setRefreshSignal(prev => prev + 1);
+  }, []);
+
+  // Synchronize source restoration when thread metadata is loaded
+  useEffect(() => {
+     if (chat.threadId && onSourceRestored) {
+        const activeThread = threads.find(t => t.thread_id === chat.threadId);
+        if (activeThread?.metadata?.source_id) {
+           onSourceRestored(activeThread.metadata.source_id);
+        }
+     }
+  }, [chat.threadId, threads, onSourceRestored]);
 
   const refreshThreads = useCallback(async () => {
     if (!tenantId) return;
     setIsThreadsLoading(true);
     try {
+      // Map threads with workspace/tenant integrity
       const data = await fetchThreads(tenantId);
-      setThreads(data);
+      setThreads(data || []);
     } catch (err) {
-      console.error("Failed to fetch threads", err);
+      console.error("Critical: Thread Synchronization Failure", err);
     } finally {
       setIsThreadsLoading(false);
     }
   }, [tenantId]);
 
+  // Primary Fetch Hook with deep dependencies
   useEffect(() => {
     refreshThreads();
-  }, [refreshThreads, tenantId]); // Refetch when tenant changes
+  }, [refreshThreads, tenantId, refreshSignal]);
 
-  // Also refresh when a new message completes, as it might create a new thread or update one
-  const lastMessageStatus = chat.messages.length > 0 ? chat.messages[chat.messages.length - 1].status : null;
+  // New Analysis Intercept
+  const startNewThread = useCallback(() => {
+    chat.startNewThread();
+    triggerRefresh();
+  }, [chat, triggerRefresh]);
+
+  // Monitor agent completion to sync history
+  const lastAgentMsg = useMemo(() => {
+    const agentMsgs = chat.messages.filter(m => m.role === "agent");
+    return agentMsgs.length > 0 ? agentMsgs[agentMsgs.length - 1] : null;
+  }, [chat.messages]);
+
   useEffect(() => {
-    if (lastMessageStatus === "completed") {
-      refreshThreads();
+    if (lastAgentMsg?.status === "completed") {
+      // Small delay to ensure DB persistence on backend
+      const timer = setTimeout(refreshThreads, 500);
+      return () => clearTimeout(timer);
     }
-  }, [lastMessageStatus, refreshThreads]);
+  }, [lastAgentMsg?.status, refreshThreads]);
 
   const value = {
     ...chat,
@@ -58,6 +101,7 @@ export function ChatProvider({ children, tenantId, selectedSourceId }: { childre
     isThreadsLoading,
     activeThreadId: chat.threadId,
     refreshThreads,
+    startNewThread
   };
 
   return <ChatContext.Provider value={value}>{children}</ChatContext.Provider>;

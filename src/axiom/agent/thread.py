@@ -39,13 +39,13 @@ class ThreadManager:
         client = await self._get_client()
         key = f"axiom:thread:{thread_id}"
         try:
-            data = await client.get(key)
+            data = await client.get(key) # type: ignore
             if not data:
                 return []
-            
+
             if isinstance(data, bytes):
                 data = data.decode("utf-8")
-                
+
             parsed = json.loads(data)
             turns = parsed.get("turns", [])
             # Ensure every turn has the required fields to avoid crashes downstream
@@ -64,6 +64,20 @@ class ThreadManager:
         except Exception as exc:
             logger.warning("Failed to load thread history for %s: %s", thread_id, exc)
             return []
+
+    async def get_thread_metadata(self, thread_id: str) -> dict[str, Any]:
+        """Fetch thread metadata (model, source_id, etc.) from Redis."""
+        client = await self._get_client()
+        key = f"axiom:thread:{thread_id}"
+        try:
+            data = await client.get(key) # type: ignore
+            if data:
+                parsed = json.loads(data)
+                return parsed.get("metadata", {})
+        except Exception:
+            pass
+        return {}
+
 
     async def get_context_injection(self, thread_id: str, schema_context: str) -> tuple[str, bool]:
         """Build context string for the LLM and detect if stale."""
@@ -108,12 +122,28 @@ class ThreadManager:
         active_filters: list[str] | None = None,
         verified_joins: list[str] | None = None,
         error_log: list[str] | None = None,
+        llm_model: str | None = None,
+        source_id: str | None = None,
     ) -> None:
         """Save a conversation turn to Redis with 24h TTL."""
         client = await self._get_client()
         key = f"axiom:thread:{thread_id}"
 
-        history = await self.get_history(thread_id)
+        # Load existing data to preserve/update metadata
+        existing_data = await client.get(key) # type: ignore
+        metadata = {}
+        history = []
+        if existing_data:
+            parsed = json.loads(existing_data)
+            history = parsed.get("turns", [])
+            metadata = parsed.get("metadata", {})
+
+        # Update metadata if new values provided
+        if llm_model:
+            metadata["llm_model"] = llm_model
+        if source_id:
+            metadata["source_id"] = source_id
+
         turn: Turn = {
             "timestamp": time.time(),
             "question": question,
@@ -126,8 +156,13 @@ class ThreadManager:
         history.append(turn)
         history = history[-self._history_size :]
 
-        data = json.dumps({"turns": history, "last_active": time.time()})
-        await client.setex(key, 86400, data)
+        data = json.dumps({
+            "turns": history, 
+            "metadata": metadata,
+            "last_active": time.time()
+        })
+        await client.setex(key, 86400, data) # type: ignore
+
 
         # Track thread index for listing
         index_key = f"axiom:tenant:{tenant_id}:threads"
@@ -151,7 +186,8 @@ class ThreadManager:
                 threads.append({
                     "thread_id": tid,
                     "last_question": last_turn.get("question", "New Thread"),
-                    "updated_at": last_turn.get("timestamp", parsed.get("last_active", 0))
+                    "updated_at": last_turn.get("timestamp", parsed.get("last_active", 0)),
+                    "metadata": parsed.get("metadata", {})
                 })
 
         return sorted(threads, key=lambda x: x["updated_at"], reverse=True)

@@ -11,6 +11,7 @@ from sqlglot import exp
 from axiom.agent.state import SQLAgentState
 from axiom.config import settings
 from axiom.rag.schema import SchemaRAG
+from axiom.core.inference import AdaptiveInferenceManager
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,10 @@ class TableSelectionNode:
         source_id = state.get("source_id", "default_source")
         tenant_id = state["tenant_id"]
         
+        # --- ENTERPRISE GRADE: Deterministic State Usage ---
+        confirmed_tables = state.get("confirmed_tables", [])
+        history_tables = state.get("history_tables", [])
+        
         # Include history context if available
         history = state.get("history_context", "")
         if history and "No prior" not in history:
@@ -131,19 +136,62 @@ class TableSelectionNode:
             except Exception:
                 pass
 
-        summaries = await self._rag.search_table_summaries(tenant_id, source_id, search_query, n_results=10)
-        if not summaries:
+        from axiom.core.discovery import DynamicSchemaMapper
+        import asyncpg
+        
+        # 1. Perform a "Metadata Grep" to find tables by column names
+        grep_keywords = [k for k in search_query.lower().split() if len(k) > 3]
+        grepped_tables = []
+        
+        try:
+            cp_conn = await asyncpg.connect(settings.database_url, timeout=5)
+            try:
+                row = await cp_conn.fetchrow("SELECT db_url FROM data_sources WHERE source_id = $1", source_id)
+                if row:
+                    target_conn = await asyncpg.connect(row["db_url"], timeout=5)
+                    try:
+                        grepped_tables = await DynamicSchemaMapper.keyword_scan_tables(target_conn, grep_keywords)
+                    finally:
+                        await target_conn.close()
+            finally:
+                await cp_conn.close()
+        except Exception as e:
+            logger.warning(f"Metadata grep failed: {e}")
+
+        # 2. Get RAG Summaries
+        summaries = await self._rag.search_table_summaries(tenant_id, source_id, search_query, n_results=20)
+        
+        # Ensure history_tables are injected into the summary text so the LLM knows about them
+        history_summaries_text = ""
+        if history_tables:
+            # We don't have the RAG summaries for them readily, so we just list them explicitly
+            history_summaries_text += "\n### PREVIOUSLY USED TABLES (HIGHLY RELEVANT FOR FOLLOW-UPS):\n" + "\n".join([f"- {t}" for t in history_tables])
+
+        if confirmed_tables:
+            history_summaries_text += "\n### USER CONFIRMED PRIMARY SOURCE (MUST BE INCLUDED):\n" + "\n".join([f"- {t}" for t in confirmed_tables])
+
+        if not summaries and not grepped_tables and not history_tables and not confirmed_tables:
             return {"selected_tables": []}
             
         summary_text = "\n".join([f"- {s['table']}: {s['summary']}" for s in summaries])
+        if grepped_tables:
+            summary_text += "\n" + "\n".join([f"- {t}: Potential match found via column name grep." for t in grepped_tables if t not in [s['table'] for s in summaries]])
         
-        prompt = f"""You are a database routing agent.
-Given the user's question, review the following candidate tables and their descriptions.
-Select up to 3 tables that are most likely needed to answer the question.
+        summary_text += history_summaries_text
+        
+        prompt = f"""You are a database strategy agent.
+Given the user's question, review the following candidate tables.
+Your goal is to find ALL possible tables that might contain the answer.
+
+### SEARCH RULE:
+If the user confirmed a primary source in the list above, you MUST select it, AND ALSO select any other tables (like 'users' or 'customers') needed to JOIN with it.
+If the user's query is a follow-up (using pronouns or relative terms), you MUST select the tables from 'PREVIOUSLY USED TABLES'.
+If you see multiple tables that seem to store similar information (e.g. 'shared_user_answers' vs 'template_answers'), you MUST select BOTH. 
+Do not try to guess which one is "better" yet—the user will clarify this in the next step.
+Include at least 2-3 tables if there is any doubt about the data's location.
 
 ### IMPORTANT:
-Table names may be schema-qualified (e.g., "public.users" or "auth.accounts"). 
-You MUST return the names EXACTLY as they appear in the list below.
+Table names may be schema-qualified. Return names EXACTLY as listed.
 
 ### CANDIDATE TABLES:
 {summary_text}
@@ -151,27 +199,48 @@ You MUST return the names EXACTLY as they appear in the list below.
 ### QUESTION:
 {search_query}
 
-Respond ONLY with a JSON list of table names, e.g. ["table1", "table2"]. No other text or markdown."""
+Respond ONLY with a JSON list of table names, e.g. ["table1", "table2"]. No other text."""
+
+        # Get Wide Routing Parameters
+        params = AdaptiveInferenceManager.get_parameters("routing", 0)
 
         response = await self._client.chat.completions.create(
             model=state.get("llm_model") or settings.llm_model,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
+            **params
         )
         
         try:
             content = response.choices[0].message.content.strip()
             # Clean up markdown if any
+            import re
             match = re.search(r"\[.*\]", content, re.DOTALL)
             if match:
                 selected_tables = json.loads(match.group(0))
             else:
                 selected_tables = json.loads(content)
+                
+            # Fallback guarantee: if history_tables exist, force them in case the LLM ignored them
+            if history_tables:
+                for t in history_tables:
+                    # Very basic deduplication, ignoring schema prefix if needed
+                    if t not in selected_tables and not any(t in s for s in selected_tables):
+                        selected_tables.append(t)
+                        
+            if confirmed_tables:
+                for t in confirmed_tables:
+                    if t not in selected_tables and not any(t in s for s in selected_tables):
+                        selected_tables.append(t)
+                        
         except Exception as exc:
             logger.warning("Failed to parse TableSelectionNode response: %s. Output: %s", exc, content if 'content' in locals() else 'None')
             selected_tables = [s["table"] for s in summaries[:3]] # fallback to top 3
+            if history_tables:
+                selected_tables.extend(history_tables)
+            if confirmed_tables:
+                selected_tables.extend(confirmed_tables)
             
-        return {"selected_tables": selected_tables}
+        return {"selected_tables": list(set(selected_tables))}
 
 
 class SchemaRetrievalNode:
@@ -230,6 +299,8 @@ class SQLGenerationNode:
         db_type = state.get("db_type", "postgresql")
         critic_feedback = state.get("critic_feedback")
         logical_blueprint = state.get("logical_blueprint")
+        negative_constraints = state.get("negative_constraints", [])
+        confirmed_tables = state.get("confirmed_tables", [])
 
         from axiom.connectors.factory import ConnectorFactory
         dialect_name, dialect_rules = await ConnectorFactory.get_dialect_info(db_type)
@@ -239,6 +310,14 @@ The target database is {dialect_name.upper()}.
 
 ### SCHEMA CONTEXT:
 {schema_context}
+
+### USER CONFIRMED TABLES:
+{json.dumps(confirmed_tables) if confirmed_tables else "None. Determine tables autonomously."}
+CRITICAL: If a table is listed here, the user explicitly chose it. You MUST prioritize it as the primary table for your query.
+
+### NEGATIVE CONSTRAINTS (PATH BLOCKERS):
+{json.dumps(negative_constraints, indent=2) if negative_constraints else "None"}
+CRITICAL: If a table or join path is listed in Negative Constraints, it was flagged as WRONG by the user. You are FORBIDDEN from using it. If you cannot answer the question without these tables, use the <error> tags to explain why, rather than repeating a failed path.
 
 ### CONVERSATION HISTORY:
 {history_context if history_context else "No prior history."}
@@ -265,7 +344,9 @@ The target database is {dialect_name.upper()}.
 7. SECURITY MANDATE: You are ONLY allowed to generate `SELECT` queries. NEVER generate `DROP`, `DELETE`, `UPDATE`, `INSERT`, `TRUNCATE`, `ALTER`, or any other destructive commands, even if the user explicitly asks for them. If a user asks to delete or modify data, explain that you are a read-only assistant in <error> tags.
 8. Think step-by-step: 
    - Which tables do I need?
-   - Do these tables only contain technical IDs? If yes, find the descriptive table to JOIN with.
+   - Do these tables only contain technical IDs or UUIDs? If yes, find the descriptive table (e.g., users, products, categories) to JOIN with to get human-readable names.
+   - MANDATORY JOIN RULE: Never return a raw UUID (e.g., '2d3f4c9b...') or a technical ID to the user if a descriptive name is available in another table. ALWAYS join to provide the "name", "title", or "label" instead of just the ID.
+   - PIVOT RULE: If the previous turns used a table that is now in NEGATIVE CONSTRAINTS, look for neighboring tables using foreign keys or similar names to find the real source of data.
    - Which columns exist in those tables?
    - How do I join them correctly using the foreign keys shown in SCHEMA CONTEXT?
    - Match exact case for identifiers.
@@ -286,6 +367,7 @@ Question: {question}"""
 
     async def __call__(self, state: SQLAgentState) -> dict:
         attempts = state.get("attempts", 0)
+        error = state.get("error")
         
         # 1. Semantic Caching (Skip LLM if semantically identical query exists)
         if not state.get("error") and state.get("query_type") != "REFINEMENT":
@@ -302,11 +384,20 @@ Question: {question}"""
                 "attempts": attempts
             }
 
+        # Get Dynamic Parameters
+        params = AdaptiveInferenceManager.get_parameters("generation", attempts, error)
+        system_msg = AdaptiveInferenceManager.get_system_override("generation")
+        
         prompt = await self._build_prompt(state)
+        messages = []
+        if system_msg:
+            messages.append({"role": "system", "content": system_msg})
+        messages.append({"role": "user", "content": prompt})
+
         response = await self._client.chat.completions.create(
             model=state.get("llm_model") or settings.llm_model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=settings.llm_temperature,
+            messages=messages,
+            **params
         )
         content = response.choices[0].message.content.strip()
         
@@ -372,8 +463,8 @@ class SQLCriticNode:
                 return "Investigation blocked: Only SELECT queries are allowed."
             
             result = await connector.execute_query(query)
-            # Limit to 20 rows for context
-            rows = result["rows"][:20]
+            # Limit to 15 rows for better context
+            rows = result["rows"][:15]
             return json.dumps(rows, default=str)
         except Exception as exc:
             return f"Investigation execution error: {str(exc)}"
@@ -413,21 +504,19 @@ To do this, output exactly this format:
 INVESTIGATE: <your SQL query here>
 
 For example:
-INVESTIGATE: SELECT * FROM tableA LIMIT 5
+INVESTIGATE: SELECT * FROM tableA LIMIT 10
 or
-INVESTIGATE: SELECT DISTINCT status FROM orders LIMIT 10
+INVESTIGATE: SELECT DISTINCT status FROM orders LIMIT 20
 
 ### INSTRUCTIONS:
-1. MANDATORY DATA SAMPLING: Your FIRST action MUST be to sample the actual data from the tables involved in the query (especially those in the JOIN clauses). Use `INVESTIGATE: SELECT * FROM <table> LIMIT 5` to see what the data actually looks like.
+1. MANDATORY DATA SAMPLING: Your FIRST action MUST be to sample the actual data from the tables involved in the query. Use `INVESTIGATE: SELECT * FROM <table> LIMIT 10` to see what the data actually looks like.
 2. Are the IDs integers or UUID strings? Are the categorical values capitalized? Do the foreign keys in one table's sample actually exist in the other table's sample? DO NOT GUESS.
-3. Identify categorical filters or JOIN conditions that might be too restrictive or fundamentally broken.
+3. If the investigation shows that the columns you are joining on have completely different data types or values that never match, identify that as the root cause.
 4. Output your INVESTIGATE query. The system will run it and give you the results. You can investigate up to 3 times.
 5. Only AFTER you have sampled the data and found the correct values or the reason for 0 rows, output your final technical instructions for the SQL Generator in exactly this format:
 FEEDBACK: <your actionable instructions here>
 
-If you discover that a JOIN condition is completely invalid (returns 0 rows), explicitly instruct the SQL Generator to try a different relationship or alternative tables from the schema.
-If you cannot find the correct categorical value, instruct the generator to drop the problematic WHERE filter entirely to at least return some data.
-If you discover the glossary rule is incorrect or too strict based on your investigation, explicitly instruct the SQL Generator to loosen or modify the glossary formula."""
+If you discover that the data you need is NOT in the current tables, or if a JOIN is impossible because the tables are unrelated, explicitly instruct the SQL Generator to look for a different relationship or state that the current schema context might be missing the required descriptive tables."""
         else:
             prompt = f"""You are a Senior Database Administrator. Analyze the failed SQL draft against the execution traceback to identify syntax violations, logical errors, or schema mismatches.
 Provide exact, technical correction instructions.
@@ -459,12 +548,15 @@ FEEDBACK: <your instructions here>"""
         max_investigations = 3 if is_zero_results else 0
         investigations = 0
         
+        # Get Dynamic Parameters
+        params = AdaptiveInferenceManager.get_parameters("critic", state.get("attempts", 0), error)
+
         while True:
             try:
                 response = await self._client.chat.completions.create(
                     model=state.get("llm_model") or settings.llm_model,
                     messages=messages,
-                    temperature=0.0,
+                    **params
                 )
                 content = response.choices[0].message.content.strip()
                 messages.append({"role": "assistant", "content": content})
@@ -517,18 +609,18 @@ class SQLExecutionNode:
             
             # Check if it's a SELECT-like statement
             if not isinstance(parsed, (exp.Select, exp.Union, exp.Except, exp.Intersect, exp.With)):
-                return False, "Query is not a SELECT statement."
+                return False, "Security Violation: Query is not a SELECT statement."
             
             # Check for forbidden expressions within the tree (e.g. subqueries that write)
             forbidden = [exp.Update, exp.Delete, exp.Drop, exp.Insert, exp.Create, exp.Alter]
             for node in parsed.find_all(*forbidden):
-                return False, f"Forbidden command '{node.key}' detected in SQL."
+                return False, f"Security Violation: Forbidden command '{node.key}' detected in SQL."
                 
             return True, None
         except Exception as exc:
             logger.warning("SQL parsing failed for security check: %s", exc)
-            # If we can't parse it reliably, we block it to be safe
-            return False, f"SQL Security Parsing Error: {str(exc)}"
+            # If we can't parse it reliably, we block it to be safe, but label it as a syntax error
+            return False, f"SQL Syntax Error (Blocked for Security): {str(exc)}"
 
     async def __call__(self, state: SQLAgentState) -> dict:
         if state.get("error"):
@@ -543,8 +635,12 @@ class SQLExecutionNode:
         db_type = state.get("db_type", "postgresql")
         safe, sec_error = await self._is_read_only(sql, db_type)
         if not safe:
-            logger.error("Security Violation Blocked: %s (Query: %s)", sec_error, sql)
-            return {"sql_result": None, "error": f"Security violation: {sec_error}"}
+            # If it's a syntax error, we don't use the scary "Security violation" prefix in the logger
+            if "Syntax Error" in sec_error:
+                logger.info("SQL Validation failed: %s (Query: %s)", sec_error, sql)
+            else:
+                logger.error("Security Violation Blocked: %s (Query: %s)", sec_error, sql)
+            return {"sql_result": None, "error": sec_error}
         
         source_id = state.get("source_id", "default_source")
         result_update = {}
@@ -617,6 +713,8 @@ class SQLExecutionNode:
                 active_filters=state.get("active_filters", []),
                 verified_joins=state.get("verified_joins", []),
                 error_log=state.get("error_log", []),
+                llm_model=state.get("llm_model"),
+                source_id=state.get("source_id"),
             )
         
         return result_update
@@ -647,6 +745,25 @@ class DataStorytellingNode:
 
         if not rows or not columns:
             return {"visualization": None}
+
+        # --- GHOST GRAPH PREVENTION ---
+        # 1. Check for insufficient data count
+        if len(rows) < 2:
+            logger.info("Insufficient rows for visualization. Skipping.")
+            return {"visualization": json.dumps({"error_code": "INSUFFICIENT_DATA", "reason": "Single scalar or empty result"})}
+
+        # 2. Check if all numeric values are zero/null
+        has_plottable_data = False
+        for row in rows:
+            for val in row:
+                if isinstance(val, (int, float)) and val != 0:
+                    has_plottable_data = True
+                    break
+            if has_plottable_data: break
+        
+        if not has_plottable_data:
+            logger.info("Result set contains only zeros/nulls. Skipping visualization.")
+            return {"visualization": json.dumps({"error_code": "INSUFFICIENT_DATA", "reason": "No non-zero plottable values"})}
 
         # Data sample for the LLM to understand types and values
         sample = rows[:5]
@@ -704,6 +821,8 @@ Respond ONLY with the JSON object. No markdown, no filler."""
         except Exception as exc:
             logger.warning("Failed to generate visualization spec: %s", exc)
             return {"visualization": None}
+
+
 class ResponseSynthesizerNode:
     """Synthesize a human-readable answer/insight based on the SQL result."""
     def __init__(self) -> None:
@@ -721,19 +840,28 @@ class ResponseSynthesizerNode:
             return {"response_text": "I couldn't find any data to answer your question."}
 
         question = state["question"]
-        result_json = json.loads(state["sql_result"])
-        columns = result_json.get("columns", [])
-        rows = result_json.get("rows", [])
+        
+        from axiom.core.cleansing import MLGradeInterceptor
+        interceptor = MLGradeInterceptor()
+        
+        # Apply deterministic ML-grade data cleaning
+        cleaned_response = interceptor.process(state["sql_result"], anomaly_method="iqr")
+        cleaned_data = cleaned_response.data
+        metadata = cleaned_response.metadata
+        
         viz_spec = state.get("visualization")
 
-        if not rows:
+        if not cleaned_data:
             return {"response_text": "The query returned no results."}
 
+        # Extract column names from the cleaned data
+        columns = list(cleaned_data[0].keys()) if cleaned_data else []
+
         # Data sample for synthesis
-        sample = rows[:10]
+        sample = cleaned_data[:5]
         
-        prompt = f"""You are a helpful Data Assistant. 
-Based on the user's question and the data results provided, write a concise, professional response.
+        prompt = f"""You are a senior Business Analyst. 
+Based on the user's question and the cleaned data results provided, write a concise, professional response.
 
 ### USER QUESTION:
 {question}
@@ -741,14 +869,22 @@ Based on the user's question and the data results provided, write a concise, pro
 ### DATA RESULTS (Columns: {columns}):
 {sample}
 
-### TOTAL ROW COUNT: {result_json.get('total_count', len(rows))}
+### METADATA:
+- Original Row Count: {metadata.row_count_original}
+- Cleaned Row Count: {metadata.row_count_cleaned}
+- Anomalies Detected: {metadata.anomaly_detected}
+- Summary Stats: {json.dumps(metadata.summary_stats, indent=2)}
 
 ### INSTRUCTIONS:
-1. Summarize the answer directly.
-2. If there's an obvious trend or significant data point (e.g., "Product X sold the most"), highlight it.
-3. If a visualization was generated (Spec: {viz_spec}), mention it (e.g., "I've generated a chart below to show this trend").
-4. Keep it under 3 sentences. Do not show raw JSON. 
-5. Be precise but conversational.
+1. ABSOLUTELY NO RAW DATA TABLES OR JSON. You must ONLY output a conversational summary. NEVER render the data as a table, markdown grid, or raw list unless explicitly asked by the user to "show me a table".
+2. NEVER output raw UUIDs, internal IDs (e.g., user_id, file_key), or technical column names.
+3. NEVER print "null" or "None". Instead say "missing" or "not provided".
+4. DO NOT show database field names like `collection_id`, `status`, `created_at`. Use plain labels: "collection", "status", "upload date".
+5. If you need to reference an image or record, use its human-readable title or a short description. Never show the full UUID.
+6. Aggregate counts and list only the most relevant examples (max 5 items).
+7. Output in plain English, with bullet points or short sentences. 
+8. If there's an obvious trend or anomaly, highlight it. If a visualization was generated (Spec: {viz_spec}), mention it.
+9. Keep it concise. Be precise but conversational.
 
 Response:"""
 
@@ -759,7 +895,101 @@ Response:"""
                 temperature=0.7,
             )
             content = response.choices[0].message.content.strip()
-            return {"response_text": content}
+            return {"response_text": content, "sql_result": cleaned_response.frontend_json, "layout": "analytics" if viz_spec else "default", "action_bar": cleaned_response.action_bar}
         except Exception as exc:
             logger.warning("Failed to synthesize response: %s", exc)
-            return {"response_text": "Here are the results for your query:"}
+            return {"response_text": "Here are the results for your query:", "sql_result": cleaned_response.frontend_json, "layout": "analytics" if viz_spec else "default", "action_bar": cleaned_response.action_bar}
+
+
+class DiscoveryNode:
+    """
+    Detective Mode: Triggered on failure or 0-results to sniff for dynamic data patterns.
+    """
+    def __init__(self) -> None:
+        import openai
+        self._client = openai.AsyncOpenAI(
+            base_url=f"{settings.litellm_url}/v1",
+            api_key=settings.litellm_key,
+        )
+
+    async def __call__(self, state: SQLAgentState) -> dict:
+        error = state.get("error", "")
+        sql_query = state.get("sql_query", "")
+        source_id = state.get("source_id", "default_source")
+        question = state["question"]
+        negative_constraints = state.get("negative_constraints", [])
+        
+        logger.info("DiscoveryNode triggered: Sniffing for hidden data patterns...")
+
+        from axiom.core.discovery import DynamicSchemaMapper
+        
+        # 1. Connect to target DB
+        import asyncpg
+        cp_conn = await asyncpg.connect(settings.database_url, timeout=10)
+        try:
+            row = await cp_conn.fetchrow(
+                "SELECT db_url, db_type FROM data_sources WHERE source_id = $1", 
+                source_id
+            )
+            if not row: return {"critic_feedback": "Discovery failed: Data source not found."}
+            target_db_url = row["db_url"]
+        finally:
+            await cp_conn.close()
+
+        try:
+            target_conn = await asyncpg.connect(target_db_url, timeout=15)
+        except Exception as conn_err:
+            logger.error(f"Discovery connection timeout/failure: {conn_err}")
+            return {"critic_feedback": f"Discovery failed: Could not connect to target database within 15s. Verify connectivity to {source_id}.", "error": None}
+        
+        try:
+            # A. Find candidate search terms from the question (entities/names)
+            # Use LLM to extract "sniffing targets"
+            extract_prompt = f"""Extract the primary search subjects (entities, partial names, or attribute values) from this question: "{question}"
+            Return ONLY a comma-separated list of terms. No other text."""
+            
+            # Get Dynamic Parameters for Discovery
+            discovery_params = AdaptiveInferenceManager.get_parameters("discovery", state.get("attempts", 0), error)
+            discovery_system = AdaptiveInferenceManager.get_system_override("discovery")
+
+            res = await self._client.chat.completions.create(
+                model=state.get("llm_model") or settings.llm_model,
+                messages=[
+                    {"role": "system", "content": discovery_system},
+                    {"role": "user", "content": extract_prompt}
+                ],
+                **discovery_params
+            )
+            search_terms = [t.strip() for t in res.choices[0].message.content.split(",")]
+            
+            # B. Check for "Pivoting" needs if the user rejected the previous table
+            pivot_hint = ""
+            if negative_constraints:
+                pivot_hint = f"The user REJECTED the previous analysis. FAILED PATHS: {negative_constraints}. Performing Neighbor Discovery and Global Grep to avoid these tables..."
+            
+            # C. Get all searchable columns
+            all_cols = await DynamicSchemaMapper.get_searchable_columns(target_conn)
+            
+            # D. Sniff for values (Force Global Grep if Negative Constraints exist)
+            sniff_results = []
+            for term in search_terms:
+                if len(term) < 3: continue
+                hits = await DynamicSchemaMapper.sniff_value(target_conn, term, all_cols)
+                sniff_results.extend(hits)
+
+            # E. Synthesize Discovery Feedback
+            results_text = "\n".join([f"- Found '{r.sample_value}' in {r.table}.{r.column} (Pattern: {r.pattern_type})" for r in sniff_results])
+            
+            discovery_feedback = f"""{pivot_hint}
+### DISCOVERY RESULTS:
+{results_text if results_text else "No hidden data matches found for search terms."}
+
+### ALTERNATIVE PATH STRATEGY:
+1. PIVOT: The previous tables were WRONG. You must use the 'Found in' tables listed above instead.
+2. EAV Pattern: If data is in a 'key/value' table, map the 'key' column to your intent.
+3. Neighbor Search: Use foreign keys to see how these newly discovered tables link to your other entities."""
+
+            return {"critic_feedback": discovery_feedback, "error": None} 
+
+        finally:
+            await target_conn.close()

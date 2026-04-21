@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     supabase_jwks_url: str = "http://localhost:9999/.well-known/jwks.json"
 
     # Agent
-    max_correction_attempts: int = 3
+    max_correction_attempts: int = 5
     max_schema_tokens: int = 4000
 
     # App

@@ -26,6 +26,9 @@ export interface QueryResponse {
   };
   insight?: string;
   thought?: string;
+  layout?: string;
+  action_bar?: string[];
+  probing_options?: any[];
   session_id: string;
   thread_id: string;
   tenant_id: string;
@@ -54,17 +57,27 @@ export interface SourceIn {
   custom_rules?: any;
 }
 
+export interface ReasoningStep {
+  node: string;
+  description: string;
+  status: 'active' | 'completed' | 'error';
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "agent";
   content: string; // Question for user, final answer or SQL block for agent
   isError?: boolean;
-  status?: "loading" | "completed" | "pending_approval";
+  status?: "loading" | "completed" | "pending_approval" | "rejected";
+  reasoning_steps?: ReasoningStep[];
   metadata?: {
     sql?: string;
     result?: string;
     insight?: string;
     thought?: string;
+    layout?: string;
+    action_bar?: string[];
+    probing_options?: any[];
     visualization?: QueryResponse["visualization"];
     thread_id?: string;
     session_id?: string;
@@ -75,6 +88,10 @@ export interface Thread {
   thread_id: string;
   last_question: string;
   updated_at: number;
+  metadata?: {
+    llm_model?: string;
+    source_id?: string;
+  };
 }
 
 export interface ThreadHistory {
@@ -87,4 +104,8 @@ export interface ThreadHistory {
     verified_joins?: string[];
     error_log?: string[];
   }[];
+  metadata?: {
+    llm_model?: string;
+    source_id?: string;
+  };
 }

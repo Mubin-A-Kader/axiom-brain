@@ -20,17 +20,83 @@ class MemoryManagerNode:
 
     async def __call__(self, state: SQLAgentState) -> dict:
         question = state["question"]
+        thread_id = state["thread_id"]
         active_filters = state.get("active_filters", [])
         verified_joins = state.get("verified_joins", [])
         error_log = state.get("error_log", [])
         history_context = state.get("history_context", "")
+        confirmed_tables = state.get("confirmed_tables", [])
 
+        # 1. Fetch Negative Constraints and Confirmed Tables from Corrective Memory Grafting
+        from axiom.agent.thread import ThreadManager
+        thread_mgr = ThreadManager()
+        metadata = await thread_mgr.get_thread_metadata(thread_id)
+        negative_constraints = metadata.get("negative_constraints", [])
+        
+        # Load previously confirmed tables for this thread so follow-up queries don't lose context
+        if not confirmed_tables:
+            confirmed_tables = metadata.get("confirmed_tables", [])
+
+        # Extract tables from the previous successful SQL for "Refinement" context
+        history_tables = []
+        if history_context and "No prior" not in history_context:
+            import re
+            sql_matches = re.findall(r"SQL:\s*(.*?)\nResult:", history_context, re.DOTALL)
+            if sql_matches:
+                last_sql = sql_matches[-1].strip()
+                try:
+                    from sqlglot import parse_one, exp
+                    parsed = parse_one(last_sql)
+                    for table in parsed.find_all(exp.Table):
+                        # Ensure we get the raw table name without schema/quotes for matching
+                        history_tables.append(table.name)
+                except Exception as e:
+                    logger.warning(f"Failed to parse history SQL for tables: {e}")
+
+        # --- ENTERPRISE GRADE: Deterministic Command Routing ---
+        # If the frontend sends a system command (like a card click), we process it
+        # deterministically and BYPASS the LLM entirely to guarantee 100% reliability
+        # and save tokens/latency.
+        if question.startswith("CONFIRMED_SOURCE:"):
+            import re
+            table_match = re.search(r"Use the '(.*?)' table", question)
+            q_match = re.search(r"answer my question about '(.*?)'", question)
+            
+            if table_match:
+                confirmed_table = table_match.group(1)
+                real_question = q_match.group(1) if q_match else question
+                logger.info(f"System Command Executed: Confirmed Source -> {confirmed_table}")
+                
+                # Persist this confirmed table to the thread metadata for future turns
+                metadata["confirmed_tables"] = [confirmed_table]
+                client = await thread_mgr._get_client()
+                key = f"axiom:thread:{thread_id}"
+                data = await client.get(key)
+                if data:
+                    parsed_data = json.loads(data)
+                    parsed_data["metadata"] = metadata
+                    await client.setex(key, 86400, json.dumps(parsed_data))
+                
+                return {
+                    "question": real_question, # Strip the system command so the SQL generator just sees the intent
+                    "active_filters": active_filters,
+                    "verified_joins": verified_joins,
+                    "error_log": error_log,
+                    "negative_constraints": negative_constraints,
+                    "confirmed_tables": [confirmed_table],
+                    "history_tables": history_tables
+                }
+
+        # --- Standard Natural Language Processing ---
         prompt = f"""You are the Memory Manager of a State-Aware Text-to-SQL Orchestrator.
 Your job is to update the structured semantic memory based on the latest user question and the prior state.
 
 ### CURRENT STATE:
 Active Filters: {json.dumps(active_filters)}
 Verified Joins: {json.dumps(verified_joins)}
+
+### NEGATIVE CONSTRAINTS (PREVIOUSLY FAILED PATHS - DO NOT REPEAT):
+{json.dumps(negative_constraints, indent=2) if negative_constraints else "None"}
 
 ### CONVERSATION HISTORY (Context):
 {history_context if history_context else "No prior history."}
@@ -44,8 +110,9 @@ Analyze the new user query in the context of the conversation history and the cu
 2. If it is a new topic, clear the active filters and verified joins.
 3. If it is a refinement, keep the relevant active filters and add any new constraints implied by the new query.
 4. Output the updated 'active_filters' and 'verified_joins' as lists of strings.
-5. Express filters clearly, e.g., "region = 'Europe'" or "Year=2023".
-6. Express verified joins clearly if mentioned or implied by recent successful queries, e.g., "users JOIN orders".
+5. NEGATIVE ENFORCEMENT: If there are Negative Constraints, ensure your updated joins and filters DO NOT reuse the tables or logic flagged as WRONG.
+6. Express filters clearly, e.g., "region = 'Europe'" or "Year=2023".
+7. Express verified joins clearly if mentioned or implied by recent successful queries, e.g., "users JOIN orders".
 
 Respond strictly with valid JSON in this format:
 {{
@@ -67,17 +134,20 @@ Respond strictly with valid JSON in this format:
             
             new_filters = result.get("active_filters", active_filters)
             new_joins = result.get("verified_joins", verified_joins)
-            
-            logger.info(f"Memory Manager updated filters: {new_filters}")
-            logger.info(f"Memory Manager updated joins: {new_joins}")
 
         except Exception as exc:
             logger.warning("Failed to parse memory manager response: %s", exc)
             new_filters = active_filters
             new_joins = verified_joins
 
+        logger.info(f"Memory Manager updated filters: {new_filters}")
+        logger.info(f"Memory Manager updated joins: {new_joins}")
+
         return {
             "active_filters": new_filters,
             "verified_joins": new_joins,
-            "error_log": error_log # Pass through to avoid overwriting with None
+            "error_log": error_log,
+            "negative_constraints": negative_constraints,
+            "confirmed_tables": confirmed_tables,
+            "history_tables": history_tables
         }

@@ -5,10 +5,11 @@ import { Sidebar } from "./Sidebar";
 import { useChat } from "../hooks/useAxiomChatContext";
 
 function SidebarConsumer() {
-  const { threads, activeThreadId, switchThread, startNewThread } = useChat();
+  const { threads, isThreadsLoading, activeThreadId, switchThread, startNewThread } = useChat();
   return (
     <Sidebar 
       threads={threads} 
+      isThreadsLoading={isThreadsLoading}
       activeThreadId={activeThreadId} 
       onThreadSelect={switchThread} 
       onNewThread={startNewThread} 
