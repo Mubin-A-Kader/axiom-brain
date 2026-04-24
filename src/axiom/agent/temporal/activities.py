@@ -18,8 +18,57 @@ class SQLActivities:
 
     @activity.defn
     async def retrieve_schema(self, state: SQLAgentState) -> SQLAgentState:
-        update = await self.schema_node(state)
-        state.update(update)
+        from axiom.connectors.mcp.registry import mcp_registry
+        import os
+        
+        tenant_id = state["tenant_id"]
+        source_id = state.get("source_id", "default_source")
+        selected_tables = state.get("selected_tables", [])
+        search_query = state["question"]
+        
+        from axiom.security.trust.ans import AgentNamingService
+        session_did = AgentNamingService.generate_session_did(tenant_id, state.get("session_id", "default"))
+        agent_did = AgentNamingService.generate_agent_did("knowledge_retrieval", session_did)
+
+        base_url = os.environ.get("AXIOM_API_URL", "http://localhost:8080")
+        knowledge_hub_url = f"{base_url}/mcp/knowledge/sse"
+        
+        # Reuse existing connection from registry
+        connector = await mcp_registry.get_connector(
+            "knowledge_retrieval", 
+            knowledge_hub_url, 
+            {"headers": {"X-Agent-DID": agent_did}}
+        )
+        
+        try:
+            if selected_tables:
+                res = await connector._session.call_tool("retrieve_schema", arguments={
+                    "tenant_id": tenant_id,
+                    "source_id": source_id,
+                    "question": " ".join(selected_tables),
+                    "n_results": 10
+                })
+                state["schema_context"] = res.content[0].text if res.content else "No schema found."
+            else:
+                res = await connector._session.call_tool("retrieve_schema", arguments={
+                    "tenant_id": tenant_id,
+                    "source_id": source_id,
+                    "question": search_query,
+                    "n_results": 5
+                })
+                state["schema_context"] = res.content[0].text if res.content else "No schema found."
+
+            res_ex = await connector._session.call_tool("retrieve_examples", arguments={
+                "tenant_id": tenant_id,
+                "source_id": source_id,
+                "question": search_query,
+                "n_results": 2
+            })
+            state["few_shot_examples"] = res_ex.content[0].text if res_ex.content else ""
+        except Exception as e:
+            logger.error(f"Retrieve schema activity failed: {e}")
+            state["error"] = str(e)
+
         return state
 
     @activity.defn
@@ -38,14 +87,13 @@ class SQLActivities:
     async def execute_sql(self, state: SQLAgentState) -> SQLAgentState:
         # --- Phase 5: Hardware-Level Sandboxing (Simulation) ---
         from axiom.agent.temporal.sandbox import SandboxedMCPServer
+        from axiom.connectors.mcp.registry import mcp_registry
         import os
         import json
         
         sql = (state["sql_query"] or "").strip()
         source_id = state.get("source_id", "default_source")
         
-        # We need the connection details (normally fetched in the node, 
-        # but here we force sandbox execution for production-grade isolation)
         base_url = os.environ.get("AXIOM_API_URL", "http://localhost:8080")
         target_db_url = f"{base_url}/mcp/postgres/sse"
         
@@ -61,7 +109,15 @@ class SQLActivities:
         }
         
         try:
-            result = await SandboxedMCPServer.run_in_sandbox(source_id, target_db_url, config, sql)
+            # Check registry first for cached connection (even for sandbox simulation)
+            key = f"{source_id}:{target_db_url}"
+            if key in mcp_registry._connectors:
+                logger.info(f"Using cached sandbox connection for {key}")
+                connector = mcp_registry._connectors[key]
+                result = await connector.execute_query(sql)
+            else:
+                result = await SandboxedMCPServer.run_in_sandbox(source_id, target_db_url, config, sql)
+                # For this simulation, we don't cache sandboxed ones in registry to match 'one-time use' VM pattern
             
             all_rows = result["rows"]
             is_truncated = len(all_rows) > 100
