@@ -90,6 +90,10 @@ async def startup() -> None:
     hub.register_server("postgres", postgres_mcp.get_server())
     hub.register_server("knowledge", knowledge_mcp.get_server())
     app.include_router(hub.router)
+    
+    # --- Initialize A2A Router ---
+    from axiom.agent.temporal.a2a import a2a
+    app.include_router(a2a.router)
 
 
 # --- Models ---
@@ -751,22 +755,52 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
             from axiom.agent.temporal.workflows import SQLAgentWorkflow
             
             logger.info(f"Starting Temporal Workflow for thread {thread_id}")
-            state = await _temporal_client.execute_workflow(
+            handle = await _temporal_client.start_workflow(
                 SQLAgentWorkflow.run,
                 initial_state,
                 id=f"sql-agent-{thread_id}",
                 task_queue="sql-agent-tasks",
             )
+            
+            # Poll for results with a timeout to see if it paused for approval
+            # In a production SSE setup, this would be handled via events.
+            # For this REST endpoint, we poll for up to 30s.
+            import asyncio
+            for _ in range(30):
+                desc = await handle.describe()
+                # If the workflow is still running, it might be waiting for approval
+                # or still executing activities.
+                # We check the execution history or use a Query to get current state.
+                # Simplification: we'll assume if it's running after activities, it's paused.
+                # Better: implement a Query handler in the workflow to return state.
+                
+                # For this implementation, we wait a bit and then check state via handle.query
+                await asyncio.sleep(1)
+                try:
+                    # We'll add this query handler to the workflow next
+                    state = await handle.query("get_state")
+                    if state.get("sql_query") and not state.get("sql_result") and not state.get("error"):
+                        is_paused = True
+                        break
+                    if state.get("sql_result") or state.get("error"):
+                        is_paused = False
+                        break
+                except Exception:
+                    continue
+            
+            if is_paused:
+                status = "pending_approval"
+            else:
+                state = await handle.result()
+                status = "completed"
         else:
             # Fallback (e.g. for tests if temporal not running)
             raise HTTPException(status_code=503, detail="Temporal service unavailable")
 
-        # After workflow completes
+        # Extract values for response
         sql = state.get("sql_query") or ""
         result = state.get("sql_result") or ""
         error = state.get("error")
-        is_paused = False # HITL via signals not yet implemented in Step 15
-        status = "completed"
         
         layout = state.get("layout", "default")
         action_bar = state.get("action_bar", [])
@@ -814,36 +848,28 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
 async def approve(req: ApproveRequest, user_id: str = Depends(verify_token)) -> QueryResponse:
 
     try:
-        config = {"configurable": {"thread_id": req.thread_id}}
+        # --- Phase 3: Signal Temporal Workflow ---
+        if _temporal_client:
+            handle = _temporal_client.get_workflow_handle(f"sql-agent-{req.thread_id}")
+            
+            # Send signal
+            await handle.signal("approve", req.approved)
+            
+            if not req.approved:
+                 return QueryResponse(
+                    sql="", result="", session_id=req.session_id, 
+                    thread_id=req.thread_id, tenant_id=req.tenant_id, status="rejected"
+                )
 
-        # If a new model is provided during approval, update the state
-        if req.model:
-            await _agent.aupdate_state(config, {"llm_model": req.model})
-
-        agent_state = await _agent.aget_state(config)
-        
-        if not agent_state.next:
-            raise HTTPException(status_code=400, detail="No pending action to approve for this thread.")
-
-        if not req.approved:
-            return QueryResponse(
-                sql=agent_state.values.get("sql_query", ""),
-                result="",
-                session_id=req.session_id,
-                thread_id=req.thread_id,
-                tenant_id=req.tenant_id,
-                status="rejected"
-            )
-
-        state = await _agent.ainvoke(None, config=config)
-        
-        # Check if it paused again (e.g. error -> regenerate -> approval required)
-        agent_state = await _agent.aget_state(config)
-        is_paused = bool(agent_state.next)
+            # Wait for workflow completion after approval
+            state = await handle.result()
+            is_paused = False
+            status = "completed"
+        else:
+             raise HTTPException(status_code=503, detail="Temporal service unavailable")
 
         sql = state.get("sql_query") or ""
         result = state.get("sql_result") or ""
-        status = "pending_approval" if is_paused else "completed"
         
         layout = state.get("layout", "default")
         action_bar = state.get("action_bar", [])
