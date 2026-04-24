@@ -445,8 +445,9 @@ Question: {question}"""
         if sql_match:
             sql = sql_match.group(1).strip()
         else:
-            # Fallback if tags are missing
-            sql = content.replace("```sql", "").replace("```", "").strip()
+            # Fallback if tags are missing — strip thought block and markdown fences
+            sql = re.sub(r"<thought>.*?</thought>", "", content, flags=re.DOTALL)
+            sql = sql.replace("```sql", "").replace("```", "").strip()
             
         return {"sql_query": sql, "error": None, "agent_thought": thought, "attempts": state["attempts"] + 1}
 

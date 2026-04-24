@@ -132,6 +132,10 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
                 <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
                 <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
               </optgroup>
+              <optgroup label="DeepSeek">
+                <option value="deepseek-chat">DeepSeek Chat</option>
+                <option value="deepseek-reasoner">DeepSeek Reasoner</option>
+              </optgroup>
             </select>
           </div>
         </div>
