@@ -141,6 +141,33 @@ services:
     mem_limit: 1g
     cpus: 1.0
 
+  # --- Temporal.io Infrastructure ---
+  temporal:
+    container_name: temporal
+    image: temporalio/auto-setup:1.22.4
+    ports:
+      - "7233:7233"
+    environment:
+      - DB=postgresql
+      - DB_PORT=5432
+      - POSTGRES_USER=axiom
+      - POSTGRES_PWD=${POSTGRES_PASSWORD:-axiom}
+      - POSTGRES_SEEDS=postgres
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development_sql.yaml
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  temporal-ui:
+    container_name: temporal-ui
+    image: temporalio/ui:2.21.3
+    ports:
+      - "8082:8080"
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    depends_on:
+      - temporal
+
 volumes:
   postgres_data:
   redis_data:

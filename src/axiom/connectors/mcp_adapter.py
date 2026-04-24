@@ -6,6 +6,7 @@ from contextlib import AsyncExitStack
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.sse import sse_client
 
 from axiom.connectors.base import BaseConnector
 from axiom.connectors.dialects import DialectRegistry
@@ -24,10 +25,12 @@ class MCPConnector(BaseConnector):
         - command: The executable command (e.g., "npx", "python")
         - args: List of arguments
         - env: Optional environment variables
+        - headers: Optional headers for SSE transport
         """
         super().__init__(source_id, db_url, config)
         self._exit_stack = AsyncExitStack()
         self._session: Optional[ClientSession] = None
+        self._headers = self.config.get("headers", {})
 
     @property
     def dialect_name(self) -> str:
@@ -46,6 +49,20 @@ class MCPConnector(BaseConnector):
         """Launch the MCP server and initialize session."""
         if self._session:
             return
+
+        if self.db_url.startswith("http://") or self.db_url.startswith("https://"):
+            logger.info(f"Connecting to MCP SSE server for source {self.source_id}: {self.db_url}")
+            try:
+                read_stream, write_stream = await self._exit_stack.enter_async_context(
+                    sse_client(self.db_url, headers=self._headers)
+                )
+                self._session = await self._exit_stack.enter_async_context(ClientSession(read_stream, write_stream))
+                await self._session.initialize()
+                logger.info(f"Initialized MCP SSE session for source: {self.source_id}")
+                return
+            except Exception as e:
+                logger.error(f"MCP SSE Connection failed for {self.source_id}: {str(e)}")
+                raise e
 
         import shlex
         import shutil

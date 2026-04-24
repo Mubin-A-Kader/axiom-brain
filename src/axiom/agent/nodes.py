@@ -261,7 +261,7 @@ class SchemaRetrievalNode:
         tenant_id = state["tenant_id"]
         selected_tables = state.get("selected_tables", [])
         search_query = state["question"]
-        
+
         # If there's history, include the last question to help retrieve related examples
         history = state.get("history_context", "")
         if history and "No prior" not in history:
@@ -272,19 +272,56 @@ class SchemaRetrievalNode:
             except Exception:
                 pass
 
-        if selected_tables:
-            schema_context = await self._rag.retrieve_exact(tenant_id, source_id, selected_tables)
-        else:
-            # Fallback to vector search if routing yielded nothing
-            schema_context = await self._rag.retrieve(tenant_id, source_id, search_query)
-            
-        few_shot_examples = await self._rag.retrieve_examples(tenant_id, source_id, search_query)
-        
+        # --- Phase 2: Decentralized Identity (Zero Trust) ---
+        from axiom.security.trust.ans import AgentNamingService
+        session_did = AgentNamingService.generate_session_did(tenant_id, state.get("session_id", "default"))
+        agent_did = AgentNamingService.generate_agent_did("knowledge_retrieval", session_did)
+        logger.info(f"Agent {agent_did} initiated schema retrieval")
+
+        # --- Phase 1: Force Knowledge Retrieval through MCP ---
+        from axiom.connectors.mcp_adapter import MCPConnector
+        base_url = os.environ.get("AXIOM_API_URL", "http://localhost:8080")
+        knowledge_hub_url = f"{base_url}/mcp/knowledge/sse"
+
+        # Pass DID in headers for the MCP Hub to verify
+        connector = MCPConnector("knowledge_retrieval", knowledge_hub_url, {"headers": {"X-Agent-DID": agent_did}})
+        await connector.connect()
+
+        try:
+            if selected_tables:
+                # Note: Knowledge MCP server currently has retrieve_schema but not retrieve_exact 
+                # mapped as a separate tool, it uses retrieve_schema with question.
+                # Let's ensure we use the MCP tool.
+                res = await connector._session.call_tool("retrieve_schema", arguments={
+                    "tenant_id": tenant_id,
+                    "source_id": source_id,
+                    "question": " ".join(selected_tables) if selected_tables else search_query,
+                    "n_results": 10
+                })
+                schema_context = res.content[0].text if res.content else "No schema context found."
+            else:
+                res = await connector._session.call_tool("retrieve_schema", arguments={
+                    "tenant_id": tenant_id,
+                    "source_id": source_id,
+                    "question": search_query,
+                    "n_results": 5
+                })
+                schema_context = res.content[0].text if res.content else "No schema context found."
+
+            res_ex = await connector._session.call_tool("retrieve_examples", arguments={
+                "tenant_id": tenant_id,
+                "source_id": source_id,
+                "question": search_query,
+                "n_results": 2
+            })
+            few_shot_examples = res_ex.content[0].text if res_ex.content else ""
+        finally:
+            await connector.disconnect()
+
         return {
             "schema_context": schema_context,
             "few_shot_examples": few_shot_examples
         }
-
 
 class SQLGenerationNode:
     def __init__(self, rag: SchemaRAG) -> None:
@@ -1071,6 +1108,26 @@ class SQLExecutionNode:
                     target_db_url = row["db_url"]
                     db_type = row["db_type"]
                     config = json.loads(row["mcp_config"]) if row["mcp_config"] else {}
+                
+                # --- Phase 1: Force Protocol Standardization (MCP) ---
+                # All postgres queries are now routed through the internal Data Retrieval MCP Server
+                if db_type == "postgresql":
+                    logger.info("Routing PostgreSQL query through internal MCP Hub (SSE)")
+                    
+                    # --- Phase 2: Decentralized Identity (Zero Trust) ---
+                    from axiom.security.trust.ans import AgentNamingService
+                    session_did = AgentNamingService.generate_session_did(state.get("tenant_id", "default"), state.get("session_id", "default"))
+                    agent_did = AgentNamingService.generate_agent_did("sql_execution", session_did)
+                    
+                    db_type = "mcp"
+                    # We use the internal SSE endpoint of our hub
+                    base_url = os.environ.get("AXIOM_API_URL", "http://localhost:8080")
+                    target_db_url = f"{base_url}/mcp/postgres/sse"
+                    config = {
+                        "command": None, 
+                        "args": [],
+                        "headers": {"X-Agent-DID": agent_did}
+                    } 
             finally:
                 await cp_conn.close()
 

@@ -56,17 +56,40 @@ _agent = None
 _thread_mgr = None
 _rag = None
 _artifact_store = None
+_temporal_client = None
 
 
 @app.on_event("startup")
 async def startup() -> None:
-    global _agent, _thread_mgr, _rag, _artifact_store
-    _agent = await build_graph()
+    global _agent, _thread_mgr, _rag, _artifact_store, _temporal_client
+    # LangGraph Deprecation: _agent is now legacy
+    # _agent = await build_graph()
     _thread_mgr = ThreadManager()
     from axiom.rag.schema import SchemaRAG
     from axiom.notebooks.artifacts import NotebookArtifactStore
     _rag = SchemaRAG()
     _artifact_store = NotebookArtifactStore(settings.artifact_root)
+
+    # Initialize Temporal Client
+    from temporalio.client import Client
+    try:
+        _temporal_client = await Client.connect("localhost:7233")
+        logger.info("Connected to Temporal.io")
+    except Exception as e:
+        logger.warning(f"Failed to connect to Temporal: {e}. Event-sourced orchestration disabled.")
+
+    # --- Initialize MCP Hub ---
+
+    from axiom.connectors.mcp.hub import hub
+    from axiom.connectors.postgres_server import PostgresMCPServer
+    from axiom.rag.mcp_server import KnowledgeMCPServer
+    
+    postgres_mcp = PostgresMCPServer(settings.database_url)
+    knowledge_mcp = KnowledgeMCPServer(_rag)
+    
+    hub.register_server("postgres", postgres_mcp.get_server())
+    hub.register_server("knowledge", knowledge_mcp.get_server())
+    app.include_router(hub.router)
 
 
 # --- Models ---
@@ -702,40 +725,48 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
                 tenant_id=tenant_id
             )
 
-        state = await _agent.ainvoke(
-            {
-                "question": req.question,
-                "selected_tables": [],
-                "schema_context": "",
-                "few_shot_examples": "",
-                "custom_rules": "",
-                "tenant_id": tenant_id,
-                "source_id": req.source_id,
-                "sql_query": None,
-                "sql_result": None,
-                "error": None,
-                "attempts": 0,
-                "session_id": session_id,
-                "thread_id": thread_id,
-                "history_context": history_context,
-                "is_stale": is_stale,
-                "query_type": "",  # memory_manager sets this to REFINEMENT or NEW_TOPIC
-                "artifact": None,
-                "llm_model": req.model,
-            },
-            config=config,
-        )
+        initial_state = {
+            "question": req.question,
+            "selected_tables": [],
+            "schema_context": "",
+            "few_shot_examples": "",
+            "custom_rules": "",
+            "tenant_id": tenant_id,
+            "source_id": req.source_id,
+            "sql_query": None,
+            "sql_result": None,
+            "error": None,
+            "attempts": 0,
+            "session_id": session_id,
+            "thread_id": thread_id,
+            "history_context": history_context,
+            "is_stale": is_stale,
+            "query_type": "",
+            "artifact": None,
+            "llm_model": req.model,
+        }
 
-        agent_state = await _agent.aget_state(config)
-        is_paused = bool(agent_state.next)
+        # --- Phase 3: Trigger Temporal Workflow ---
+        if _temporal_client:
+            from axiom.agent.temporal.workflows import SQLAgentWorkflow
+            
+            logger.info(f"Starting Temporal Workflow for thread {thread_id}")
+            state = await _temporal_client.execute_workflow(
+                SQLAgentWorkflow.run,
+                initial_state,
+                id=f"sql-agent-{thread_id}",
+                task_queue="sql-agent-tasks",
+            )
+        else:
+            # Fallback (e.g. for tests if temporal not running)
+            raise HTTPException(status_code=503, detail="Temporal service unavailable")
 
-        # If there is an error (like "table not found"), return it as a valid response
-        # so the frontend can show the specific DB error.
-        error = state.get("error")
-
+        # After workflow completes
         sql = state.get("sql_query") or ""
         result = state.get("sql_result") or ""
-        status = "pending_approval" if is_paused else "completed"
+        error = state.get("error")
+        is_paused = False # HITL via signals not yet implemented in Step 15
+        status = "completed"
         
         layout = state.get("layout", "default")
         action_bar = state.get("action_bar", [])
