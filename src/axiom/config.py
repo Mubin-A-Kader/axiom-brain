@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     chroma_url: str = "http://localhost:8200"
     chroma_collection: str = "schema"
     chroma_token: str = "secret-chroma-token"
+    notebook_executor_url: str = "http://localhost:8090"
+    notebook_execution_timeout: int = 60
+    artifact_root: str = "/tmp/axiom-artifacts"
 
     # Security
     lakera_api_key: str = ""

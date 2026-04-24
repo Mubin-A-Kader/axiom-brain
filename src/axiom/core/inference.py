@@ -45,7 +45,7 @@ class AdaptiveInferenceManager:
         
         return {
             "temperature": temp,
-            "max_tokens": 1000 if node_name == "discovery" else 500,
+            "max_tokens": 1000 if node_name in ("discovery", "critic") else 500,
             "response_format": {"type": "json_object"} if node_name in ["planning", "discovery"] else None
         }
 

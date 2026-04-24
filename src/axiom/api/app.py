@@ -1,12 +1,12 @@
 import logging
 import uuid
 import json
-from datetime import datetime
+from datetime import date, datetime
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, field_validator
 
 from axiom.agent.graph import build_graph
@@ -55,15 +55,18 @@ _guard = LakeraGuard()
 _agent = None
 _thread_mgr = None
 _rag = None
+_artifact_store = None
 
 
 @app.on_event("startup")
 async def startup() -> None:
-    global _agent, _thread_mgr, _rag
+    global _agent, _thread_mgr, _rag, _artifact_store
     _agent = await build_graph()
     _thread_mgr = ThreadManager()
     from axiom.rag.schema import SchemaRAG
+    from axiom.notebooks.artifacts import NotebookArtifactStore
     _rag = SchemaRAG()
+    _artifact_store = NotebookArtifactStore(settings.artifact_root)
 
 
 # --- Models ---
@@ -88,7 +91,7 @@ class ApproveRequest(BaseModel):
 class QueryResponse(BaseModel):
     sql: str
     result: Any # Use Any to allow dict/str, then validate to string
-    visualization: Optional[Dict[str, Any]] = None
+    artifact: Optional[Dict[str, Any]] = None
     insight: Optional[str] = None
     thought: Optional[str] = None
     layout: str = "default"
@@ -493,6 +496,105 @@ async def get_thread_history(thread_id: str, user_id: str = Depends(verify_token
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/artifacts/{artifact_id}")
+async def get_artifact(artifact_id: str, user_id: str = Depends(verify_token)) -> Dict[str, Any]:
+    try:
+        if _artifact_store is None:
+            raise HTTPException(status_code=500, detail="Artifact store not initialized")
+        metadata = _artifact_store.load_metadata(artifact_id)
+        notebook = _artifact_store.load_notebook(artifact_id)
+        from axiom.notebooks.artifacts import NotebookArtifactStore
+
+        return {
+            "artifact": NotebookArtifactStore.public_metadata(metadata),
+            "notebook": notebook,
+        }
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to fetch artifact: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/artifacts/{artifact_id}/download")
+async def download_artifact(artifact_id: str, user_id: str = Depends(verify_token)) -> FileResponse:
+    try:
+        if _artifact_store is None:
+            raise HTTPException(status_code=500, detail="Artifact store not initialized")
+        path = _artifact_store.notebook_path(artifact_id)
+        if not path.exists():
+            raise FileNotFoundError(artifact_id)
+        return FileResponse(
+            path,
+            media_type="application/x-ipynb+json",
+            filename=f"axiom-{artifact_id}.ipynb",
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to download artifact: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/artifacts/{artifact_id}/rerun")
+async def rerun_artifact(artifact_id: str, user_id: str = Depends(verify_token)) -> Dict[str, Any]:
+    try:
+        if _artifact_store is None:
+            raise HTTPException(status_code=500, detail="Artifact store not initialized")
+
+        metadata = _artifact_store.load_metadata(artifact_id)
+        notebook = _artifact_store.load_notebook(artifact_id)
+
+        from axiom.notebooks.executor_client import NotebookExecutorClient
+
+        executor = NotebookExecutorClient(
+            settings.notebook_executor_url,
+            settings.notebook_execution_timeout,
+        )
+        try:
+            execution = await executor.execute(
+                tenant_id=metadata["tenant_id"],
+                thread_id=metadata["thread_id"],
+                artifact_id=artifact_id,
+                notebook=notebook,
+            )
+        except Exception as exc:
+            execution = {
+                "status": "failed",
+                "notebook": notebook,
+                "outputs": [],
+                "execution_error": str(exc),
+                "logs": str(exc),
+            }
+
+        artifact = _artifact_store.save(
+            artifact_id=artifact_id,
+            tenant_id=metadata["tenant_id"],
+            thread_id=metadata["thread_id"],
+            notebook=execution.get("notebook") or notebook,
+            status=execution.get("status", "failed"),
+            outputs=execution.get("outputs", []),
+            cells_summary=metadata.get("cells_summary", []),
+            execution_error=execution.get("execution_error"),
+            logs=execution.get("logs"),
+        )
+        return {
+            "artifact": artifact,
+            "notebook": _artifact_store.load_notebook(artifact_id),
+        }
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to rerun artifact: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @app.post("/query/stream")
 async def query_stream(req: QueryRequest, user_id: str = Depends(verify_token)):
     if not await _guard.is_safe(req.question):
@@ -521,8 +623,8 @@ async def query_stream(req: QueryRequest, user_id: str = Depends(verify_token)):
         "thread_id": thread_id,
         "history_context": history_context,
         "is_stale": is_stale,
-        "query_type": "", 
-        "visualization": None,
+        "query_type": "",  # memory_manager sets this to REFINEMENT or NEW_TOPIC
+        "artifact": None,
         "llm_model": req.model,
     }
 
@@ -530,7 +632,9 @@ async def query_stream(req: QueryRequest, user_id: str = Depends(verify_token)):
         def _json_serial(obj):
             if isinstance(obj, (datetime, date)):
                 return obj.isoformat()
-            raise TypeError(f"Type {type(obj)} not serializable")
+            if hasattr(obj, '__dict__'):
+                return obj.__dict__
+            return str(obj)
 
         def _strip_heavy_data(data):
             """Remove base64, SVG, or massive strings from streaming chunks to save tokens."""
@@ -543,6 +647,7 @@ async def query_stream(req: QueryRequest, user_id: str = Depends(verify_token)):
             return data
 
         try:
+            config["recursion_limit"] = 50
             async for chunk in _agent.astream(initial_state, config=config, stream_mode="updates"):
                 clean_chunk = _strip_heavy_data(chunk)
                 yield f"data: {json.dumps(clean_chunk, default=_json_serial)}\n\n"
@@ -551,7 +656,7 @@ async def query_stream(req: QueryRequest, user_id: str = Depends(verify_token)):
             is_paused = bool(agent_state.next)
             final_data = agent_state.values
             
-            safe_final = {k: v for k, v in final_data.items() if k not in ['error_log', 'verified_joins']} # Exclude non-serializable if any
+            safe_final = {k: v for k, v in final_data.items() if k not in ['error_log', 'verified_joins', 'validation_results', 'hypotheses', 'investigation_log', 'rca_report']} # Exclude non-serializable or heavy if any
             
             # 3. Final Safety Check on generated output
             sql = safe_final.get("sql_query")
@@ -583,7 +688,7 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
         session_id = req.session_id or str(uuid.uuid4())
         thread_id = req.thread_id or str(uuid.uuid4())
         tenant_id = req.tenant_id
-        config = {"configurable": {"thread_id": thread_id}}
+        config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
 
         history_context, is_stale = await _thread_mgr.get_context_injection(thread_id, "")
 
@@ -614,8 +719,8 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
                 "thread_id": thread_id,
                 "history_context": history_context,
                 "is_stale": is_stale,
-                "query_type": "", 
-                "visualization": None,
+                "query_type": "",  # memory_manager sets this to REFINEMENT or NEW_TOPIC
+                "artifact": None,
                 "llm_model": req.model,
             },
             config=config,
@@ -632,13 +737,6 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
         result = state.get("sql_result") or ""
         status = "pending_approval" if is_paused else "completed"
         
-        viz = None
-        if state.get("visualization"):
-            try:
-                viz = json.loads(state["visualization"])
-            except:
-                pass
-
         layout = state.get("layout", "default")
         action_bar = state.get("action_bar", [])
         probing_options = state.get("probing_options", [])
@@ -663,7 +761,7 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
         return QueryResponse(
             sql=sql,
             result=result or error or "", # Pass error if no result
-            visualization=viz,
+            artifact=state.get("artifact"),
             insight=state.get("response_text") if not error else f"I encountered a database error: {error}",
             thought=state.get("agent_thought"),
             layout=layout,
@@ -716,13 +814,6 @@ async def approve(req: ApproveRequest, user_id: str = Depends(verify_token)) -> 
         result = state.get("sql_result") or ""
         status = "pending_approval" if is_paused else "completed"
         
-        viz = None
-        if state.get("visualization"):
-            try:
-                viz = json.loads(state["visualization"])
-            except:
-                pass
-
         layout = state.get("layout", "default")
         action_bar = state.get("action_bar", [])
         probing_options = state.get("probing_options", [])
@@ -754,7 +845,7 @@ async def approve(req: ApproveRequest, user_id: str = Depends(verify_token)) -> 
         return QueryResponse(
             sql=sql,
             result=result,
-            visualization=viz,
+            artifact=state.get("artifact"),
             insight=state.get("response_text"),
             thought=state.get("agent_thought"),
             layout=layout,

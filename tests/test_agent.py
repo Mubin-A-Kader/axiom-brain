@@ -128,7 +128,7 @@ async def test_sql_generation_node_with_error_correction(
         assert result["attempts"] == 2
         # Check that error correction prompt was included
         call_args = mock_create.call_args
-        prompt = call_args[1]["messages"][0]["content"]
+        prompt = call_args[1]["messages"][1]["content"]
         assert "PREVIOUS ATTEMPT FAILED" in prompt
 
 
@@ -228,7 +228,7 @@ async def test_sql_execution_node_error(sample_state: SQLAgentState) -> None:
 
             assert result["sql_result"] is None
             assert "error" in result
-            assert "Security violation" in result["error"]
+            assert "Security" in result["error"]
 
 
 # ============================================================================

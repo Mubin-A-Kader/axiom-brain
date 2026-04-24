@@ -1,4 +1,14 @@
-import { ApproveRequest, QueryRequest, QueryResponse, Source, SourceIn, Thread, ThreadHistory } from "../types";
+import {
+  ApproveRequest,
+  NotebookArtifact,
+  NotebookDocument,
+  QueryRequest,
+  QueryResponse,
+  Source,
+  SourceIn,
+  Thread,
+  ThreadHistory,
+} from "../types";
 import { createClient } from "./supabase/client";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
@@ -47,7 +57,7 @@ export async function askQuestion(req: QueryRequest): Promise<QueryResponse> {
 
 export async function askQuestionStream(
   req: QueryRequest,
-  onChunk: (data: any) => void
+  onChunk: (data: Record<string, unknown>) => void
 ): Promise<void> {
   const headers = await getAuthHeaders();
 
@@ -92,7 +102,7 @@ export async function askQuestionStream(
         try {
           const data = JSON.parse(dataStr);
           onChunk(data);
-        } catch (e) {
+        } catch {
           // parse error, wait for more data
         }
       }
@@ -123,6 +133,57 @@ export async function approveQuery(req: ApproveRequest): Promise<QueryResponse> 
   }
 
   return response.json();
+}
+
+export async function fetchArtifact(
+  artifactId: string
+): Promise<{ artifact: NotebookArtifact; notebook: NotebookDocument }> {
+  const headers = await getAuthHeaders();
+  const response = await fetch(`${API_URL}/artifacts/${artifactId}`, { headers });
+
+  if (!response.ok) {
+    if (response.status === 401) throw new Error("Unauthorized. Please log in again.");
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.detail || "Failed to fetch notebook artifact.");
+  }
+
+  return response.json();
+}
+
+export async function rerunArtifact(
+  artifactId: string
+): Promise<{ artifact: NotebookArtifact; notebook: NotebookDocument }> {
+  const headers = await getAuthHeaders();
+  const response = await fetch(`${API_URL}/artifacts/${artifactId}/rerun`, {
+    method: "POST",
+    headers,
+  });
+
+  if (!response.ok) {
+    if (response.status === 401) throw new Error("Unauthorized. Please log in again.");
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.detail || "Failed to rerun notebook artifact.");
+  }
+
+  return response.json();
+}
+
+export async function downloadArtifact(artifactId: string): Promise<void> {
+  const headers = await getAuthHeaders();
+  const response = await fetch(`${API_URL}/artifacts/${artifactId}/download`, { headers });
+
+  if (!response.ok) {
+    if (response.status === 401) throw new Error("Unauthorized. Please log in again.");
+    throw new Error("Failed to download notebook artifact.");
+  }
+
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `axiom-${artifactId}.ipynb`;
+  link.click();
+  URL.revokeObjectURL(url);
 }
 
 export async function fetchSources(tenantId: string): Promise<Source[]> {

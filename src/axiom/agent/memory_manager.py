@@ -87,6 +87,43 @@ class MemoryManagerNode:
                     "history_tables": history_tables
                 }
 
+        if question.startswith("REJECTED_INTENT:"):
+            import re
+            table_match = re.search(r"The suggested tables \[(.*?)\]", question)
+            q_match = re.search(r"answer my question about '(.*?)'", question)
+            
+            real_question = q_match.group(1) if q_match else question
+            
+            if table_match:
+                rejected_tables_str = table_match.group(1)
+                # Parse the list of strings (simple split or ast)
+                rejected_tables = [t.strip().strip("'\"") for t in rejected_tables_str.split(",")]
+                
+                logger.info(f"System Command Executed: Rejected Intent -> {rejected_tables}")
+                
+                # Persist this to the thread metadata so the next turn's TableSelectionNode picks it up
+                constraint = f"FAIL_PATH: The user explicitly rejected the following tables for the intent '{real_question}': {rejected_tables}. DO NOT USE THESE TABLES."
+                negative_constraints.append(constraint)
+                metadata["negative_constraints"] = negative_constraints
+                
+                client = await thread_mgr._get_client()
+                key = f"axiom:thread:{thread_id}"
+                data = await client.get(key)
+                if data:
+                    parsed_data = json.loads(data)
+                    parsed_data["metadata"] = metadata
+                    await client.setex(key, 86400, json.dumps(parsed_data))
+                
+                return {
+                    "question": real_question, 
+                    "active_filters": active_filters,
+                    "verified_joins": verified_joins,
+                    "error_log": error_log,
+                    "negative_constraints": negative_constraints,
+                    "confirmed_tables": confirmed_tables,
+                    "history_tables": history_tables
+                }
+
         # --- Standard Natural Language Processing ---
         prompt = f"""You are the Memory Manager of a State-Aware Text-to-SQL Orchestrator.
 Your job is to update the structured semantic memory based on the latest user question and the prior state.
@@ -116,9 +153,14 @@ Analyze the new user query in the context of the conversation history and the cu
 
 Respond strictly with valid JSON in this format:
 {{
+  "query_type": "NEW_TOPIC" or "REFINEMENT",
   "active_filters": ["filter1", "filter2"],
   "verified_joins": ["join1"]
 }}
+
+query_type rules:
+- "REFINEMENT" if the new question refers to, continues, or adds detail to the previous result (e.g. "show detailed statistics", "filter that by X", "how many of those", "in that list who is...", "break it down by...")
+- "NEW_TOPIC" if it's a completely different question with no relationship to prior turns
 """
 
         try:
@@ -134,16 +176,19 @@ Respond strictly with valid JSON in this format:
             
             new_filters = result.get("active_filters", active_filters)
             new_joins = result.get("verified_joins", verified_joins)
+            query_type = result.get("query_type", "NEW_TOPIC")
 
         except Exception as exc:
             logger.warning("Failed to parse memory manager response: %s", exc)
             new_filters = active_filters
             new_joins = verified_joins
+            query_type = "NEW_TOPIC"
 
         logger.info(f"Memory Manager updated filters: {new_filters}")
-        logger.info(f"Memory Manager updated joins: {new_joins}")
+        logger.info(f"Memory Manager query_type: {query_type}")
 
         return {
+            "query_type": query_type,
             "active_filters": new_filters,
             "verified_joins": new_joins,
             "error_log": error_log,

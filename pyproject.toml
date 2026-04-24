@@ -30,6 +30,11 @@ dependencies = [
     "PyYAML>=6.0.0",
     "pandas>=3.0.2",
     "numpy>=2.4.4",
+    "matplotlib>=3.10.0",
+    "plotly>=5.0.0",
+    "nbclient>=0.10.0",
+    "nbformat>=5.10.0",
+    "ipykernel>=6.29.0",
 ]
 
 [project.optional-dependencies]

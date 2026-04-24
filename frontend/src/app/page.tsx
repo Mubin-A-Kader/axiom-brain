@@ -51,7 +51,7 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const router = useRouter();
 
-  const latestArtifactMsg = [...messages].reverse().find((m: any) => m.metadata?.result || m.metadata?.visualization);
+  const latestArtifactMsg = [...messages].reverse().find((m: any) => m.metadata?.result || m.metadata?.artifact);
   
   // Logic: Prefer manually selected artifact, otherwise fall back to the latest one
   const activeArtifactMsg = selectedArtifactId 
@@ -120,8 +120,18 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
               value={selectedModel}
               onChange={(e) => setSelectedModel(e.target.value)}
             >
-              <option value="gemini-1.5-flash">Gemini 1.5</option>
-              <option value="gpt-4o-mini">GPT-4o Mini</option>
+              <optgroup label="Claude">
+                <option value="claude-sonnet">Claude Sonnet ★</option>
+                <option value="claude-opus">Claude Opus</option>
+              </optgroup>
+              <optgroup label="OpenAI">
+                <option value="gpt-4o">GPT-4o</option>
+                <option value="gpt-4o-mini">GPT-4o Mini</option>
+              </optgroup>
+              <optgroup label="Gemini">
+                <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+                <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
+              </optgroup>
             </select>
           </div>
         </div>
@@ -179,7 +189,7 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
                           : 'hover:bg-white/5 border border-transparent'
                         }`}
                         onClick={() => {
-                          if (msg.metadata?.result || msg.metadata?.visualization) {
+                          if (msg.metadata?.result || msg.metadata?.artifact) {
                             setSelectedArtifactId(msg.id);
                             setShowArtifacts(true);
                           }
@@ -188,12 +198,14 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
                         {/* Vertical connector line */}
                         <div className="absolute top-0 left-0 w-px h-full bg-[#638A70]/10 ml-[-2px]" />
 
-                        <IntelligenceOrb 
-                          steps={msg.reasoning_steps || []} 
-                          isCompleted={msg.status === "completed"} 
-                          thought={msg.metadata?.thought} 
-                          sql={msg.metadata?.sql}
-                        />
+                        <div className="mt-2">
+                          <IntelligenceOrb
+                            steps={msg.reasoning_steps || []}
+                            isCompleted={msg.status === "completed"}
+                            thought={msg.metadata?.thought}
+                            sql={msg.metadata?.sql}
+                          />
+                        </div>
 
                         {/* Proactive Probing Comparison Card (Shows during pause) */}
                         {msg.metadata?.probing_options && msg.metadata.probing_options.length > 0 && (
@@ -235,11 +247,27 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
                                   </div>
                                 ))}
                               </div>
+
+                              <div className="pt-4 border-t border-white/5 flex justify-end">
+                                <button 
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    const prevMsg = messages[messages.findIndex((m: any) => m.id === msg.id) - 1];
+                                    const userQ = prevMsg ? prevMsg.content : "";
+                                    const suggestedTables = msg.metadata.probing_options.map((opt: any) => `'${opt.table_name}'`).join(", ");
+                                    sendMessage(`REJECTED_INTENT: The suggested tables [${suggestedTables}] are not what I meant. Please find other tables to answer my question about '${userQ}'.`);
+                                  }}
+                                  className="text-[10px] font-bold uppercase tracking-widest text-[#E6E1D8]/40 hover:text-[#C26D5C] transition-all flex items-center gap-2"
+                                >
+                                  <X className="w-3 h-3" />
+                                  None of these match my intent
+                                </button>
+                              </div>
                            </div>
                         )}
 
                         {/* Click indicator for messages with artifacts */}
-                        {(msg.metadata?.result || msg.metadata?.visualization) && (
+                        {(msg.metadata?.result || msg.metadata?.artifact) && (
                           <div className={`absolute top-2 right-4 flex items-center gap-2 px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-widest transition-all ${
                             activeArtifactMsg?.id === msg.id && isArtifactActive
                             ? 'bg-[#638A70] text-[#1E1E1C]'

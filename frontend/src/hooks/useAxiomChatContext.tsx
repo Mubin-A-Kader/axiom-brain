@@ -15,6 +15,7 @@ interface ChatContextType {
   setSelectedModel: (model: string) => void;
   sendMessage: (question: string) => Promise<void>;
   handleApprove: (approved: boolean, threadId: string) => Promise<void>;
+  markAsWrong: (messageId: string, comment?: string) => Promise<void>;
   startNewThread: () => void;
   switchThread: (threadId: string) => Promise<void>;
   refreshThreads: () => Promise<void>;
@@ -72,7 +73,7 @@ export function ChatProvider({
 
   // Primary Fetch Hook with deep dependencies
   useEffect(() => {
-    refreshThreads();
+    void Promise.resolve().then(refreshThreads);
   }, [refreshThreads, tenantId, refreshSignal]);
 
   // New Analysis Intercept

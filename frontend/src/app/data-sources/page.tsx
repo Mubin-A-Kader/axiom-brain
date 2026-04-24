@@ -457,7 +457,11 @@ export default function DataSourcesPage() {
                         onClick={() => {
                           const nextMode = !isCodeView;
                           if (nextMode) {
-                            setLocalJson(JSON.stringify(formData.metrics, null, 2));
+                            setLocalJson(
+                              formData.metrics.length > 0
+                                ? JSON.stringify(formData.metrics, null, 2)
+                                : ""
+                            );
                           }
                           setIsCodeView(nextMode);
                         }}
@@ -497,7 +501,7 @@ export default function DataSourcesPage() {
                             // Allow invalid JSON while typing, don't update state yet
                           }
                         }}
-                        placeholder='[{"name": "Revenue", "formula": "SUM(amount)", "description": "Total sales"}]'
+                        placeholder={`[\n  {\n    "name": "Revenue",\n    "formula": "SUM(amount) WHERE status = 'completed'",\n    "description": "Use when asked for total sales or income"\n  },\n  {\n    "name": "Active Users",\n    "formula": "COUNT(DISTINCT user_id) WHERE last_seen > NOW() - INTERVAL 30 DAY",\n    "description": "Users active in the last 30 days"\n  }\n]`}
                       />
                       <p className="text-[9px] text-[#E6E1D8]/20 font-mono">PASTE VALID JSON ARRAY OF METRICS ABOVE</p>
                     </div>
@@ -560,8 +564,25 @@ export default function DataSourcesPage() {
                         </div>
                       ))}
                       {formData.metrics.length === 0 && (
-                        <div className="py-8 border border-dashed border-white/5 rounded-lg text-center">
-                           <p className="text-xs text-[#E6E1D8]/20 italic">No business metrics defined yet.</p>
+                        <div className="border border-dashed border-white/5 rounded-lg p-5 space-y-3">
+                          <p className="text-[10px] font-mono text-[#E6E1D8]/25 uppercase tracking-widest text-center mb-4">Expected Format</p>
+                          <div className="bg-[#1E1E1C] border border-white/5 rounded-lg p-4 space-y-3 opacity-30 pointer-events-none select-none">
+                            <div className="grid grid-cols-2 gap-4">
+                              <div className="space-y-1">
+                                <p className="text-[9px] font-mono text-[#638A70] uppercase tracking-widest">Metric Name</p>
+                                <p className="text-xs text-[#E6E1D8]">Revenue</p>
+                              </div>
+                              <div className="space-y-1">
+                                <p className="text-[9px] font-mono text-[#638A70] uppercase tracking-widest">SQL Formula / Logic</p>
+                                <p className="text-xs font-mono text-[#E6E1D8]">{"SUM(amount) WHERE status = 'completed'"}</p>
+                              </div>
+                              <div className="col-span-full space-y-1">
+                                <p className="text-[9px] font-mono text-[#638A70] uppercase tracking-widest">Description (When to use this)</p>
+                                <p className="text-xs text-[#E6E1D8]">Use when asked for total sales, income, or revenue</p>
+                              </div>
+                            </div>
+                          </div>
+                          <p className="text-[10px] text-[#E6E1D8]/20 text-center pt-1">Click <span className="text-[#638A70]">+ Add Metric</span> to define your first business rule</p>
                         </div>
                       )}
                     </div>

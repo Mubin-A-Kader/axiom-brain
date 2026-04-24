@@ -51,12 +51,22 @@ class IntentProberNode:
 
     async def __call__(self, state: SQLAgentState) -> dict:
         selected_tables = state.get("selected_tables", [])
+        confirmed_tables = state.get("confirmed_tables", [])
+        history_tables = state.get("history_tables", [])
+        
+        # We only want to probe for NEW ambiguities. 
+        # Exclude already confirmed or historically successful tables from the probing set.
+        unconfirmed_tables = [
+            t for t in selected_tables 
+            if t not in confirmed_tables and t not in history_tables
+        ]
+        
         source_id = state.get("source_id")
         tenant_id = state["tenant_id"]
         question = state["question"]
         
-        # MANDATORY PROBE: If we have 2 or more tables, we SHOW them. No more guessing.
-        if not selected_tables or len(selected_tables) < 2:
+        # MANDATORY PROBE: If we have 2 or more UNCONFIRMED tables, we SHOW them. No more guessing.
+        if not unconfirmed_tables or len(unconfirmed_tables) < 2:
              return {"probing_options": []}
 
         # 1. Connectivity
@@ -72,11 +82,11 @@ class IntentProberNode:
             logger.error(f"Prober failed to connect to control plane: {e}")
             return {"probing_options": []}
 
-        logger.info(f"Mandatory Probing Triggered for tables: {selected_tables}")
+        logger.info(f"Mandatory Probing Triggered for unconfirmed tables: {unconfirmed_tables}")
 
         probing_options = []
         # Sample the top 3 candidates
-        for i, table in enumerate(selected_tables[:3]):
+        for i, table in enumerate(unconfirmed_tables[:3]):
             samples = await self._get_samples(db_url, table)
             
             translate_prompt = f"""Translate this database table name and its sample data into a clear Business Entity name and description.

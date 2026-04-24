@@ -20,7 +20,7 @@ class SQLAgentState(TypedDict):
     history_context: str
     is_stale: bool
     query_type: str
-    visualization: Optional[str]
+    artifact: Optional[dict]
     layout: str
     action_bar: list[str]
     llm_model: Optional[str]
@@ -35,3 +35,12 @@ class SQLAgentState(TypedDict):
     probing_options: list[dict]
     confirmed_tables: list[str]
     history_tables: list[str]
+    last_sql_result: Optional[str]  # last non-CONCLUDED sql_result, used by notebook builder after action_plan clears sql_result
+    # RCA specific fields
+    problem_statement: Optional[str]
+    hypotheses: list[str]
+    validation_results: list[dict]
+    investigation_log: list[str]
+    investigation_attempts: int
+    root_cause_confidence: Optional[str]
+    rca_report: Optional[dict]

@@ -38,23 +38,56 @@ class DynamicSchemaMapper:
         # Simplify to use the first/main keyword for the check to keep it fast
         rows = await conn.fetch(query, search_pattern)
         return [r['table_name'] for r in rows]
-        """Use Levenshtein distance (via pg_trgm if available or manual) to find similar tables."""
+
+    @staticmethod
+    async def find_similar_tables(conn: asyncpg.Connection, target: str) -> List[str]:
+        """Find tables with names similar to target.
+
+        Returns list of schema."table" strings. Prioritises exact case-insensitive
+        matches so lead_lead → lead_Lead is always found before fuzzy candidates.
+        """
+        bare = target.split(".")[-1].strip('"').strip("'")
+
+        # 1. Exact case-insensitive match (handles capitalisation mismatches like lead_lead → lead_Lead)
+        exact_rows = await conn.fetch(
+            """SELECT schemaname, tablename
+               FROM pg_catalog.pg_tables
+               WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+                 AND lower(tablename) = lower($1)
+               LIMIT 5""",
+            bare,
+        )
+        if exact_rows:
+            return [f'{r["schemaname"]}."{r["tablename"]}"' for r in exact_rows]
+
+        # 2. Fuzzy: pg_trgm similarity if available, otherwise ILIKE substring
         try:
-            # Check for pg_trgm extension
             has_trgm = await conn.fetchval("SELECT count(*) FROM pg_extension WHERE extname = 'pg_trgm'")
             if has_trgm:
-                query = "SELECT tablename FROM pg_catalog.pg_tables WHERE tablename % $1 ORDER BY similarity(tablename, $1) DESC LIMIT 5"
-                rows = await conn.fetch(query, target)
-                return [r['tablename'] for r in rows]
+                rows = await conn.fetch(
+                    """SELECT schemaname, tablename
+                       FROM pg_catalog.pg_tables
+                       WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+                         AND tablename % $1
+                       ORDER BY similarity(tablename, $1) DESC
+                       LIMIT 5""",
+                    bare,
+                )
+                if rows:
+                    return [f'{r["schemaname"]}."{r["tablename"]}"' for r in rows]
         except Exception:
             pass
-        
-        # Fallback: Simple ILIKE search
+
+        # 3. Substring ILIKE fallback
         rows = await conn.fetch(
-            "SELECT tablename FROM pg_catalog.pg_tables WHERE tablename ILIKE $1 LIMIT 5",
-            f"%{target}%"
+            """SELECT schemaname, tablename
+               FROM pg_catalog.pg_tables
+               WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+                 AND tablename ILIKE $1
+               LIMIT 5""",
+            f"%{bare}%",
         )
-        return [r['tablename'] for r in rows]
+        return [f'{r["schemaname"]}."{r["tablename"]}"' for r in rows]
 
     @staticmethod
     async def get_searchable_columns(conn: asyncpg.Connection, schema: str = 'public') -> List[Dict[str, str]]:
@@ -64,7 +97,7 @@ class DynamicSchemaMapper:
             FROM information_schema.columns 
             WHERE table_schema = $1 
             AND data_type IN ('text', 'character varying', 'jsonb')
-            AND table_name NOT IN (SELECT tablename FROM pg_catalog.pg_views)
+            AND table_name NOT IN (SELECT viewname FROM pg_catalog.pg_views)
         """
         rows = await conn.fetch(query, schema)
         return [{"table": r['table_name'], "column": r['column_name'], "type": r['data_type']} for r in rows]

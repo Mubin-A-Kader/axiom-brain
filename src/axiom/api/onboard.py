@@ -5,12 +5,120 @@ import logging
 from typing import Optional, Dict, Any
 
 import asyncpg
+import openai
 from axiom.config import settings
 from axiom.rag.schema import SchemaRAG
 from axiom.connectors.factory import ConnectorFactory
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+_SUMMARY_PROMPT = """You are a database documentation expert. Given a table's DDL and a sample of its data, write a concise 2-3 sentence description for a semantic search index.
+
+Your description MUST:
+- State what real-world entity or concept this table stores
+- Call out any EAV/key-value patterns (e.g. if a column like `system_label`, `key`, `question_type`, or `answer_key` stores categories, list a few real example values from the sample)
+- Mention how this table joins to related tables (foreign keys)
+- Use plain English that a non-technical user's question could match against
+
+DDL:
+{ddl}
+
+Sample rows (up to 5):
+{sample}
+
+Write ONLY the description. No preamble, no bullet points."""
+
+
+# Columns that are likely EAV "key" columns — sample DISTINCT values for these
+_EAV_KEY_COLUMNS = {"system_label", "key", "label", "question_type", "answer_key", "attribute", "field_name", "metric_name", "event_type", "category"}
+
+
+async def _generate_table_summary(
+    client: openai.AsyncOpenAI,
+    model: str,
+    table_name: str,
+    ddl: str,
+    connector,
+    sem: asyncio.Semaphore,
+) -> str:
+    """Sample table data and ask the LLM for a rich semantic summary."""
+    async with sem:
+        sample_text = "No sample available."
+        try:
+            # Detect EAV key columns from the DDL and sample their DISTINCT values
+            import re
+            col_names = re.findall(r'"(\w+)"\s+(?:text|character varying)', ddl, re.IGNORECASE)
+            eav_cols = [c for c in col_names if c.lower() in _EAV_KEY_COLUMNS]
+
+            extra_samples = []
+            for col in eav_cols[:2]:
+                try:
+                    r = await connector.execute_query(
+                        f'SELECT DISTINCT "{col}" FROM {table_name} WHERE "{col}" IS NOT NULL ORDER BY "{col}" LIMIT 50'
+                    )
+                    vals = [str(row[0]) for row in r.get("rows", [])]
+                    if vals:
+                        extra_samples.append(f'DISTINCT "{col}" values: {", ".join(vals)}')
+                except Exception:
+                    pass
+
+            # Regular row sample
+            result = await connector.execute_query(f'SELECT * FROM {table_name} LIMIT 5')
+            rows = result.get("rows", [])
+            cols = result.get("columns", [])
+            if rows and cols:
+                lines = [", ".join(str(v) for v in row) for row in rows[:5]]
+                sample_text = "columns: " + ", ".join(cols) + "\n" + "\n".join(lines)
+                if extra_samples:
+                    sample_text += "\n\n" + "\n".join(extra_samples)
+            elif extra_samples:
+                sample_text = "\n".join(extra_samples)
+        except Exception:
+            pass
+
+        try:
+            resp = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": _SUMMARY_PROMPT.format(
+                    ddl=ddl[:1500],      # cap DDL in prompt — avoid huge tables
+                    sample=sample_text[:1000],
+                )}],
+                max_tokens=150,
+                temperature=0.2,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as exc:
+            logger.warning("Summary generation failed for %s: %s", table_name, exc)
+            return f"Table containing {table_name} data."
+
+
+async def enrich_schema_with_summaries(
+    schema: dict,
+    connector,
+    model: str,
+    concurrency: int = 5,
+) -> dict:
+    """Generate rich LLM summaries for every table in the schema dict (in-place)."""
+    client = openai.AsyncOpenAI(
+        base_url=f"{settings.litellm_url}/v1",
+        api_key=settings.litellm_key,
+    )
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _enrich(table_name: str, meta: dict) -> tuple[str, str]:
+        summary = await _generate_table_summary(
+            client, model, table_name, meta["ddl"], connector, sem
+        )
+        return table_name, summary
+
+    tasks = [_enrich(t, m) for t, m in schema.items()]
+    results = await asyncio.gather(*tasks)
+
+    for table_name, summary in results:
+        schema[table_name]["description"] = summary
+
+    return schema
 
 async def run_ingestion(
     tenant_id: str, 
@@ -42,9 +150,12 @@ async def run_ingestion(
         if not schema:
             raise Exception(f"No schema information found for {source_id}")
             
-        logger.info(f"Extracted {len(schema)} tables. Ingesting into ChromaDB...")
+        logger.info(f"Extracted {len(schema)} tables. Generating rich summaries...")
+        llm_model = settings.llm_model
+        schema = await enrich_schema_with_summaries(schema, connector, llm_model)
+
+        logger.info(f"Ingesting {len(schema)} tables into ChromaDB...")
         rag = SchemaRAG()
-        # Pass tenant_id to ingest for strict isolation
         rag.ingest(tenant_id, source_id, schema)
         
         # 4. Final update: mark as active

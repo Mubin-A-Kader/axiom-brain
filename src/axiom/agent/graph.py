@@ -3,13 +3,11 @@ import logging
 from langgraph.graph import StateGraph, END
 
 from axiom.agent.nodes import (
-    SchemaRetrievalNode, SQLGenerationNode, SQLExecutionNode, 
-    TableSelectionNode, DatabaseSelectionNode, HumanApprovalNode, 
-    DataStorytellingNode, ResponseSynthesizerNode, SQLCriticNode, DiscoveryNode
+    SchemaRetrievalNode, SQLGenerationNode, SQLExecutionNode,
+    TableSelectionNode, DatabaseSelectionNode,
+    NotebookArtifactNode, ResponseSynthesizerNode, SQLCriticNode, DiscoveryNode
 )
 from axiom.agent.memory_manager import MemoryManagerNode
-from axiom.agent.planner import QueryPlannerNode
-from axiom.agent.probing import IntentProberNode
 from axiom.agent.state import SQLAgentState
 from axiom.agent.thread import ThreadManager
 from axiom.config import settings
@@ -22,40 +20,34 @@ def _should_correct(state: SQLAgentState) -> str:
     error = state.get("error")
     sql_result = state.get("sql_result")
     attempts = state.get("attempts", 0)
-    
-    if attempts >= settings.max_correction_attempts:
-        if not error and sql_result:
-            return "visualize_data"
-        return END
 
-    if error:
-        if "does not exist" in error.lower():
-            return "discovery"
-        return "critic"
-    
+    # 1. Success → build notebook artifact
     if sql_result:
-        import json
-        try:
-            res = json.loads(sql_result)
-            if res.get("total_count") == 0:
-                return "discovery"
-        except Exception:
-            pass
-        return "visualize_data"
-        
-    return END
+        return "build_notebook_artifact"
 
-def _should_probe(state: SQLAgentState) -> str:
-    # If the user has NOT yet confirmed a source, and we found alternative candidates, we MUST probe.
-    has_confirmed = len(state.get("confirmed_tables", [])) > 0
-    
-    if not has_confirmed and state.get("probing_options") and len(state["probing_options"]) >= 2:
-        logger.info("Mandatory Probing Triggered: User must confirm business intent.")
-        return "require_probing"
-        
-    return "plan_query"
+    # 2. Hard limits or unrecoverable errors → synthesize what we have
+    if attempts >= settings.max_correction_attempts:
+        return "synthesize_response"
 
-def _should_synthesize(state: SQLAgentState) -> str:
+    if error and (
+        "Exhausted maximum SQL correction" in error
+        or "permission denied" in error.lower()
+    ):
+        return "synthesize_response"
+
+    # 3. Zero results → critic handles investigation + INVESTIGATE loop
+    if error and "ZERO_RESULTS" in error:
+        return "critic"
+
+    # 4. Table doesn't exist → try discovery once, then critic
+    if error and "does not exist" in error.lower() and attempts <= 1:
+        return "discovery"
+
+    # 5. Any other error → critic
+    if error:
+        return "critic"
+
+    # 6. Fallback
     return "synthesize_response"
 
 
@@ -63,55 +55,29 @@ async def build_graph():
     rag = SchemaRAG()
     thread_mgr = ThreadManager()
 
-    memory_node = MemoryManagerNode()
-    db_routing_node = DatabaseSelectionNode()
-    routing_node = TableSelectionNode(rag)
-    schema_node = SchemaRetrievalNode(rag)
-    prober_node = IntentProberNode()
-    planner_node = QueryPlannerNode()
-    gen_node = SQLGenerationNode(rag)
-    critic_node = SQLCriticNode()
-    discovery_node = DiscoveryNode()
-    exec_node = SQLExecutionNode(thread_mgr)
-    approval_node = HumanApprovalNode()
-    viz_node = DataStorytellingNode()
-    synthesizer_node = ResponseSynthesizerNode()
-
     graph = StateGraph(SQLAgentState)
-    graph.add_node("memory_manager", memory_node)
-    graph.add_node("route_database", db_routing_node)
-    graph.add_node("route_tables", routing_node)
-    graph.add_node("retrieve_schema", schema_node)
-    graph.add_node("intent_prober", prober_node)
-    graph.add_node("require_probing", approval_node) # Reuse pass-through
-    graph.add_node("plan_query", planner_node)
-    graph.add_node("generate_sql", gen_node)
-    graph.add_node("critic", critic_node)
-    graph.add_node("discovery", discovery_node)
-    graph.add_node("execute_sql", exec_node)
-    graph.add_node("visualize_data", viz_node)
-    graph.add_node("synthesize_response", synthesizer_node)
+
+    graph.add_node("memory_manager", MemoryManagerNode())
+    graph.add_node("route_database", DatabaseSelectionNode())
+    graph.add_node("route_tables", TableSelectionNode(rag))
+    graph.add_node("retrieve_schema", SchemaRetrievalNode(rag))
+    graph.add_node("generate_sql", SQLGenerationNode(rag))
+    graph.add_node("execute_sql", SQLExecutionNode(thread_mgr, rag))
+    graph.add_node("critic", SQLCriticNode())
+    graph.add_node("discovery", DiscoveryNode())
+    graph.add_node("build_notebook_artifact", NotebookArtifactNode())
+    graph.add_node("synthesize_response", ResponseSynthesizerNode())
 
     graph.set_entry_point("memory_manager")
     graph.add_edge("memory_manager", "route_database")
     graph.add_edge("route_database", "route_tables")
     graph.add_edge("route_tables", "retrieve_schema")
-
-    # Proactive Probing Loop
-    graph.add_edge("retrieve_schema", "intent_prober")
-    graph.add_conditional_edges("intent_prober", _should_probe)
-    graph.add_edge("require_probing", "plan_query")
-
-    graph.add_edge("plan_query", "generate_sql")
-
-    # Execution & Correction Loop
+    graph.add_edge("retrieve_schema", "generate_sql")
     graph.add_edge("generate_sql", "execute_sql")
-
     graph.add_conditional_edges("execute_sql", _should_correct)
     graph.add_edge("critic", "generate_sql")
-
     graph.add_edge("discovery", "generate_sql")
-    graph.add_edge("visualize_data", "synthesize_response")
+    graph.add_edge("build_notebook_artifact", "synthesize_response")
     graph.add_edge("synthesize_response", END)
 
     try:
@@ -124,7 +90,4 @@ async def build_graph():
         logger.warning("Redis unavailable (%s), falling back to MemorySaver", exc)
         checkpointer = MemorySaver()
 
-    return graph.compile(
-        checkpointer=checkpointer,
-        interrupt_before=["require_probing"],
-    )
+    return graph.compile(checkpointer=checkpointer)
