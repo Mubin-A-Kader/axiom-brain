@@ -53,8 +53,9 @@ app.add_middleware(
 
 _guard = LakeraGuard()
 _agent = None
-_thread_mgr = None
-_rag = None
+_thread_mgr = ThreadManager()
+from axiom.rag.schema import SchemaRAG
+_rag = SchemaRAG()
 _artifact_store = None
 _temporal_client = None
 
@@ -64,10 +65,7 @@ async def startup() -> None:
     global _agent, _thread_mgr, _rag, _artifact_store, _temporal_client
     # LangGraph Deprecation: _agent is now legacy
     # _agent = await build_graph()
-    _thread_mgr = ThreadManager()
-    from axiom.rag.schema import SchemaRAG
     from axiom.notebooks.artifacts import NotebookArtifactStore
-    _rag = SchemaRAG()
     _artifact_store = NotebookArtifactStore(settings.artifact_root)
 
     # Initialize Temporal Client

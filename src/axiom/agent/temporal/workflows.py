@@ -7,7 +7,7 @@ from axiom.agent.state import SQLAgentState
 with workflow.unsafe.imports_passed_through():
     from axiom.agent.temporal.activities import SQLActivities
 
-@workflow.definition
+@workflow.defn
 class SQLAgentWorkflow:
     """
     Main orchestrator workflow replacing the LangGraph execution path.
