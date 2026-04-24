@@ -17,22 +17,61 @@ export interface ApproveRequest {
 
 export interface QueryResponse {
   sql: string;
-  result: string; // JSON string of the results or error
-  visualization?: {
-    x_axis: string | null;
-    y_axis: string | string[];
-    plot_type: "bar" | "line" | "scatter" | "pie" | "histogram" | "area" | "indicator";
-    title: string;
-  };
+  result?: string; // JSON string of the results; absent when query returned 0 rows or errored
+  artifact?: NotebookArtifact;
   insight?: string;
   thought?: string;
   layout?: string;
   action_bar?: string[];
-  probing_options?: any[];
+  probing_options?: JsonObject[];
   session_id: string;
   thread_id: string;
   tenant_id: string;
   status: "completed" | "pending_approval" | "rejected";
+}
+
+export interface NotebookOutput {
+  cell_index: number;
+  type: "stream" | "image" | "html" | "text" | "error";
+  name?: string;
+  text?: string;
+  html?: string;
+  data_url?: string;
+  mime?: string;
+  ename?: string;
+  evalue?: string;
+}
+
+export interface NotebookCellOutput {
+  output_type?: string;
+  name?: string;
+  text?: string | string[];
+  html?: string | string[];
+  data?: Record<string, string | string[]>;
+  ename?: string;
+  evalue?: string;
+}
+
+export interface NotebookCell {
+  cell_type: "markdown" | "code";
+  source?: string | string[];
+  outputs?: NotebookCellOutput[];
+}
+
+export interface NotebookDocument {
+  cells?: NotebookCell[];
+}
+
+export interface NotebookArtifact {
+  artifact_id: string;
+  kind: "notebook";
+  status: "queued" | "running" | "completed" | "failed";
+  notebook_url?: string;
+  download_url?: string;
+  cells_summary?: string[];
+  outputs?: NotebookOutput[];
+  execution_error?: string;
+  created_at: string;
 }
 
 export interface Source {
@@ -43,8 +82,8 @@ export interface Source {
   db_type: string;
   status: string;
   error_message?: string;
-  mcp_config?: any;
-  custom_rules?: any;
+  mcp_config?: SourceMcpConfig;
+  custom_rules?: string | unknown[];
 }
 
 export interface SourceIn {
@@ -53,8 +92,8 @@ export interface SourceIn {
   db_url: string;
   db_type: string;
   description: string;
-  mcp_config?: any;
-  custom_rules?: any;
+  mcp_config?: SourceMcpConfig;
+  custom_rules?: string | unknown[];
 }
 
 export interface ReasoningStep {
@@ -77,8 +116,8 @@ export interface ChatMessage {
     thought?: string;
     layout?: string;
     action_bar?: string[];
-    probing_options?: any[];
-    visualization?: QueryResponse["visualization"];
+    probing_options?: JsonObject[];
+    artifact?: NotebookArtifact;
     thread_id?: string;
     session_id?: string;
   };
@@ -99,7 +138,7 @@ export interface ThreadHistory {
     timestamp: number;
     question: string;
     sql: string;
-    result: any;
+    result: unknown;
     active_filters?: string[];
     verified_joins?: string[];
     error_log?: string[];
@@ -108,4 +147,15 @@ export interface ThreadHistory {
     llm_model?: string;
     source_id?: string;
   };
+}
+export type JsonObject = Record<string, unknown>;
+
+export interface SourceMcpConfig {
+  ssh?: {
+    host?: string;
+    port?: string | number;
+    username?: string;
+    private_key?: string;
+  };
+  [key: string]: unknown;
 }

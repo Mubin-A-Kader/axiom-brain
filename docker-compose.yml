@@ -44,6 +44,7 @@ services:
     volumes:
       - ./litellm_config.yaml:/app/config.yaml
     environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     healthcheck:
@@ -97,6 +98,7 @@ services:
       - "8080:8080"
     volumes:
       - ./src:/app/src
+      - axiom_artifacts:/tmp/axiom-artifacts
     environment:
       DATABASE_URL: postgresql://axiom:${POSTGRES_PASSWORD:-axiom}@postgres:5432/axiomdb?search_path=auth,public
       REDIS_URL: redis://redis:6379
@@ -104,6 +106,9 @@ services:
       LLM_MODEL: ${LLM_MODEL:-gemini-2.5-flash}
       CHROMA_URL: http://chromadb:8000
       CHROMA_TOKEN: ${CHROMA_TOKEN:-secret-chroma-token}
+      NOTEBOOK_EXECUTOR_URL: http://notebook-executor:8090
+      NOTEBOOK_EXECUTION_TIMEOUT: ${NOTEBOOK_EXECUTION_TIMEOUT:-60}
+      ARTIFACT_ROOT: /tmp/axiom-artifacts
       SUPABASE_JWKS_URL: http://gateway/auth/v1/.well-known/jwks.json
       LAKERA_API_KEY: ${LAKERA_API_KEY:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
@@ -116,8 +121,27 @@ services:
         condition: service_started
       litellm:
         condition: service_healthy
+      notebook-executor:
+        condition: service_started
+
+  notebook-executor:
+    build:
+      context: .
+      target: runtime
+    command: ["uvicorn", "axiom.notebooks.executor_app:app", "--host", "0.0.0.0", "--port", "8090", "--loop", "asyncio"]
+    expose:
+      - "8090"
+    volumes:
+      - ./src:/app/src:ro
+      - axiom_artifacts:/tmp/axiom-artifacts
+    environment:
+      PYTHONUNBUFFERED: "1"
+      AXIOM_ARTIFACT_ROOT: /tmp/axiom-artifacts
+    mem_limit: 1g
+    cpus: 1.0
 
 volumes:
   postgres_data:
   redis_data:
   chroma_data:
+  axiom_artifacts:

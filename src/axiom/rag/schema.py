@@ -1,3 +1,4 @@
+import json
 import networkx as nx
 import chromadb
 import tiktoken
@@ -41,7 +42,15 @@ class SchemaRAG:
                     table_name = meta.get("table", table_id)
                     cols = meta.get("columns", "").split(",") if meta.get("columns") else []
                     graph.add_node(table_name, columns=[c.strip() for c in cols if c.strip()])
-                    # We might need to store edges in metadata too if we want full recovery from Chroma
+                    # Restore FK edges that were persisted at ingestion time
+                    raw_fks = meta.get("foreign_keys", "")
+                    if raw_fks:
+                        try:
+                            import json as _json
+                            for fk in _json.loads(raw_fks):
+                                graph.add_edge(table_name, fk["to"], via=fk["via"])
+                        except Exception:
+                            pass
         except Exception as e:
             logger.warning("Failed to load graph from Chroma for %s: %s", graph_key, e)
             
@@ -58,18 +67,22 @@ class SchemaRAG:
         
         for table_name, meta in tables.items():
             graph.add_node(table_name, columns=meta.get("columns", []))
+            fk_list = []
             for fk in meta.get("foreign_keys", []):
                 graph.add_edge(table_name, fk["references"], via=fk["column"])
-            
+                fk_list.append({"to": fk["references"], "via": fk["column"]})
+
             # Full DDL for precise generation
             docs.append(meta["ddl"])
             ids.append(f"{tenant_id}_{source_id}_{table_name}")
             metas.append({
                 "tenant_id": tenant_id,
-                "source_id": source_id, 
-                "type": "schema", 
-                "table": table_name, 
-                "columns": ",".join(meta.get("columns", []))
+                "source_id": source_id,
+                "type": "schema",
+                "table": table_name,
+                "columns": ",".join(meta.get("columns", [])),
+                # Persist FK edges so the graph survives restarts
+                "foreign_keys": json.dumps(fk_list) if fk_list else "",
             })
             
             # High-level summary for the router

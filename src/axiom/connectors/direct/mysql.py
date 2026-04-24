@@ -125,21 +125,17 @@ class MySQLConnector(BaseConnector):
                     columns = await cur.fetchall()
                     col_names = [col['Field'] for col in columns]
                     
-                    # Formulate DDL
-                    col_defs = [f"{col['Field']} {col['Type']}" for col in columns]
-                    ddl = f"CREATE TABLE {table_name} ({', '.join(col_defs)})"
-                    
-                    # 3. Get foreign keys (MySQL information_schema)
+                    # 3. Get foreign keys first so they can be embedded in the DDL
                     fk_query = """
-                        SELECT 
-                            COLUMN_NAME, 
-                            REFERENCED_TABLE_NAME, 
-                            REFERENCED_COLUMN_NAME 
-                        FROM 
-                            information_schema.KEY_COLUMN_USAGE 
-                        WHERE 
-                            TABLE_SCHEMA = %s 
-                            AND TABLE_NAME = %s 
+                        SELECT
+                            COLUMN_NAME,
+                            REFERENCED_TABLE_NAME,
+                            REFERENCED_COLUMN_NAME
+                        FROM
+                            information_schema.KEY_COLUMN_USAGE
+                        WHERE
+                            TABLE_SCHEMA = %s
+                            AND TABLE_NAME = %s
                             AND REFERENCED_TABLE_NAME IS NOT NULL;
                     """
                     await cur.execute(fk_query, (db_name, table_name))
@@ -148,7 +144,16 @@ class MySQLConnector(BaseConnector):
                         {"column": fk["COLUMN_NAME"], "references": fk["REFERENCED_TABLE_NAME"]}
                         for fk in fks
                     ]
-                    
+
+                    # Build DDL with embedded FOREIGN KEY constraints
+                    col_defs = [f"`{col['Field']}` {col['Type']}" for col in columns]
+                    fk_defs = [
+                        f'FOREIGN KEY (`{fk["COLUMN_NAME"]}`) REFERENCES '
+                        f'`{fk["REFERENCED_TABLE_NAME"]}`(`{fk["REFERENCED_COLUMN_NAME"]}`)'
+                        for fk in fks
+                    ]
+                    ddl = f"CREATE TABLE `{table_name}` ({', '.join(col_defs + fk_defs)})"
+
                     schema[table_name] = {
                         "ddl": ddl,
                         "columns": col_names,

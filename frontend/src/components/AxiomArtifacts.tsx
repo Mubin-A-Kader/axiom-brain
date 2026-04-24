@@ -1,19 +1,21 @@
 "use client";
 
 import React from 'react';
-import { AxiomCanvas } from './AxiomCanvas';
 import { DataTable } from './DataTable';
+import { NotebookArtifactViewer } from './NotebookArtifactViewer';
 import { motion, AnimatePresence } from 'framer-motion';
+import { ChatMessage } from '../types';
 
 interface AxiomArtifactsProps {
-  message: any;
+  message?: ChatMessage;
   onActionClick: (action: string) => void;
 }
 
 export function AxiomArtifacts({ message, onActionClick }: AxiomArtifactsProps) {
-  if (!message || (!message.metadata?.visualization && !message.metadata?.result)) return null;
+  if (!message || (!message.metadata?.artifact && !message.metadata?.result)) return null;
 
-  const hasVisualization = !!message.metadata?.visualization;
+  const artifact = message.metadata?.artifact;
+  const hasArtifact = !!artifact;
   const hasResult = !!message.metadata?.result;
 
   return (
@@ -27,13 +29,8 @@ export function AxiomArtifacts({ message, onActionClick }: AxiomArtifactsProps) 
           transition={{ duration: 0.3 }}
           className="space-y-12"
         >
-          {hasVisualization && (
-             <AxiomCanvas 
-               layout="default"
-               insight={message.metadata.insight}
-               visualization={message.metadata.visualization}
-               result={message.metadata.result}
-             />
+          {hasArtifact && (
+             <NotebookArtifactViewer artifact={artifact} />
           )}
           
           {hasResult && (

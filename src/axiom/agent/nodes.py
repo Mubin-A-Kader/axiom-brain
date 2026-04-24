@@ -1,6 +1,8 @@
+import asyncio
 import json
 import logging
 import re
+import uuid
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -126,6 +128,7 @@ class TableSelectionNode:
         # --- ENTERPRISE GRADE: Deterministic State Usage ---
         confirmed_tables = state.get("confirmed_tables", [])
         history_tables = state.get("history_tables", [])
+        negative_constraints = state.get("negative_constraints", [])
         
         # Include history context if available
         history = state.get("history_context", "")
@@ -170,6 +173,10 @@ class TableSelectionNode:
         if confirmed_tables:
             history_summaries_text += "\n### USER CONFIRMED PRIMARY SOURCE (MUST BE INCLUDED):\n" + "\n".join([f"- {t}" for t in confirmed_tables])
 
+        # Add negative constraints to the prompt
+        if negative_constraints:
+            history_summaries_text += "\n### NEGATIVE CONSTRAINTS (DO NOT USE THESE TABLES):\n" + "\n".join([f"- {c}" for c in negative_constraints])
+
         if not summaries and not grepped_tables and not history_tables and not confirmed_tables:
             return {"selected_tables": []}
             
@@ -192,6 +199,7 @@ Include at least 2-3 tables if there is any doubt about the data's location.
 
 ### IMPORTANT:
 Table names may be schema-qualified. Return names EXACTLY as listed.
+CRITICAL: You MUST NOT select any tables listed in the NEGATIVE CONSTRAINTS section. These were explicitly rejected by the user. If you need to find an alternative, look for different tables.
 
 ### CANDIDATE TABLES:
 {summary_text}
@@ -212,13 +220,14 @@ Respond ONLY with a JSON list of table names, e.g. ["table1", "table2"]. No othe
         
         try:
             content = response.choices[0].message.content.strip()
-            # Clean up markdown if any
             import re
             match = re.search(r"\[.*\]", content, re.DOTALL)
-            if match:
-                selected_tables = json.loads(match.group(0))
-            else:
-                selected_tables = json.loads(content)
+            raw = match.group(0) if match else content
+            try:
+                selected_tables = json.loads(raw)
+            except json.JSONDecodeError:
+                # Response was truncated mid-array — extract all quoted strings we can find
+                selected_tables = re.findall(r'"([^"]+)"', raw)
                 
             # Fallback guarantee: if history_tables exist, force them in case the LLM ignored them
             if history_tables:
@@ -312,8 +321,8 @@ The target database is {dialect_name.upper()}.
 {schema_context}
 
 ### USER CONFIRMED TABLES:
-{json.dumps(confirmed_tables) if confirmed_tables else "None. Determine tables autonomously."}
-CRITICAL: If a table is listed here, the user explicitly chose it. You MUST prioritize it as the primary table for your query.
+{json.dumps(confirmed_tables) if confirmed_tables else "None. You have full autonomy to select ANY tables from the SCHEMA CONTEXT."}
+{("CRITICAL: If a table is listed here, the user explicitly chose it. You MUST prioritize it as the primary table for your query. However, you are ALLOWED and ENCOURAGED to use ANY OTHER tables from the SCHEMA CONTEXT to fully answer the question." if confirmed_tables else "")}
 
 ### NEGATIVE CONSTRAINTS (PATH BLOCKERS):
 {json.dumps(negative_constraints, indent=2) if negative_constraints else "None"}
@@ -351,18 +360,31 @@ CRITICAL: If a table or join path is listed in Negative Constraints, it was flag
    - How do I join them correctly using the foreign keys shown in SCHEMA CONTEXT?
    - Match exact case for identifiers.
 9. ZERO-RESULT RECOVERY RULE: If the CRITIC FEEDBACK instructs you to try a completely different JOIN path or to drop a WHERE filter entirely because the previous attempt returned 0 rows, you MUST follow those instructions. Do not stubbornly repeat the exact same JOIN or WHERE clause if it has been proven to fail.
-10. Output your thought process inside <thought> tags.
-11. Output the final SQL query inside <sql> tags.
-12. Return ONLY the tags. No other text. No markdown fences.
-13. If you cannot answer the question because the necessary tables/columns do not exist in the schema, output your explanation inside <error> tags and do NOT output any <sql> tags.
-14. DIALECT SPECIFIC RULES:
+10. NO PLACEHOLDER VALUES — EVER: Never write fake IDs, placeholder UUIDs, or stub values like `'<some_id>'`, `'actual-uuid-here'`, `'<question_id>'`, or similar. If you need a specific ID or lookup value that is not given to you, use a subquery or JOIN to find it from the real lookup table using the EXACT column names shown in SCHEMA CONTEXT. A query with a placeholder is always wrong.
+11. DIRECT COLUMN FIRST (STRICT): Before joining through a question/answer table, check the SCHEMA CONTEXT for a column that directly stores the concept (e.g. a profile column named after the attribute). A direct column query is always simpler and less likely to return 0 rows. Only use question/answer tables if no direct column exists.
+12. Q&A / EAV TABLE PATTERN (STRICT): When an answers/values table has a `*_id` FK column pointing to a labels/questions/categories table:
+   - The label text (question, category name, etc.) lives in the REFERENCED table, not in the answers/values table. Always JOIN to the referenced table and filter the text column there.
+   - NEVER filter the value/answer column for the label text. Value columns hold responses ("Yes"/"No"/"Occasionally"), not labels.
+   - NEVER write a subquery that searches for a label phrase inside a value/answer column.
+   - The correct structure is: JOIN the referenced labels table on the FK column, filter its text column for the label, filter the answers table for the value.
+13. OR OPERATOR — ALWAYS PARENTHESISE: AND binds tighter than OR. Without parentheses `a OR b AND c` silently becomes `a OR (b AND c)`. Any WHERE clause mixing OR and AND MUST wrap the OR group: `(cond1 OR cond2) AND cond3`.
+14. ILIKE PRECISION — use complete meaningful words: `%yes%` not `%ye%` (matches "they", "money", "player"); `%no%` not `%n%`. Always use the full word or a distinctive substring.
+15. Output your thought process inside <thought> tags.
+16. Output the final SQL query inside <sql> tags.
+17. Return ONLY the tags. No other text. No markdown fences.
+15. Use <error> tags ONLY for genuine impossibilities: the required entity truly has no matching table or column anywhere in the schema, OR the request is a destructive command. Do NOT use <error> for vague or broad questions — instead, make a reasonable interpretation and generate SQL. Specifically:
+    - "statistics", "summary", "overview", "breakdown", "distribution" → derive sensible aggregates (COUNT, AVG, SUM, GROUP BY) from the available tables.
+    - "show me X" where X is ambiguous → pick the most relevant table and return representative data.
+    - Uncertainty about which column → use the closest match and note it in <thought>.
+    Only refuse if you genuinely cannot find ANY table or column to work with.
+16. DIALECT SPECIFIC RULES:
 {dialect_rules}
 
 Question: {question}"""
         if critic_feedback:
             base += f"\n\n### CRITIC FEEDBACK (PREVIOUS ATTEMPT FAILED):\n{critic_feedback}\n\nUpdate your query strictly following this technical feedback."
         elif error:
-            base += f"\n\n### PREVIOUS ATTEMPT FAILED:\n{error}\n\nReview the SCHEMA CONTEXT carefully. \n- If the error is \"relation ... does not exist\", you likely forgot the schema prefix (e.g. use \"public\".\"tableName\" instead of \"tableName\").\n- If the error suggests a column or table name that exists but with different capitalization, you MUST use double quotes around that name (e.g., \"membershipFees\")."
+            base += f"\n\n### PREVIOUS ATTEMPT FAILED:\n{error}\n\nReview the SCHEMA CONTEXT carefully. \n- If the error is \"relation ... does not exist\", you likely forgot the schema prefix (e.g. use \"public\".\"tableName\" instead of \"tableName\").\n- If the error suggests a column or table name that exists but with different capitalization, you MUST use double quotes around that name (e.g., \"membershipFees\").\n- If the error is \"function ... does not exist\" and mentions argument types, you MUST explicitly cast the column to numeric or the appropriate type (e.g., `SUM(column::numeric)`, `AVG(CAST(column AS numeric))`)."
         return base
 
     async def __call__(self, state: SQLAgentState) -> dict:
@@ -381,7 +403,7 @@ Question: {question}"""
         if attempts >= settings.max_correction_attempts:
             return {
                 "error": f"Exhausted maximum SQL correction attempts ({settings.max_correction_attempts}). Last error: {state.get('error')}",
-                "attempts": attempts
+                "attempts": 0 # Reset attempts so investigator doesn't instantly die on next query
             }
 
         # Get Dynamic Parameters
@@ -438,36 +460,244 @@ class SQLCriticNode:
             api_key=settings.litellm_key,
         )
 
-    async def _execute_investigation(self, state: SQLAgentState, query: str) -> str:
-        """Run a read-only investigation query against the database."""
+    async def _get_connector(self, state: SQLAgentState):
+        """Return (connector, db_type) for the current source."""
+        from axiom.connectors.factory import ConnectorFactory
+        source_id = state.get("source_id", "default_source")
+        cp_conn = await asyncpg.connect(settings.database_url)
         try:
-            from axiom.connectors.factory import ConnectorFactory
-            import asyncpg
-            source_id = state.get("source_id", "default_source")
-            cp_conn = await asyncpg.connect(settings.database_url)
-            try:
-                row = await cp_conn.fetchrow(
-                    "SELECT db_url, db_type, mcp_config FROM data_sources WHERE source_id = $1", 
-                    source_id
-                )
-                if not row: return "Investigation failed: Source not found."
-                db_url = row["db_url"]
-                db_type = row["db_type"]
-                config = json.loads(row["mcp_config"]) if row["mcp_config"] else {}
-            finally:
-                await cp_conn.close()
+            row = await cp_conn.fetchrow(
+                "SELECT db_url, db_type, mcp_config FROM data_sources WHERE source_id = $1",
+                source_id,
+            )
+            if not row:
+                return None, None
+            db_url = row["db_url"]
+            db_type = row["db_type"]
+            config = json.loads(row["mcp_config"]) if row["mcp_config"] else {}
+        finally:
+            await cp_conn.close()
+        connector = await ConnectorFactory.get_connector(source_id, db_type, db_url, config)
+        return connector, db_type
 
-            connector = await ConnectorFactory.get_connector(source_id, db_type, db_url, config)
-            # Ensure it's a SELECT
+    async def _execute_investigation(self, state: SQLAgentState, query: str) -> str:
+        """Run a read-only investigation query against the database.
+
+        If a jsonb ILIKE error is detected, automatically rewrites the query
+        to cast the offending column to text and retries once.
+        """
+        try:
+            connector, _ = await self._get_connector(state)
+            if connector is None:
+                return "Investigation failed: Source not found."
             if not query.strip().upper().startswith("SELECT"):
                 return "Investigation blocked: Only SELECT queries are allowed."
-            
-            result = await connector.execute_query(query)
-            # Limit to 15 rows for better context
-            rows = result["rows"][:15]
-            return json.dumps(rows, default=str)
+            try:
+                result = await connector.execute_query(query)
+                rows = result["rows"][:15]
+                return json.dumps(rows, default=str)
+            except Exception as exc:
+                err = str(exc)
+
+                # jsonb ~~* unknown → auto-cast ILIKE columns and retry
+                if "jsonb" in err and ("~~*" in err or "~~" in err or "operator does not exist" in err):
+                    fixed = re.sub(
+                        r'"([^"]+)"\s+(I?LIKE)',
+                        r'"\1"::text \2',
+                        query,
+                        flags=re.IGNORECASE,
+                    )
+                    if fixed != query:
+                        try:
+                            result = await connector.execute_query(fixed)
+                            rows = result["rows"][:15]
+                            return f"[auto-cast applied]\n{json.dumps(rows, default=str)}"
+                        except Exception as exc2:
+                            return f"Investigation execution error (after auto-cast): {str(exc2)}"
+
+                # column "x" does not exist → discover real columns and return them
+                col_err = re.search(r'column "([^"]+)" does not exist', err, re.IGNORECASE)
+                if col_err:
+                    tbl_match = re.search(
+                        r'FROM\s+"?(\w+)"?\."?(\w+)"?', query, re.IGNORECASE
+                    )
+                    if tbl_match:
+                        schema_n, table_n = tbl_match.group(1), tbl_match.group(2)
+                        discovery = (
+                            f"SELECT column_name, data_type "
+                            f"FROM information_schema.columns "
+                            f"WHERE table_schema='{schema_n}' AND table_name='{table_n}' "
+                            f"ORDER BY ordinal_position"
+                        )
+                        try:
+                            dcols = await connector.execute_query(discovery)
+                            col_list = [f"{r[0]} ({r[1]})" for r in dcols["rows"]]
+                            return (
+                                f"Column '{col_err.group(1)}' does not exist. "
+                                f"Actual columns of {schema_n}.{table_n}: {col_list}. "
+                                f"Rewrite your INVESTIGATE query using one of these column names."
+                            )
+                        except Exception:
+                            pass
+
+                return f"Investigation execution error: {err}"
         except Exception as exc:
             return f"Investigation execution error: {str(exc)}"
+
+    async def _auto_probe_zero_results(self, state: SQLAgentState, failed_sql: str) -> str:
+        """Run targeted column-value samples on every table touched by the failed SQL.
+
+        Casts all probed columns to ::text so jsonb values appear as their real
+        string representation (e.g. '"Non-Vegetarian"') rather than raw JSON objects.
+        Also probes FK-neighbor tables so the critic sees alternative paths.
+        """
+        try:
+            connector, _ = await self._get_connector(state)
+            if connector is None:
+                return ""
+
+            schema_table_re = re.compile(r'"([a-z_]+)"\."([a-zA-Z_0-9]+)"')
+            tables = schema_table_re.findall(failed_sql)          # [(schema, table), ...]
+
+            # Columns used in WHERE / ILIKE / = conditions
+            filter_col_re = re.compile(
+                r'"([^"]+)"(?:::text)?\s+(?:ILIKE|LIKE|=|!=|<>)', re.IGNORECASE
+            )
+            filter_cols = filter_col_re.findall(failed_sql)
+
+            # Extract (column, pattern) pairs from ILIKE conditions for cross-filter probing
+            ilike_pair_re = re.compile(
+                r'"([^"]+)"(?:::text)?\s+ILIKE\s+\'([^\']+)\'', re.IGNORECASE
+            )
+            ilike_pairs = ilike_pair_re.findall(failed_sql)  # [(col, pattern), ...]
+
+            sections: list[str] = []
+            seen: set[str] = set()
+
+            async def probe_table(schema: str, table: str) -> None:
+                fqt = f'"{schema}"."{table}"'
+                if fqt in seen:
+                    return
+                seen.add(fqt)
+
+                # 5-row sample — cast every value to text so jsonb shows as string
+                try:
+                    sample = await connector.execute_query(f"SELECT * FROM {fqt} LIMIT 5")
+                    sections.append(f"SAMPLE {fqt}:\n{json.dumps(sample['rows'][:5], default=str)}")
+                except Exception:
+                    pass
+
+                # DISTINCT values of each filter column, always cast to ::text
+                for col in filter_cols:
+                    try:
+                        dist = await connector.execute_query(
+                            f'SELECT DISTINCT "{col}"::text FROM {fqt} '
+                            f'WHERE "{col}" IS NOT NULL LIMIT 30'
+                        )
+                        vals = [r[0] for r in dist["rows"]]
+                        if vals:
+                            sections.append(
+                                f'DISTINCT "{col}"::text in {fqt}:\n{json.dumps(vals, default=str)}'
+                            )
+                    except Exception:
+                        pass
+
+                # Cross-filter probe: for Q&A-style tables, sample each ILIKE column
+                # filtered by the other ILIKE columns so we see co-occurring values.
+                # e.g. sample answerText WHERE questionText ILIKE '%smoke%'
+                if len(ilike_pairs) >= 2:
+                    for i, (target_col, _) in enumerate(ilike_pairs):
+                        where_parts = [
+                            f'"{c}"::text ILIKE \'{p}\''
+                            for j, (c, p) in enumerate(ilike_pairs)
+                            if j != i
+                        ]
+                        where_clause = " AND ".join(where_parts)
+                        try:
+                            cross = await connector.execute_query(
+                                f'SELECT DISTINCT "{target_col}"::text FROM {fqt} '
+                                f'WHERE {where_clause} AND "{target_col}" IS NOT NULL LIMIT 30'
+                            )
+                            vals = [r[0] for r in cross["rows"]]
+                            if vals:
+                                sections.append(
+                                    f'DISTINCT "{target_col}"::text in {fqt} '
+                                    f'(filtered by {where_clause}):\n{json.dumps(vals, default=str)}'
+                                )
+                        except Exception:
+                            pass
+
+                # FK-neighbor probe: discover tables referenced by FKs from this table.
+                # Critical for Q&A patterns where question text lives in a sibling table
+                # (e.g. ptemplate_answers.question_id → ptemplate_questions).
+                try:
+                    fk_query = (
+                        "SELECT DISTINCT ccu.table_schema, ccu.table_name "
+                        "FROM information_schema.table_constraints tc "
+                        "JOIN information_schema.key_column_usage kcu "
+                        "  ON tc.constraint_name = kcu.constraint_name "
+                        "  AND tc.table_schema = kcu.table_schema "
+                        "JOIN information_schema.constraint_column_usage ccu "
+                        "  ON ccu.constraint_name = tc.constraint_name "
+                        "WHERE tc.constraint_type = 'FOREIGN KEY' "
+                        f"AND tc.table_schema = '{schema}' "
+                        f"AND tc.table_name = '{table}'"
+                    )
+                    fk_result = await connector.execute_query(fk_query)
+                    for fk_row in fk_result["rows"][:4]:
+                        fk_schema, fk_table = fk_row[0], fk_row[1]
+                        fqt_fk = f'"{fk_schema}"."{fk_table}"'
+                        if fqt_fk in seen:
+                            continue
+                        seen.add(fqt_fk)
+                        try:
+                            fk_sample = await connector.execute_query(
+                                f"SELECT * FROM {fqt_fk} LIMIT 5"
+                            )
+                            if fk_sample["rows"]:
+                                sections.append(
+                                    f"FK-NEIGHBOR SAMPLE {fqt_fk} "
+                                    f"(referenced by {fqt}):\n"
+                                    f"{json.dumps(fk_sample['rows'][:5], default=str)}"
+                                )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # Probe every table in the failed SQL
+            probe_tasks = [probe_table(s, t) for s, t in tables]
+            await asyncio.gather(*probe_tasks, return_exceptions=True)
+
+            return "\n\n".join(sections) if sections else ""
+        except Exception as exc:
+            logger.debug("Auto-probe failed: %s", exc)
+            return ""
+
+    async def _fetch_table_catalog(self, state: SQLAgentState) -> str:
+        """Return all user-visible tables so the critic can discover sibling tables."""
+        try:
+            connector, db_type = await self._get_connector(state)
+            if connector is None:
+                return "Catalog unavailable: source not found."
+            # Works for PostgreSQL and MySQL; graceful fallback for others
+            if db_type == "mysql":
+                catalog_sql = (
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' "
+                    "ORDER BY table_name"
+                )
+            else:
+                catalog_sql = (
+                    "SELECT table_schema, table_name FROM information_schema.tables "
+                    "WHERE table_schema NOT IN ('pg_catalog','information_schema') "
+                    "AND table_type = 'BASE TABLE' ORDER BY table_schema, table_name"
+                )
+            result = await connector.execute_query(catalog_sql)
+            names = [" | ".join(str(v) for v in row) for row in result["rows"]]
+            return "\n".join(names) if names else "No tables found."
+        except Exception as exc:
+            return f"Catalog query error: {str(exc)}"
 
     async def __call__(self, state: SQLAgentState) -> dict:
         question = state["question"]
@@ -483,13 +713,27 @@ class SQLCriticNode:
         is_zero_results = "ZERO_RESULTS" in error
         
         if is_zero_results:
+            # Run both catalog lookup and column-value probe in parallel
+            table_catalog, data_probe = await asyncio.gather(
+                self._fetch_table_catalog(state),
+                self._auto_probe_zero_results(state, sql_query),
+                return_exceptions=True,
+            )
+            if isinstance(table_catalog, Exception):
+                table_catalog = "Catalog unavailable."
+            if isinstance(data_probe, Exception):
+                data_probe = ""
+
             prompt = f"""You are an autonomous SQL Data Engineering Agent diagnosing a "0-Result" (Empty Data) failure.
-The previous query executed successfully but returned zero rows. This often happens because WHERE or JOIN conditions use incorrect literal values (e.g., wrong casing like 'active' vs 'Active', or typos like 'convrted'), or because the JOIN keys simply don't match between tables.
+The previous query executed successfully but returned zero rows. This can happen because:
+- WHERE / JOIN conditions use wrong literal values (wrong casing, typos, numeric vs string IDs)
+- The JOIN keys don't match between tables
+- **The WRONG TABLE was queried** — a sibling table with a different name may hold the actual data
 
 ### ORIGINAL QUESTION:
 {question}
 
-### SCHEMA CONTEXT:
+### SCHEMA CONTEXT (retrieved at query time):
 {schema_context}
 
 ### BUSINESS GLOSSARY (SEMANTIC LAYER):
@@ -498,25 +742,42 @@ The previous query executed successfully but returned zero rows. This often happ
 ### FAILED (ZERO-RESULT) SQL:
 {sql_query}
 
-### YOUR CAPABILITIES:
-You can investigate the actual data in the database by outputting an investigation query.
-To do this, output exactly this format:
-INVESTIGATE: <your SQL query here>
+### ALL TABLES IN THE DATABASE:
+{table_catalog}
 
-For example:
-INVESTIGATE: SELECT * FROM tableA LIMIT 10
-or
-INVESTIGATE: SELECT DISTINCT status FROM orders LIMIT 20
+### PRE-SAMPLED DATA (auto-collected before this prompt):
+{data_probe if data_probe else "No samples available."}
+
+### YOUR CAPABILITIES:
+Run investigation queries in this exact format:
+INVESTIGATE: <SQL here>
+
+CRITICAL RULES FOR YOUR TOOL CALLS:
+- NEVER call the same tool with the same arguments twice — results won't change.
+- NEVER use ILIKE directly on a jsonb column — cast first: `"col"::text ILIKE '%val%'`
+- NEVER include apostrophes in ILIKE patterns (e.g. don't write `ILIKE '%don\'t%'`). Use a shorter keyword without the apostrophe: `ILIKE '%no%'` or `ILIKE '%never%'`.
+- When a `describe_table` result shows column names, use ONLY those exact names in subsequent `sample_values` calls. Do not invent column names.
+- After sampling, go directly to `run_query` to test alternative SQL. Do not keep sampling — verify quickly.
 
 ### INSTRUCTIONS:
-1. MANDATORY DATA SAMPLING: Your FIRST action MUST be to sample the actual data from the tables involved in the query. Use `INVESTIGATE: SELECT * FROM <table> LIMIT 10` to see what the data actually looks like.
-2. Are the IDs integers or UUID strings? Are the categorical values capitalized? Do the foreign keys in one table's sample actually exist in the other table's sample? DO NOT GUESS.
-3. If the investigation shows that the columns you are joining on have completely different data types or values that never match, identify that as the root cause.
-4. Output your INVESTIGATE query. The system will run it and give you the results. You can investigate up to 3 times.
-5. Only AFTER you have sampled the data and found the correct values or the reason for 0 rows, output your final technical instructions for the SQL Generator in exactly this format:
-FEEDBACK: <your actionable instructions here>
+1. **Read the PRE-SAMPLED DATA first — before making any tool calls.** It shows DISTINCT values of every filtered column (including cross-filtered values) and FK-NEIGHBOR table samples.
 
-If you discover that the data you need is NOT in the current tables, or if a JOIN is impossible because the tables are unrelated, explicitly instruct the SQL Generator to look for a different relationship or state that the current schema context might be missing the required descriptive tables."""
+2. **Early-exit if data is conclusively absent (NO tool calls needed):** If the PRE-SAMPLED DATA contains a cross-filter result (labelled "filtered by ...") for the answer/value column, and that result does NOT contain anything resembling the searched value, the data simply does not exist. Do NOT make any tool calls. Immediately output:
+FEEDBACK: NO_MATCH — The question exists in the database but no answers match the requested value. Here are the actual stored values for that question: <list the values from the cross-filter sample>
+
+3. **ILIKE match rule:** If the cross-filter sample shows values that are close (different casing, slight wording difference), use the exact stored string and rewrite the SQL. Then output:
+VERIFIED_SQL: <corrected SQL>
+
+4. **Wrong-column detection:** If the sampled values of the filtered column contain nothing resembling the filter pattern AND there is no cross-filter result, the filter belongs on a different column or FK-referenced table. Use `describe_table` to confirm, then rewrite.
+
+5. **Multi-path rule:** Only if the PRE-SAMPLED DATA is inconclusive, try up to 3 alternative queries using `run_query`.
+
+6. **Verify then STOP:** The moment `run_query` returns non-empty rows — output:
+VERIFIED_SQL: <exact SQL that returned rows>
+No further tool calls after this.
+
+7. If ALL paths return 0 rows, output:
+FEEDBACK: <what was tried, what values DO exist, and why the requested value wasn't found>"""
         else:
             prompt = f"""You are a Senior Database Administrator. Analyze the failed SQL draft against the execution traceback to identify syntax violations, logical errors, or schema mismatches.
 Provide exact, technical correction instructions.
@@ -536,90 +797,236 @@ Provide exact, technical correction instructions.
 ### EXECUTION TRACEBACK ERROR:
 {error}
 
+### YOUR CAPABILITIES:
+If you need to look up an actual value (e.g. find the real UUID/ID of a question, category, or lookup row), run:
+INVESTIGATE: <SELECT query>
+You may investigate once. After investigating, output your final instructions as:
+FEEDBACK: <your instructions here>
+
 ### INSTRUCTIONS:
-1. Diagnose the root cause of the error based on the traceback.
-2. Output explicit, technical correction instructions on how to rewrite the query.
-3. Keep the feedback concise and strictly technical.
-4. Output your final feedback in this format:
+1. Diagnose the root cause of the error.
+2. If the error is caused by a placeholder value (e.g. '<some_id>', 'actual-uuid-here') — run an INVESTIGATE query to find the real value, then tell the generator to use a JOIN or subquery so no hard-coded IDs are ever needed.
+3. If the error is a type/cast issue, instruct the generator to use the correct CAST (e.g. `column::numeric`).
+4. Keep feedback concise and strictly technical.
+5. Output:
 FEEDBACK: <your instructions here>"""
 
+        # ── Tool definitions ──────────────────────────────────────────────────
+        # Instead of the fragile "INVESTIGATE: SELECT..." text protocol, the
+        # critic LLM calls these structured tools. No regex parsing, no column
+        # hallucination, JSONB handled automatically.
+        _TOOLS = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "describe_table",
+                    "description": (
+                        "Return the exact column names and data types for a table. "
+                        "Use this first whenever you are unsure of a column name."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "schema_name": {"type": "string", "description": "e.g. 'public'"},
+                            "table_name":  {"type": "string", "description": "e.g. 'ptemplate_questions'"},
+                        },
+                        "required": ["schema_name", "table_name"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sample_values",
+                    "description": (
+                        "Return up to 30 DISTINCT values of a column cast to text. "
+                        "Use this to see the real stored strings (casing, hyphens, JSON format) "
+                        "before writing an ILIKE pattern."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "schema_name": {"type": "string"},
+                            "table_name":  {"type": "string"},
+                            "column_name": {"type": "string"},
+                        },
+                        "required": ["schema_name", "table_name", "column_name"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_query",
+                    "description": (
+                        "Execute a read-only SELECT query and return up to 15 rows. "
+                        "CRITICAL: If the result is non-empty (has rows), you MUST immediately "
+                        "stop all further tool calls and output exactly:\n"
+                        "VERIFIED_SQL: <that exact SQL query>\n"
+                        "Do NOT make any more tool calls after finding a working query."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "sql": {"type": "string"},
+                        },
+                        "required": ["sql"],
+                    },
+                },
+            },
+        ]
+
+        async def _dispatch_tool(name: str, args: dict) -> str:
+            """Execute whichever tool the LLM called and return a string result."""
+            try:
+                connector, _ = await self._get_connector(state)
+                if connector is None:
+                    return "Tool error: source not found."
+
+                if name == "describe_table":
+                    sql = (
+                        "SELECT column_name, data_type "
+                        "FROM information_schema.columns "
+                        f"WHERE table_schema='{args['schema_name']}' "
+                        f"AND table_name='{args['table_name']}' "
+                        "ORDER BY ordinal_position"
+                    )
+                    r = await connector.execute_query(sql)
+                    cols = [f"{row[0]} ({row[1]})" for row in r["rows"]]
+                    return json.dumps(cols)
+
+                if name == "sample_values":
+                    fqt = f"\"{args['schema_name']}\".\"{args['table_name']}\""
+                    col = args["column_name"]
+                    sql = (
+                        f"SELECT DISTINCT \"{col}\"::text "
+                        f"FROM {fqt} "
+                        f"WHERE \"{col}\" IS NOT NULL LIMIT 30"
+                    )
+                    r = await connector.execute_query(sql)
+                    return json.dumps([row[0] for row in r["rows"]], default=str)
+
+                if name == "run_query":
+                    raw = args["sql"].strip()
+                    if not raw.upper().startswith("SELECT"):
+                        return "Blocked: only SELECT queries allowed."
+                    # Auto-fix jsonb ILIKE on the fly
+                    fixed = re.sub(
+                        r'"([^"]+)"\s+(I?LIKE)',
+                        r'"\1"::text \2',
+                        raw, flags=re.IGNORECASE,
+                    )
+                    r = await connector.execute_query(fixed)
+                    return json.dumps(r["rows"][:15], default=str)
+
+                return f"Unknown tool: {name}"
+            except Exception as exc:
+                return f"Tool error ({name}): {exc}"
+
+        # ── LLM loop with tool use ────────────────────────────────────────────
         messages = [{"role": "user", "content": prompt}]
-        
-        max_investigations = 3 if is_zero_results else 0
-        investigations = 0
-        
-        # Get Dynamic Parameters
         params = AdaptiveInferenceManager.get_parameters("critic", state.get("attempts", 0), error)
+        max_tool_calls = 8 if is_zero_results else 3
+        tool_calls_made = 0
 
         while True:
             try:
                 response = await self._client.chat.completions.create(
                     model=state.get("llm_model") or settings.llm_model,
                     messages=messages,
-                    **params
+                    tools=_TOOLS,
+                    tool_choice="auto",
+                    **{k: v for k, v in params.items() if k not in ("stream",)},
                 )
-                content = response.choices[0].message.content.strip()
-                messages.append({"role": "assistant", "content": content})
+                msg = response.choices[0].message
+                finish = response.choices[0].finish_reason
 
-                import re
-                
-                # Look for INVESTIGATE followed optionally by markdown sql block
-                inv_match = re.search(r"INVESTIGATE:\s*```(?:sql)?\s*(.*?)\s*```", content, re.IGNORECASE | re.DOTALL)
-                if not inv_match:
-                    # Fallback to capturing the rest of the line if no markdown block
-                    inv_match = re.search(r"INVESTIGATE:\s*([^\n]+)", content, re.IGNORECASE)
-                
-                # If the content explicitly contains FEEDBACK: block, prioritize that over investigation if it's the final output
+                # ── Tool call branch ──────────────────────────────────────────
+                if finish == "tool_calls" and msg.tool_calls and tool_calls_made < max_tool_calls:
+                    messages.append(msg)          # append assistant message with tool_calls
+                    for tc in msg.tool_calls:
+                        tool_calls_made += 1
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except Exception:
+                            args = {}
+                        logger.info("Critic tool call: %s(%s)", tc.function.name, args)
+                        result = await _dispatch_tool(tc.function.name, args)
+                        logger.info("Critic tool result: %s", result[:200])
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": result,
+                        })
+                    continue   # send tool results back to the model
+
+                # ── Final text response ──────────────────────────────────────
+                content = (msg.content or "").strip()
+
+                # VERIFIED_SQL: critic already confirmed this query returns rows
+                # → skip generate_sql entirely, inject directly as the next query
+                verified_match = re.search(
+                    r"VERIFIED_SQL:\s*```(?:sql)?\s*(.*?)\s*```|VERIFIED_SQL:\s*(SELECT\s.+)",
+                    content, re.IGNORECASE | re.DOTALL,
+                )
+                if verified_match:
+                    verified_sql = (verified_match.group(1) or verified_match.group(2) or "").strip()
+                    if verified_sql:
+                        logger.info("Critic found verified working SQL — bypassing generator.")
+                        return {
+                            "critic_feedback": None,
+                            "sql_query": verified_sql,
+                            "error": None,
+                        }
+
                 feedback_match = re.search(r"FEEDBACK:\s*(.*)", content, re.IGNORECASE | re.DOTALL)
-                
-                if inv_match and not feedback_match and investigations < max_investigations:
-                    investigations += 1
-                    inv_query = inv_match.group(1).strip()
-                    logger.info("Critic investigating: %s", inv_query)
-                    inv_result = await self._execute_investigation(state, inv_query)
-                    logger.info("Critic investigation result: %s", inv_result)
-                    messages.append({
-                        "role": "user", 
-                        "content": f"INVESTIGATION RESULT:\n{inv_result}\n\nIf you need to investigate further, output another INVESTIGATE: query. Otherwise, output your final FEEDBACK: instructions."
-                    })
-                else:
-                    feedback = content
-                    if feedback_match:
-                        feedback = feedback_match.group(1).strip()
-                    logger.info("Critic Feedback generated.")
-                    return {"critic_feedback": feedback}
-                    
+                feedback = feedback_match.group(1).strip() if feedback_match else content
+                logger.info("Critic Feedback generated.")
+                return {"critic_feedback": feedback}
+
             except Exception as exc:
                 logger.warning("Failed to generate critic feedback: %s", exc)
                 return {"critic_feedback": f"Critic analysis failed. Please fix the original error: {error}"}
 
 
 class SQLExecutionNode:
-    def __init__(self, thread_mgr=None) -> None:
+    def __init__(self, thread_mgr=None, rag=None) -> None:
         self._thread_mgr = thread_mgr
+        self._rag = rag
 
     async def _is_read_only(self, sql: str, db_type: str = "postgresql") -> tuple[bool, str | None]:
         """Use sqlglot to strictly verify the query is a SELECT statement."""
         try:
             from axiom.connectors.factory import ConnectorFactory
             dialect_name, _ = await ConnectorFactory.get_dialect_info(db_type)
-            
-            # We assume a single statement for now
-            parsed = sqlglot.parse_one(sql, read=dialect_name)
-            
-            # Check if it's a SELECT-like statement
-            if not isinstance(parsed, (exp.Select, exp.Union, exp.Except, exp.Intersect, exp.With)):
-                return False, "Security Violation: Query is not a SELECT statement."
-            
-            # Check for forbidden expressions within the tree (e.g. subqueries that write)
-            forbidden = [exp.Update, exp.Delete, exp.Drop, exp.Insert, exp.Create, exp.Alter]
-            for node in parsed.find_all(*forbidden):
-                return False, f"Security Violation: Forbidden command '{node.key}' detected in SQL."
-                
+
+            # parse() returns a list — handles multi-statement SQL that parse_one
+            # would return as exp.Block, which is not in the SELECT-like types.
+            statements = sqlglot.parse(sql, read=dialect_name)
+            if not statements:
+                return False, "Security Violation: Empty query."
+
+            allowed = (exp.Select, exp.Union, exp.Except, exp.Intersect, exp.With)
+            forbidden = (exp.Update, exp.Delete, exp.Drop, exp.Insert, exp.Create, exp.Alter)
+
+            for stmt in statements:
+                if stmt is None:
+                    continue
+                if not isinstance(stmt, allowed):
+                    return False, "Security Violation: Query is not a SELECT statement."
+                for node in stmt.find_all(*forbidden):
+                    return False, f"Security Violation: Forbidden command '{node.key}' detected in SQL."
+
             return True, None
         except Exception as exc:
             logger.warning("SQL parsing failed for security check: %s", exc)
-            # If we can't parse it reliably, we block it to be safe, but label it as a syntax error
+            # sqlglot can fail on valid SQL with unusual escaping (e.g. don\'t).
+            # Fall back to a simple string check rather than blocking the whole query.
+            sql_upper = sql.strip().upper()
+            write_keywords = ("DROP ", "DELETE ", "UPDATE ", "INSERT ", "TRUNCATE ", "ALTER ", "CREATE ")
+            if sql_upper.startswith("SELECT") and not any(kw in sql_upper for kw in write_keywords):
+                logger.info("SQL parsing fallback: allowing query that starts with SELECT and has no write keywords.")
+                return True, None
             return False, f"SQL Syntax Error (Blocked for Security): {str(exc)}"
 
     async def __call__(self, state: SQLAgentState) -> dict:
@@ -673,31 +1080,38 @@ class SQLExecutionNode:
             # --- RESPONSE LIMITING & ZERO-RESULT PROTOCOL ---
             all_rows = result["rows"]
             attempts = state.get("attempts", 0)
-            
-            # If we get 0 rows and we still have retries left, trigger the investigator
-            if len(all_rows) == 0 and attempts < settings.max_correction_attempts:
-                logger.info("0 rows returned. Triggering Zero-Result Investigation Protocol.")
-                error_str = "ZERO_RESULTS: The query executed successfully but returned 0 rows. Please investigate WHERE/JOIN conditions using your investigation tools."
-                new_error_log = state.get("error_log", []) + [error_str]
+
+            # Zero rows → route to critic's INVESTIGATE loop instead of treating as success
+            if not all_rows:
                 result_update = {
                     "sql_result": None,
-                    "error": error_str,
-                    "error_log": new_error_log
+                    "error": f"ZERO_RESULTS: The query executed successfully but returned 0 rows. SQL: {state.get('sql_query', '')}",
                 }
             else:
                 is_truncated = len(all_rows) > 100
                 display_rows = all_rows[:100] if is_truncated else all_rows
-
-                # Format to JSON for the LLM/State
                 result_update = {
                     "sql_result": json.dumps({
-                        "columns": result["columns"], 
+                        "columns": result["columns"],
                         "rows": display_rows,
                         "is_truncated": is_truncated,
                         "total_count": len(all_rows)
-                    }, default=str), 
+                    }, default=str),
                     "error": None
                 }
+
+                # Auto-save every successful query as a few-shot example so future
+                # queries on the same tenant/source learn from real working SQL.
+                if self._rag and state.get("question") and sql:
+                    try:
+                        await self._rag.ingest_example(
+                            state.get("tenant_id", "default"),
+                            state.get("source_id", "default_source"),
+                            state["question"],
+                            sql,
+                        )
+                    except Exception as ex:
+                        logger.debug("Failed to save example to RAG: %s", ex)
 
         except Exception as exc:
             logger.warning("SQL execution error: %s", exc)
@@ -725,102 +1139,84 @@ class HumanApprovalNode:
         # No state modification needed. The pause happens BEFORE this node executes.
         return {}
 
-class DataStorytellingNode:
-    """Transform SQL results into a visualization specification for the frontend."""
+class NotebookArtifactNode:
+    """Transform SQL results into an executed notebook artifact."""
     def __init__(self) -> None:
-        import openai
-        self._client = openai.AsyncOpenAI(
-            base_url=f"{settings.litellm_url}/v1",
-            api_key=settings.litellm_key,
+        from axiom.notebooks.artifacts import NotebookArtifactStore
+        from axiom.notebooks.executor_client import NotebookExecutorClient
+
+        self._store = NotebookArtifactStore(settings.artifact_root)
+        self._executor = NotebookExecutorClient(
+            settings.notebook_executor_url,
+            settings.notebook_execution_timeout,
         )
 
     async def __call__(self, state: SQLAgentState) -> dict:
-        if state.get("error") or not state.get("sql_result"):
-            return {"visualization": None}
+        # action_plan clears sql_result to None after RCA; fall back to last_sql_result
+        raw_result = state.get("sql_result") or state.get("last_sql_result")
+        if state.get("error") or not raw_result or raw_result == "CONCLUDED":
+            return {"artifact": None}
 
-        question = state["question"]
-        result_json = json.loads(state["sql_result"])
-        columns = result_json.get("columns", [])
-        rows = result_json.get("rows", [])
+        from axiom.notebooks.builder import build_analysis_notebook
 
-        if not rows or not columns:
-            return {"visualization": None}
-
-        # --- GHOST GRAPH PREVENTION ---
-        # 1. Check for insufficient data count
-        if len(rows) < 2:
-            logger.info("Insufficient rows for visualization. Skipping.")
-            return {"visualization": json.dumps({"error_code": "INSUFFICIENT_DATA", "reason": "Single scalar or empty result"})}
-
-        # 2. Check if all numeric values are zero/null
-        has_plottable_data = False
-        for row in rows:
-            for val in row:
-                if isinstance(val, (int, float)) and val != 0:
-                    has_plottable_data = True
-                    break
-            if has_plottable_data: break
-        
-        if not has_plottable_data:
-            logger.info("Result set contains only zeros/nulls. Skipping visualization.")
-            return {"visualization": json.dumps({"error_code": "INSUFFICIENT_DATA", "reason": "No non-zero plottable values"})}
-
-        # Data sample for the LLM to understand types and values
-        sample = rows[:5]
-
-        prompt = f"""You are a Senior Data Analyst. 
-Given the user's question and the SQL result set, generate a visualization specification.
-
-### QUESTION:
-{question}
-
-### RESULT COLUMNS:
-{columns}
-
-### DATA SAMPLE (Top 5 rows):
-{sample}
-
-### INSTRUCTIONS:
-1. Determine the best plot type: bar, line, scatter, pie, histogram, area, or indicator.
-2. Select the correct x_axis and y_axis column names from the RESULT COLUMNS.
-3. The title must be a data-driven INSIGHT (e.g., "Revenue grew by 20% in Q4") rather than a generic description.
-4. If the data is a single scalar value, use plot_type "indicator".
-5. If the data has no obvious trend or categorical breakdown, return null.
-
-### OUTPUT FORMAT (Strict JSON):
-{{
-  "x_axis": "<column_name | null>",
-  "y_axis": "<column_name | list_of_column_names>",
-  "plot_type": "<bar | line | scatter | pie | histogram | area | indicator>",
-  "title": "<insightful_title>",
-  "config": {{
-    "show_legend": <true | false>,
-    "stack": <true | false>
-  }}
-}}
-
-Respond ONLY with the JSON object. No markdown, no filler."""
+        artifact_id = str(uuid.uuid4())
+        tenant_id = state.get("tenant_id", "default_tenant")
+        thread_id = state.get("thread_id", artifact_id)
 
         try:
-            response = await self._client.chat.completions.create(
-                model=state.get("llm_model") or settings.llm_model,
-                messages=[{"role": "system", "content": "You are a helpful assistant that only outputs JSON."}, {"role": "user", "content": prompt}],
-                temperature=0.0,
-                response_format={"type": "json_object"}
+            result_json = json.loads(raw_result)
+            columns = result_json.get("columns", [])
+            rows = result_json.get("rows", [])
+            if not isinstance(columns, list) or not isinstance(rows, list):
+                raise ValueError("SQL result must contain list-valued columns and rows")
+
+            notebook, cells_summary = build_analysis_notebook(
+                question=state["question"],
+                sql=state.get("sql_query") or "",
+                result=result_json,
+                insight=state.get("response_text"),
             )
-            content = response.choices[0].message.content.strip()
 
-            # Basic validation that it's JSON
-            # If the LLM returns "null" or invalid JSON, we catch it
-            if content.lower() == "null":
-                return {"visualization": None}
-
-            # Validate it's parseable
-            json.loads(content) 
-            return {"visualization": content}
+            execution = await self._executor.execute(
+                tenant_id=tenant_id,
+                thread_id=thread_id,
+                artifact_id=artifact_id,
+                notebook=notebook,
+            )
+            artifact = self._store.save(
+                artifact_id=artifact_id,
+                tenant_id=tenant_id,
+                thread_id=thread_id,
+                notebook=execution.get("notebook") or notebook,
+                status=execution.get("status", "failed"),
+                outputs=execution.get("outputs", []),
+                cells_summary=cells_summary,
+                execution_error=execution.get("execution_error"),
+                logs=execution.get("logs"),
+            )
+            return {"artifact": artifact}
         except Exception as exc:
-            logger.warning("Failed to generate visualization spec: %s", exc)
-            return {"visualization": None}
+            logger.warning("Failed to build notebook artifact: %s", exc)
+            try:
+                fallback_result = json.loads(raw_result)
+            except Exception:
+                fallback_result = {"columns": ["error"], "rows": [[str(exc)]]}
+            fallback_notebook, cells_summary = build_analysis_notebook(
+                question=state["question"],
+                sql=state.get("sql_query") or "",
+                result=fallback_result,
+                insight=state.get("response_text"),
+            )
+            artifact = self._store.save(
+                artifact_id=artifact_id,
+                tenant_id=tenant_id,
+                thread_id=thread_id,
+                notebook=fallback_notebook,
+                status="failed",
+                cells_summary=cells_summary,
+                execution_error=str(exc),
+            )
+            return {"artifact": artifact}
 
 
 class ResponseSynthesizerNode:
@@ -832,10 +1228,68 @@ class ResponseSynthesizerNode:
             api_key=settings.litellm_key,
         )
 
+    @staticmethod
+    def _extract_zero_result_signal(feedback: str) -> tuple[bool, str]:
+        """Pull the NO_MATCH flag and available-values list out of critic feedback.
+
+        Returns (no_match: bool, clean_summary: str).  Deliberately strips raw
+        probe rows / sample dumps so the synthesis LLM only sees intent-level
+        information, not raw DB data that would cause hallucination.
+        """
+        no_match = "NO_MATCH" in feedback
+        # Find an explicit list of available values mentioned after common lead-in phrases
+        values_match = re.search(
+            r'(?:available|stored|actual|existing)\s+(?:values?|answers?|options?)[:\s]+([^\n]{3,200})',
+            feedback, re.IGNORECASE,
+        )
+        available_str = values_match.group(1).strip().rstrip(".") if values_match else ""
+        if available_str:
+            return no_match, f"Available values: {available_str}"
+        # Fall back: use first sentence only (avoid embedding multi-line probe dumps)
+        first_sentence = re.split(r'[\n.]{1}', feedback.replace("NO_MATCH — ", ""))[0].strip()
+        return no_match, first_sentence[:300]
+
     async def __call__(self, state: SQLAgentState) -> dict:
         if state.get("error"):
-            return {"response_text": f"I encountered an error: {state['error']}"}
-        
+            error = state["error"]
+            # For zero-result failures, surface only the clean investigation signal —
+            # never the raw probe data which causes hallucination.
+            if "ZERO_RESULTS" in error:
+                feedback = state.get("critic_feedback") or ""
+                question = state.get("question", "your question")
+                no_match, clean_signal = self._extract_zero_result_signal(feedback)
+                try:
+                    response = await self._client.chat.completions.create(
+                        model=state.get("llm_model") or settings.llm_model,
+                        messages=[{"role": "user", "content": (
+                            f"The user asked: \"{question}\"\n\n"
+                            f"A database search found no matching records. "
+                            f"Investigation note: {clean_signal}\n\n"
+                            "Write exactly 1-2 sentences for the user. "
+                            "State clearly that no results were found. "
+                            "If 'Available values' are listed above, mention them as the options that DO exist. "
+                            "Do NOT mention SQL, tables, databases, raw data, photos, or any technical details. "
+                            "Do NOT invent information not stated in the investigation note above."
+                        )}],
+                        temperature=0.2,
+                    )
+                    return {"response_text": response.choices[0].message.content.strip()}
+                except Exception:
+                    msg = f"No results found for your query."
+                    if clean_signal:
+                        msg += f" {clean_signal}."
+                    return {"response_text": msg}
+            return {"response_text": f"I encountered an error: {error}"}
+
+        # RCA path: ActionPlanNode already populated response_text and cleared sql_result
+        if state.get("response_text") and not state.get("sql_result"):
+            artifact = state.get("artifact")
+            return {
+                "response_text": state["response_text"],
+                "layout": "notebook" if artifact else "default",
+                "action_bar": [],
+            }
+
         if not state.get("sql_result"):
             return {"response_text": "I couldn't find any data to answer your question."}
 
@@ -849,7 +1303,7 @@ class ResponseSynthesizerNode:
         cleaned_data = cleaned_response.data
         metadata = cleaned_response.metadata
         
-        viz_spec = state.get("visualization")
+        artifact = state.get("artifact")
 
         if not cleaned_data:
             return {"response_text": "The query returned no results."}
@@ -883,7 +1337,7 @@ Based on the user's question and the cleaned data results provided, write a conc
 5. If you need to reference an image or record, use its human-readable title or a short description. Never show the full UUID.
 6. Aggregate counts and list only the most relevant examples (max 5 items).
 7. Output in plain English, with bullet points or short sentences. 
-8. If there's an obvious trend or anomaly, highlight it. If a visualization was generated (Spec: {viz_spec}), mention it.
+8. If there's an obvious trend or anomaly, highlight it. If an analysis notebook artifact was generated, mention that the workspace contains the executable notebook.
 9. Keep it concise. Be precise but conversational.
 
 Response:"""
@@ -895,10 +1349,10 @@ Response:"""
                 temperature=0.7,
             )
             content = response.choices[0].message.content.strip()
-            return {"response_text": content, "sql_result": cleaned_response.frontend_json, "layout": "analytics" if viz_spec else "default", "action_bar": cleaned_response.action_bar}
+            return {"response_text": content, "sql_result": cleaned_response.frontend_json, "layout": "notebook" if artifact else "default", "action_bar": cleaned_response.action_bar}
         except Exception as exc:
             logger.warning("Failed to synthesize response: %s", exc)
-            return {"response_text": "Here are the results for your query:", "sql_result": cleaned_response.frontend_json, "layout": "analytics" if viz_spec else "default", "action_bar": cleaned_response.action_bar}
+            return {"response_text": "Here are the results for your query:", "sql_result": cleaned_response.frontend_json, "layout": "notebook" if artifact else "default", "action_bar": cleaned_response.action_bar}
 
 
 class DiscoveryNode:
@@ -922,32 +1376,56 @@ class DiscoveryNode:
         logger.info("DiscoveryNode triggered: Sniffing for hidden data patterns...")
 
         from axiom.core.discovery import DynamicSchemaMapper
-        
-        # 1. Connect to target DB
         import asyncpg
+
+        # 1. Look up db_type and config from control plane
         cp_conn = await asyncpg.connect(settings.database_url, timeout=10)
         try:
             row = await cp_conn.fetchrow(
-                "SELECT db_url, db_type FROM data_sources WHERE source_id = $1", 
+                "SELECT db_url, db_type, mcp_config FROM data_sources WHERE source_id = $1",
                 source_id
             )
-            if not row: return {"critic_feedback": "Discovery failed: Data source not found."}
-            target_db_url = row["db_url"]
+            if not row:
+                return {"critic_feedback": "Discovery failed: Data source not found."}
+            db_url = row["db_url"]
+            db_type = row["db_type"]
+            config = json.loads(row["mcp_config"]) if row["mcp_config"] else {}
         finally:
             await cp_conn.close()
 
+        # 2. Reuse the existing connector (SSH tunnel already running) rather than raw asyncpg
         try:
-            target_conn = await asyncpg.connect(target_db_url, timeout=15)
+            from axiom.connectors.factory import ConnectorFactory
+            connector = await ConnectorFactory.get_connector(source_id, db_type, db_url, config)
+            if not connector._pool:
+                await connector.connect()
+            target_conn = await connector._pool.acquire()
         except Exception as conn_err:
             logger.error(f"Discovery connection timeout/failure: {conn_err}")
-            return {"critic_feedback": f"Discovery failed: Could not connect to target database within 15s. Verify connectivity to {source_id}.", "error": None}
-        
+            return {"critic_feedback": f"Discovery failed: Could not connect to target database. Verify connectivity to {source_id}.", "error": None}
+
         try:
-            # A. Find candidate search terms from the question (entities/names)
-            # Use LLM to extract "sniffing targets"
+            # A. If the error is a "relation does not exist", find the actual table name first
+            similar_table_hint = ""
+            import re as _re
+            does_not_exist_match = _re.search(r'relation "?([^"]+)"? does not exist', error, _re.IGNORECASE)
+            if does_not_exist_match:
+                bad_table = does_not_exist_match.group(1)
+                similar = await DynamicSchemaMapper.find_similar_tables(target_conn, bad_table)
+                if similar:
+                    similar_table_hint = (
+                        f"\n### TABLE NAME FIX:\n"
+                        f"The table '{bad_table}' does NOT exist. "
+                        f"The following real tables in the database have similar names — use one of these instead:\n"
+                        + "\n".join(f"  - public.\"{t}\"" for t in similar)
+                        + "\nUse double-quotes around the table name to preserve exact case.\n"
+                    )
+                    logger.info("DiscoveryNode table name fix: %s → %s", bad_table, similar)
+
+            # B. Find candidate search terms from the question (entities/names)
             extract_prompt = f"""Extract the primary search subjects (entities, partial names, or attribute values) from this question: "{question}"
             Return ONLY a comma-separated list of terms. No other text."""
-            
+
             # Get Dynamic Parameters for Discovery
             discovery_params = AdaptiveInferenceManager.get_parameters("discovery", state.get("attempts", 0), error)
             discovery_system = AdaptiveInferenceManager.get_system_override("discovery")
@@ -961,16 +1439,15 @@ class DiscoveryNode:
                 **discovery_params
             )
             search_terms = [t.strip() for t in res.choices[0].message.content.split(",")]
-            
-            # B. Check for "Pivoting" needs if the user rejected the previous table
+
+            # C. Check for "Pivoting" needs if the user rejected the previous table
             pivot_hint = ""
             if negative_constraints:
                 pivot_hint = f"The user REJECTED the previous analysis. FAILED PATHS: {negative_constraints}. Performing Neighbor Discovery and Global Grep to avoid these tables..."
-            
-            # C. Get all searchable columns
+
+            # D. Get all searchable columns and sniff for values
             all_cols = await DynamicSchemaMapper.get_searchable_columns(target_conn)
-            
-            # D. Sniff for values (Force Global Grep if Negative Constraints exist)
+
             sniff_results = []
             for term in search_terms:
                 if len(term) < 3: continue
@@ -979,8 +1456,8 @@ class DiscoveryNode:
 
             # E. Synthesize Discovery Feedback
             results_text = "\n".join([f"- Found '{r.sample_value}' in {r.table}.{r.column} (Pattern: {r.pattern_type})" for r in sniff_results])
-            
-            discovery_feedback = f"""{pivot_hint}
+
+            discovery_feedback = f"""{similar_table_hint}{pivot_hint}
 ### DISCOVERY RESULTS:
 {results_text if results_text else "No hidden data matches found for search terms."}
 
@@ -989,7 +1466,7 @@ class DiscoveryNode:
 2. EAV Pattern: If data is in a 'key/value' table, map the 'key' column to your intent.
 3. Neighbor Search: Use foreign keys to see how these newly discovered tables link to your other entities."""
 
-            return {"critic_feedback": discovery_feedback, "error": None} 
+            return {"critic_feedback": discovery_feedback, "error": None}
 
         finally:
-            await target_conn.close()
+            await connector._pool.release(target_conn)

@@ -1,13 +1,13 @@
 import { useState, useCallback } from "react";
-import { ChatMessage, QueryResponse, ThreadHistory, ReasoningStep } from "../types";
-import { askQuestion, askQuestionStream, approveQuery, fetchThreadHistory } from "../lib/api";
+import { ChatMessage, QueryResponse, ReasoningStep } from "../types";
+import { askQuestionStream, approveQuery, fetchThreadHistory, sendFeedback } from "../lib/api";
 
 export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: string) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sessionId, setSessionId] = useState<string>("");
   const [threadId, setThreadId] = useState<string>("");
   const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [selectedModel, setSelectedModel] = useState<string>("");
+  const [selectedModel, setSelectedModel] = useState<string>("claude-sonnet");
 
   const appendMessage = useCallback((msg: ChatMessage) => {
     setMessages((prev) => [...prev, msg]);
@@ -49,11 +49,11 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
           role: "agent",
           content: "", // Content might be in insight or we use thought
           status: "completed",
-          metadata: {
-            sql: turn.sql,
-            result: turn.result,
-            thread_id: newThreadId
-          }
+            metadata: {
+              sql: turn.sql,
+              result: typeof turn.result === "string" ? turn.result : JSON.stringify(turn.result),
+              thread_id: newThreadId
+            }
         });
       });
       setMessages(newMessages);
@@ -100,7 +100,7 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
           result: data.result,
           insight: data.insight,
           thought: data.thought,
-          visualization: data.visualization,
+          artifact: data.artifact,
           thread_id: data.thread_id,
           session_id: data.session_id,
         },
@@ -137,11 +137,12 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
       return parts.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(" ");
     };
 
-    const getStepDescription = (node: string, data: any) => {
+    const getStepDescription = (node: string) => {
       if (node === "retrieve_schema") return "Scanning schema for relevant tables...";
       if (node === "plan_query") return "Formulating logical execution plan...";
       if (node === "generate_sql") return "Writing SQL dialect...";
       if (node === "execute_sql") return "Executing query against database...";
+      if (node === "build_notebook_artifact") return "Building executable notebook artifact...";
       if (node === "critic_sql") return "Validating query semantics...";
       if (node === "synthesize_response") return "Cleaning data & generating summary...";
       return `Processing ${formatNodeName(node)}...`;
@@ -157,7 +158,7 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
         model: selectedModel || undefined,
       }, (chunk) => {
         if (chunk.__final__) {
-           const finalState = chunk.__final__;
+           const finalState = chunk.__final__ as Record<string, unknown>;
            const isPaused = chunk.__is_paused__;
 
            // Mark last step completed
@@ -166,16 +167,18 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
            }
 
            const responseObj: QueryResponse = {
-              sql: finalState.sql_query || "",
-              result: finalState.sql_result || finalState.error || "",
-              insight: finalState.response_text || (finalState.error ? `Database error: ${finalState.error}` : undefined),
-              thought: finalState.agent_thought,
-              visualization: finalState.visualization ? JSON.parse(finalState.visualization) : undefined,
-              layout: finalState.layout || "default",
-              action_bar: finalState.action_bar || [],
-              probing_options: finalState.probing_options || [],
-              session_id: sessionId || finalState.session_id || "",
-              thread_id: threadId || finalState.thread_id || "",
+              sql: String(finalState.sql_query || ""),
+              result: typeof finalState.sql_result === 'string' ? finalState.sql_result : undefined,
+              insight: typeof finalState.response_text === "string"
+                ? finalState.response_text
+                : finalState.error ? `Database error: ${String(finalState.error)}` : undefined,
+              thought: typeof finalState.agent_thought === "string" ? finalState.agent_thought : undefined,
+              artifact: finalState.artifact as QueryResponse["artifact"],
+              layout: typeof finalState.layout === "string" ? finalState.layout : "default",
+              action_bar: Array.isArray(finalState.action_bar) ? finalState.action_bar as string[] : [],
+              probing_options: Array.isArray(finalState.probing_options) ? finalState.probing_options as QueryResponse["probing_options"] : [],
+              session_id: sessionId || String(finalState.session_id || ""),
+              thread_id: threadId || String(finalState.thread_id || ""),
               tenant_id: tenantId,
               status: isPaused ? "pending_approval" : "completed"
            };
@@ -195,7 +198,7 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
                    result: responseObj.result,
                    insight: responseObj.insight,
                    thought: responseObj.thought,
-                   visualization: responseObj.visualization,
+                   artifact: responseObj.artifact,
                    layout: responseObj.layout,
                    action_bar: responseObj.action_bar,
                    probing_options: responseObj.probing_options,
@@ -214,10 +217,9 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
         }
 
         // Process active nodes
-        const nodeNames = Object.keys(chunk);
-        if (nodeNames.length > 0) {
-          const nodeName = nodeNames[0]; // Usually one node per chunk
-          const stateData = chunk[nodeName];
+          const nodeNames = Object.keys(chunk);
+          if (nodeNames.length > 0) {
+            const nodeName = nodeNames[0]; // Usually one node per chunk
 
           // Mark previous step as completed
           if (currentSteps.length > 0) {
@@ -229,7 +231,7 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
             ...currentSteps, 
             { 
               node: formatNodeName(nodeName), 
-              description: getStepDescription(nodeName, stateData),
+              description: getStepDescription(nodeName),
               status: 'active' 
             }
           ];
@@ -247,14 +249,15 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
           });
         }
       });
-    } catch (error: any) {
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : "An error occurred.";
       if (currentSteps.length > 0) {
         currentSteps[currentSteps.length - 1].status = 'error';
       }
       updateLastMessage({
         status: "completed",
         isError: true,
-        content: error.message || "An error occurred.",
+        content: message,
         reasoning_steps: currentSteps
       });
     } finally {
@@ -274,16 +277,26 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
         model: selectedModel || undefined,
       });
       handleResponse(response);
-    } catch (error: any) {
+    } catch (error: unknown) {
       updateLastMessage({
         status: "completed",
         isError: true,
-        content: error.message || "An error occurred.",
+        content: error instanceof Error ? error.message : "An error occurred.",
       });
     } finally {
       setIsLoading(false);
     }
   }, [sessionId, tenantId, selectedModel, updateLastMessage, handleResponse]);
+
+  const markAsWrong = useCallback(async (messageId: string, comment?: string) => {
+    if (!threadId) return;
+    await sendFeedback({
+      thread_id: threadId,
+      message_id: messageId,
+      is_correct: false,
+      comment,
+    });
+  }, [threadId]);
 
   return {
     messages,
@@ -292,6 +305,7 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
     handleApprove,
     selectedModel,
     setSelectedModel,
+    markAsWrong,
     startNewThread,
     switchThread,
     threadId,
