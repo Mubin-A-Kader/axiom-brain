@@ -4,6 +4,28 @@ from typing import Dict, Any, Optional, Callable, Awaitable
 
 logger = logging.getLogger("axiom-paste")
 
+class PatternAnalyzer:
+    """
+    Analyzes historical agent behavior to predict likely tool calls.
+    """
+    def __init__(self, thread_mgr=None):
+        self._thread_mgr = thread_mgr
+
+    async def predict_next_tools(self, tenant_id: str, question: str) -> list[str]:
+        """
+        Heuristic-based prediction for Step 17.
+        """
+        predictions = []
+        q_lower = question.lower()
+        
+        if "user" in q_lower or "customer" in q_lower:
+            predictions.append("predict_users_join")
+            
+        if "revenue" in q_lower or "sales" in q_lower:
+            predictions.append("predict_orders_join")
+            
+        return predictions
+
 class SpeculativeToolExecutor:
     """
     Implements PASTE (Pattern-Aware Speculative Tool Execution).
@@ -47,5 +69,6 @@ class SpeculativeToolExecutor:
         self._inflight_tasks.clear()
         self._results.clear()
 
-# Global PASTE Instance
+# Global instances
 paste = SpeculativeToolExecutor()
+analyzer = PatternAnalyzer()

@@ -663,40 +663,52 @@ async def query_stream(req: QueryRequest, user_id: str = Depends(verify_token)):
                 return obj.__dict__
             return str(obj)
 
-        def _strip_heavy_data(data):
-            """Remove base64, SVG, or massive strings from streaming chunks to save tokens."""
-            if isinstance(data, dict):
-                return {k: _strip_heavy_data(v) for k, v in data.items()}
-            if isinstance(data, list):
-                return [_strip_heavy_data(i) for i in data]
-            if isinstance(data, str) and (len(data) > 2000 or data.startswith("data:image") or "<svg" in data.lower()):
-                return "[... Large Binary/Image Data Truncated ...]"
-            return data
-
         try:
-            config["recursion_limit"] = 50
-            async for chunk in _agent.astream(initial_state, config=config, stream_mode="updates"):
-                clean_chunk = _strip_heavy_data(chunk)
-                yield f"data: {json.dumps(clean_chunk, default=_json_serial)}\n\n"
-            
-            agent_state = await _agent.aget_state(config)
-            is_paused = bool(agent_state.next)
-            final_data = agent_state.values
-            
-            safe_final = {k: v for k, v in final_data.items() if k not in ['error_log', 'verified_joins', 'validation_results', 'hypotheses', 'investigation_log', 'rca_report']} # Exclude non-serializable or heavy if any
-            
-            # 3. Final Safety Check on generated output
-            sql = safe_final.get("sql_query")
-            if sql and not await _guard.is_safe(sql):
-                logger.warning("Security Violation: Generated SQL blocked by Lakera Guard: %s", sql)
-                safe_final["sql_query"] = sql
-                safe_final["sql_result"] = ""
-                safe_final["response_text"] = "Security Violation: The generated query was blocked."
-            
-            if sql and safe_final.get("sql_result") and not is_paused:
-                await _thread_mgr.set_cached_result(thread_id, req.question, sql, safe_final["sql_result"])
+            if not _temporal_client:
+                yield f"data: {json.dumps({'error': 'Temporal unavailable'})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
 
-            yield f"data: {json.dumps({'__final__': safe_final, '__is_paused__': is_paused}, default=_json_serial)}\n\n"
+            handle = await _temporal_client.start_workflow(
+                "SQLAgentWorkflow", # Use string name to avoid circular import if needed
+                initial_state,
+                id=f"sql-agent-stream-{thread_id}",
+                task_queue="sql-agent-tasks",
+            )
+
+            last_emitted_node = None
+            
+            while True:
+                desc = await handle.describe()
+                if desc.status == 1: # Running
+                    try:
+                        state = await handle.query("get_state")
+                        # Determine current progress based on state changes
+                        # This is a simplified version of node-based streaming
+                        current_node = None
+                        if state.get("sql_query") and not state.get("sql_result"):
+                             current_node = "generate_sql"
+                        elif state.get("schema_context") and not state.get("sql_query"):
+                             current_node = "retrieve_schema"
+                        
+                        if current_node and current_node != last_emitted_node:
+                            yield f"data: {json.dumps({current_node: state}, default=_json_serial)}\n\n"
+                            last_emitted_node = current_node
+                            
+                        # Check if waiting for approval
+                        if state.get("sql_query") and not state.get("sql_result") and not state.get("error"):
+                             # If we've been in this state for a bit, it's likely paused for HITL
+                             pass 
+                    except Exception:
+                        pass
+                else:
+                    # Workflow finished (Completed, Failed, etc.)
+                    final_state = await handle.result()
+                    yield f"data: {json.dumps({'__final__': final_state, '__is_paused__': False}, default=_json_serial)}\n\n"
+                    break
+                
+                await asyncio.sleep(0.5)
+
             yield "data: [DONE]\n\n"
         except Exception as e:
             logger.exception("Error in stream")
