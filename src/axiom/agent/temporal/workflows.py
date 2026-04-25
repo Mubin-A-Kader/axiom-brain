@@ -35,10 +35,12 @@ class SQLAgentWorkflow:
         state = self._state
         
         # 1. Retrieve Schema
+        # Increased timeout to 5 minutes to accommodate large schema retrievals
         state = await workflow.execute_activity(
             SQLActivities.retrieve_schema,
             state,
-            start_to_close_timeout=timedelta(minutes=1),
+            start_to_close_timeout=timedelta(minutes=5),
+            heartbeat_timeout=timedelta(seconds=30),
         )
         self._state = state
         

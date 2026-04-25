@@ -21,6 +21,9 @@ class SQLActivities:
         from axiom.connectors.mcp.registry import mcp_registry
         import os
         
+        # --- Heartbeat Implementation ---
+        activity.heartbeat("Initializing schema retrieval")
+        
         tenant_id = state["tenant_id"]
         source_id = state.get("source_id", "default_source")
         selected_tables = state.get("selected_tables", [])
@@ -42,6 +45,7 @@ class SQLActivities:
         
         try:
             if selected_tables:
+                activity.heartbeat(f"Retrieving schema for {len(selected_tables)} tables")
                 res = await connector._session.call_tool("retrieve_schema", arguments={
                     "tenant_id": tenant_id,
                     "source_id": source_id,
@@ -50,6 +54,7 @@ class SQLActivities:
                 })
                 state["schema_context"] = res.content[0].text if res.content else "No schema found."
             else:
+                activity.heartbeat("Performing vector search for schema retrieval")
                 res = await connector._session.call_tool("retrieve_schema", arguments={
                     "tenant_id": tenant_id,
                     "source_id": source_id,
@@ -58,6 +63,7 @@ class SQLActivities:
                 })
                 state["schema_context"] = res.content[0].text if res.content else "No schema found."
 
+            activity.heartbeat("Retrieving few-shot examples")
             res_ex = await connector._session.call_tool("retrieve_examples", arguments={
                 "tenant_id": tenant_id,
                 "source_id": source_id,
