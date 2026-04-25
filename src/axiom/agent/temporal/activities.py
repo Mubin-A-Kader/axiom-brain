@@ -1,8 +1,8 @@
 import logging
 import os
 import json
+import asyncio
 from temporalio import activity
-from datetime import timedelta
 from axiom.agent.state import SQLAgentState
 from axiom.agent.nodes import SchemaRetrievalNode, SQLGenerationNode, SQLExecutionNode
 from axiom.rag.schema import SchemaRAG
@@ -22,8 +22,6 @@ class SQLActivities:
 
     @activity.defn
     async def retrieve_schema(self, state: SQLAgentState) -> SQLAgentState:
-        activity.heartbeat("Connecting to Knowledge MCP")
-        
         tenant_id = state["tenant_id"]
         source_id = state.get("source_id", "default_source")
         selected_tables = state.get("selected_tables", [])
@@ -34,7 +32,7 @@ class SQLActivities:
         base_url = os.environ.get("AXIOM_API_URL", "http://localhost:8080")
         knowledge_hub_url = f"{base_url}/mcp/knowledge/sse"
         
-        # FRESH CONNECTION per activity to avoid AnyIO task-mismatch errors
+        # Isolated connection to prevent AnyIO cross-task context leaks
         connector = MCPConnector(
             "knowledge_retrieval", 
             knowledge_hub_url, 
@@ -42,10 +40,10 @@ class SQLActivities:
         )
         
         try:
+            activity.heartbeat("Connecting...")
             await connector.connect()
-            activity.heartbeat("Fetching Schema...")
             
-            # Using direct tool calls via the session
+            activity.heartbeat("Fetching DDLs...")
             if selected_tables:
                 res = await connector._session.call_tool("retrieve_schema", arguments={
                     "tenant_id": tenant_id, "source_id": source_id,
@@ -66,11 +64,15 @@ class SQLActivities:
             })
             state["few_shot_examples"] = res_ex.content[0].text if res_ex.content else ""
             
+        except asyncio.CancelledError:
+            logger.warning("Activity retrieve_schema cancelled")
+            raise
         except Exception as e:
-            logger.exception("Activity retrieve_schema failed")
+            logger.error(f"Activity retrieve_schema failed: {e}")
             state["error"] = str(e)
         finally:
-            await connector.disconnect()
+            # Shield the disconnect to avoid anyio context errors during cleanup
+            await asyncio.shield(connector.disconnect())
 
         return state
 
@@ -98,13 +100,16 @@ class SQLActivities:
         connector = MCPConnector(source_id, target_db_url, {"headers": {"X-Agent-DID": agent_did}})
         
         try:
+            activity.heartbeat("Executing SQL in sandbox...")
             await connector.connect()
             result = await connector.execute_query(sql)
             state["sql_result"] = json.dumps(result, default=str)
             state["error"] = None
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             state["error"] = str(exc)
         finally:
-            await connector.disconnect()
+            await asyncio.shield(connector.disconnect())
             
         return state
