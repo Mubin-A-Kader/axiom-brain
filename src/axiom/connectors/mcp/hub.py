@@ -19,8 +19,6 @@ class MCPHub:
         self.servers: Dict[str, Server] = {}
         # Transports are singletons per server type
         self.server_transports: Dict[str, SseServerTransport] = {}
-        # Active sessions mapping real session IDs to their server name
-        self.active_sessions: Dict[str, str] = {}
         
         self.router = APIRouter(prefix="/mcp")
         self.pep = PolicyEnforcementPoint(ABACPolicyEngine())
@@ -35,6 +33,9 @@ class MCPHub:
     def _setup_routes(self):
         @self.router.get("/{server_name}/sse")
         async def sse_endpoint(server_name: str, request: Request):
+            """
+            Direct ASGI handling for MCP SSE connections.
+            """
             if server_name not in self.servers:
                 raise HTTPException(status_code=404, detail=f"MCP Server '{server_name}' not found")
             
@@ -44,7 +45,13 @@ class MCPHub:
             server = self.servers[server_name]
             transport = self.server_transports[server_name]
             
-            return await self._handle_mcp_sse(request, server, transport, server_name)
+            # Direct ASGI integration: connect_sse handles the 'send' and 'receive'
+            # of the ASGI scope, managing headers and the stream internally.
+            async with transport.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
+                logger.info(f"MCP Session established for {server_name}")
+                # Run the server on the established streams
+                await server.run(read_stream, write_stream, server.create_initialization_options())
+                logger.info(f"MCP Session closed for {server_name}")
 
         @self.router.post("/{server_name}/messages")
         async def handle_message(server_name: str, request: Request):
@@ -79,31 +86,8 @@ class MCPHub:
                         "error": {"code": -32000, "message": "Access Denied: Policy violation"}
                     }
 
+            # handle_post_message routes the JSON-RPC to the correct session writer
             return await transport.handle_post_message(request.scope, request.receive, request._send)
-
-    async def _handle_mcp_sse(self, request, server, transport, server_name):
-        """
-        Bridge between MCP connect_sse and FastAPI ASGI scope.
-        """
-        async with transport.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
-            # Use getattr because session_id might be set dynamically by the transport
-            sid = getattr(transport, "session_id", str(uuid.uuid4()))
-            self.active_sessions[sid] = server_name
-            
-            server_task = asyncio.create_task(
-                server.run(read_stream, write_stream, server.create_initialization_options())
-            )
-            
-            try:
-                # Keep the stream open
-                while not server_task.done():
-                    await asyncio.sleep(0.1)
-                    yield ""
-                await server_task
-            finally:
-                self.active_sessions.pop(sid, None)
-                if not server_task.done():
-                    server_task.cancel()
 
 # Global Hub instance
 hub = MCPHub()
