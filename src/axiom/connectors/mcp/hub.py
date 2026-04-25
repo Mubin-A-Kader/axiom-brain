@@ -1,8 +1,8 @@
 import logging
+import uuid
+import asyncio
 from typing import Dict
-import starlette.types
 from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import StreamingResponse
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 
@@ -18,6 +18,8 @@ class MCPHub:
     def __init__(self):
         self.servers: Dict[str, Server] = {}
         # Multi-session support: Store transports by session ID
+        # Since mcp-python's SseServerTransport is a factory, 
+        # we store the writers for specific sessions here.
         self.transports: Dict[str, SseServerTransport] = {}
         self.router = APIRouter(prefix="/mcp")
         self.pep = PolicyEnforcementPoint(ABACPolicyEngine())
@@ -37,36 +39,36 @@ class MCPHub:
             logger.info(f"SSE Connection: {agent_did} -> {server_name}")
             
             server = self.servers[server_name]
+            
+            # Generate a unique session ID for this specific connection
+            session_id = str(uuid.uuid4())
+            
+            # Create a transport instance for this session
+            # Note: The endpoint here should include the sessionId for mcp-python to route correctly
             transport = SseServerTransport(f"/mcp/{server_name}/messages")
             
-            async def event_generator():
-                async with transport.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
-                    self.transports[transport.session_id] = transport
-                    logger.info(f"MCP Session {transport.session_id} established for {server_name}")
-                    try:
-                        await server.run(read_stream, write_stream, server.create_initialization_options())
-                    finally:
-                        self.transports.pop(transport.session_id, None)
-                        logger.info(f"MCP Session {transport.session_id} closed")
-
-            # SseServerTransport.connect_sse returns a context manager that handles the SSE lifecycle.
-            # However, FastAPI needs a Response object. 
-            # We can use a custom response or follow the starlette pattern.
-            
-            # The most robust way to integrate mcp-python's SSE with FastAPI/Starlette:
-            return StreamingResponse(
-                # connect_sse handles the 'text/event-stream' headers and handshake
-                # but we need to run it in the background of the response.
-                # Actually, mcp-python's SseServerTransport is designed to be called 
-                # inside an ASGI scope directly.
-                self._handle_mcp_sse(request, server, transport),
-                media_type="text/event-stream"
-            )
+            # connect_sse handles the entire ASGI lifecycle (headers, body, send)
+            # We don't return a StreamingResponse because connect_sse calls request._send directly.
+            async with transport.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
+                # The session_id on the transport object is set internally by connect_sse
+                # after the handshake. Let's find it or use our generated one.
+                real_session_id = getattr(transport, "session_id", session_id)
+                self.transports[real_session_id] = transport
+                logger.info(f"MCP Session {real_session_id} active for {server_name}")
+                
+                try:
+                    await server.run(read_stream, write_stream, server.create_initialization_options())
+                finally:
+                    self.transports.pop(real_session_id, None)
+                    logger.info(f"MCP Session {real_session_id} terminated")
 
         @self.router.post("/{server_name}/messages")
         async def handle_message(server_name: str, request: Request):
             session_id = request.query_params.get("sessionId")
             if not session_id or session_id not in self.transports:
+                # If not found, try to see if it's in the body or elsewhere
+                # or log available sessions for debugging
+                logger.warning(f"Session {session_id} not found in {list(self.transports.keys())}")
                 raise HTTPException(status_code=404, detail="MCP Session not found")
             
             transport = self.transports[session_id]
@@ -93,31 +95,5 @@ class MCPHub:
 
             return await transport.handle_post_message(request.scope, request.receive, request._send)
 
-    async def _handle_mcp_sse(self, request, server, transport):
-        """
-        Bridge between MCP connect_sse and FastAPI StreamingResponse.
-        """
-        async with transport.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
-            self.transports[transport.session_id] = transport
-            
-            server_task = asyncio.create_task(
-                server.run(read_stream, write_stream, server.create_initialization_options())
-            )
-            
-            try:
-                # Keep the stream open as long as the server is running
-                while not server_task.done():
-                    await asyncio.sleep(0.1)
-                    # Yielding nothing just to keep the generator alive
-                    # SseServerTransport handles the actual sending via request._send
-                    yield ""
-                
-                await server_task
-            finally:
-                self.transports.pop(transport.session_id, None)
-                if not server_task.done():
-                    server_task.cancel()
-
 # Global Hub instance
 hub = MCPHub()
-import asyncio
