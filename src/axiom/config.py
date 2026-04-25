@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     # Infrastructure
     redis_url: str = "redis://localhost:6379"
     chroma_url: str = "http://localhost:8200"
+    temporal_url: str = "localhost:7233"
     chroma_collection: str = "schema"
     chroma_token: str = "secret-chroma-token"
     notebook_executor_url: str = "http://localhost:8090"

@@ -71,8 +71,8 @@ async def startup() -> None:
     # Initialize Temporal Client
     from temporalio.client import Client
     try:
-        _temporal_client = await Client.connect("localhost:7233")
-        logger.info("Connected to Temporal.io")
+        _temporal_client = await Client.connect(settings.temporal_url)
+        logger.info(f"Connected to Temporal.io at {settings.temporal_url}")
     except Exception as e:
         logger.warning(f"Failed to connect to Temporal: {e}. Event-sourced orchestration disabled.")
 

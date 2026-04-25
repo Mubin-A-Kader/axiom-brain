@@ -113,6 +113,7 @@ services:
       SUPABASE_JWKS_URL: http://gateway/auth/v1/.well-known/jwks.json
       LAKERA_API_KEY: ${LAKERA_API_KEY:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      TEMPORAL_URL: temporal:7233
     depends_on:
       postgres:
         condition: service_healthy
@@ -153,7 +154,6 @@ services:
       - POSTGRES_USER=axiom
       - POSTGRES_PWD=${POSTGRES_PASSWORD:-axiom}
       - POSTGRES_SEEDS=postgres
-      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development_sql.yaml
     depends_on:
       postgres:
         condition: service_healthy
