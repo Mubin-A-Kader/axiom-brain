@@ -71,8 +71,9 @@ class SQLActivities:
             logger.error(f"Activity retrieve_schema failed: {e}")
             state["error"] = str(e)
         finally:
-            # Shield the disconnect to avoid anyio context errors during cleanup
-            await asyncio.shield(connector.disconnect())
+            import anyio
+            with anyio.CancelScope(shield=True):
+                await connector.disconnect()
 
         return state
 
@@ -110,6 +111,8 @@ class SQLActivities:
         except Exception as exc:
             state["error"] = str(exc)
         finally:
-            await asyncio.shield(connector.disconnect())
+            import anyio
+            with anyio.CancelScope(shield=True):
+                await connector.disconnect()
             
         return state
