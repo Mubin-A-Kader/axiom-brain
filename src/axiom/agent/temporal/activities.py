@@ -36,12 +36,15 @@ class SQLActivities:
         base_url = os.environ.get("AXIOM_API_URL", "http://localhost:8080")
         knowledge_hub_url = f"{base_url}/mcp/knowledge/sse"
         
-        # Reuse existing connection from registry
-        connector = await mcp_registry.get_connector(
+        # STABILIZATION: Create a NEW connection for every activity task
+        # Caching connections across tasks in Temporal activities causes anyio scope errors
+        from axiom.connectors.mcp_adapter import MCPConnector
+        connector = MCPConnector(
             "knowledge_retrieval", 
             knowledge_hub_url, 
             {"headers": {"X-Agent-DID": agent_did}}
         )
+        await connector.connect()
         
         try:
             if selected_tables:
@@ -113,19 +116,16 @@ class SQLActivities:
             "args": [],
             "headers": {"X-Agent-DID": agent_did}
         }
-        
+
         try:
-            # Check registry first for cached connection (even for sandbox simulation)
-            key = f"{source_id}:{target_db_url}"
-            if key in mcp_registry._connectors:
-                logger.info(f"Using cached sandbox connection for {key}")
-                connector = mcp_registry._connectors[key]
-                result = await connector.execute_query(sql)
-            else:
-                result = await SandboxedMCPServer.run_in_sandbox(source_id, target_db_url, config, sql)
-                # For this simulation, we don't cache sandboxed ones in registry to match 'one-time use' VM pattern
-            
+            # STABILIZATION: Create fresh connection for every task
+            from axiom.connectors.mcp_adapter import MCPConnector
+            connector = MCPConnector(source_id, target_db_url, config)
+            await connector.connect()
+            result = await connector.execute_query(sql)
+
             all_rows = result["rows"]
+
             is_truncated = len(all_rows) > 100
             display_rows = all_rows[:100] if is_truncated else all_rows
             
