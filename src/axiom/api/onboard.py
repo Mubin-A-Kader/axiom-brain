@@ -130,8 +130,12 @@ async def enrich_schema_with_summaries(
     sem = asyncio.Semaphore(concurrency)
 
     async def _enrich(table_name: str, meta: dict) -> tuple[str, str, list]:
+        # Non-SQL connectors (n8n, app connectors) may not have DDL — use column names as a stand-in
+        ddl = meta.get("ddl") or (
+            f"Table: {table_name}\nColumns: {', '.join(meta.get('columns', {}).keys())}"
+        )
         summary, samples = await _generate_table_summary(
-            client, model, table_name, meta["ddl"], connector, sem
+            client, model, table_name, ddl, connector, sem
         )
         return table_name, summary, samples
 

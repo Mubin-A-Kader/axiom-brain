@@ -79,7 +79,7 @@ async def get_oauth_url(req: OAuthUrlRequest, user_id: str = Depends(verify_toke
         fernet = _get_fernet()
         state = fernet.encrypt(json.dumps(state_dict).encode()).decode()
 
-        redirect_uri = "http://localhost:8080/api/oauth/callback"
+        redirect_uri = f"{settings.public_url}/api/oauth/callback"
 
         params = urllib.parse.urlencode(
             {
@@ -103,17 +103,86 @@ async def get_oauth_url(req: OAuthUrlRequest, user_id: str = Depends(verify_toke
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _exchange_code(code: str, client_id: str, client_secret: str, verifier: str, token_url: str) -> dict:
+    from axiom.config import settings
+    body = urllib.parse.urlencode({
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": f"{settings.public_url}/api/oauth/callback",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code_verifier": verifier,
+    }).encode()
+    req = urllib.request.Request(token_url, data=body, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
 @router.get("/api/oauth/callback")
 async def oauth_callback(code: str, state: str, background_tasks: BackgroundTasks):
     try:
         fernet = _get_fernet()
         state_dict = json.loads(fernet.decrypt(state.encode()).decode())
-
-        tenant_id = state_dict["tenant_id"]
-        source_id = state_dict["source_id"]
-        connector = state_dict["connector"]
-        verifier = state_dict["verifier"]
     except Exception:
+        raise HTTPException(status_code=400, detail="Invalid state token")
+
+    # ── n8n scoped flow ───────────────────────────────────────────────────────
+    if state_dict.get("flow") == "n8n":
+        try:
+            n8n_credential_type = state_dict["n8n_credential_type"]
+            client_id = state_dict["n8n_client_id"]
+            client_secret = state_dict["n8n_client_secret"]
+            verifier = state_dict["verifier"]
+
+            tokens = _exchange_code(
+                code, client_id, client_secret, verifier,
+                state_dict["token_url"],
+            )
+
+            # Inject the tokens into a new n8n credential so n8n can refresh them.
+            from axiom.connectors.n8n.client import N8nClient
+            n8n = N8nClient()
+            expiry_ms = int((time.time() + tokens.get("expires_in", 3600)) * 1000)
+            credential_id = await n8n.create_credential(
+                name=f"axiom-{n8n_credential_type}-{int(time.time())}",
+                credential_type=n8n_credential_type,
+                data={
+                    "clientId": client_id,
+                    "clientSecret": client_secret,
+                    "oauthTokenData": {
+                        "access_token": tokens["access_token"],
+                        "refresh_token": tokens.get("refresh_token", ""),
+                        "scope": tokens.get("scope", ""),
+                        "token_type": tokens.get("token_type", "Bearer"),
+                        "expiry_date": expiry_ms,
+                    },
+                },
+            )
+
+            return HTMLResponse(f"""
+<html><body><script>
+  if (window.opener) {{
+    window.opener.postMessage({{
+      type: "n8n-oauth-complete",
+      credential_id: {json.dumps(credential_id)}
+    }}, "*");
+  }}
+  setTimeout(() => window.close(), 500);
+</script><p>Authorization complete — you may close this window.</p></body></html>
+""")
+        except Exception as e:
+            return HTMLResponse(
+                f"<html><body><h2>Error</h2><p>{str(e)}</p></body></html>",
+                status_code=400,
+            )
+
+    # ── direct app-connector flow (Gmail, etc.) ───────────────────────────────
+    tenant_id = state_dict.get("tenant_id")
+    source_id = state_dict.get("source_id")
+    connector = state_dict.get("connector")
+    verifier = state_dict.get("verifier")
+    if not all([tenant_id, source_id, connector, verifier]):
         raise HTTPException(status_code=400, detail="Invalid state token")
 
     from axiom.connectors.apps.factory import AppConnectorFactory
@@ -123,25 +192,8 @@ async def oauth_callback(code: str, state: str, background_tasks: BackgroundTask
     client_id = os.environ.get(oauth.client_id_env, "")
     client_secret = os.environ.get(oauth.client_secret_env, "")
 
-    redirect_uri = "http://localhost:8080/api/oauth/callback"
-
-    body = urllib.parse.urlencode(
-        {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": redirect_uri,
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "code_verifier": verifier,
-        }
-    ).encode()
-
     try:
-        req = urllib.request.Request(oauth.token_url, data=body, method="POST")
-        req.add_header("Content-Type", "application/x-www-form-urlencoded")
-
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            tokens = json.loads(resp.read())
+        tokens = _exchange_code(code, client_id, client_secret, verifier, oauth.token_url)
 
         creds = {
             "access_token": tokens["access_token"],
@@ -154,14 +206,13 @@ async def oauth_callback(code: str, state: str, background_tasks: BackgroundTask
         from axiom.auth.token_store import save
         await save(tenant_id, connector, creds)
 
-        # App connectors don't have SQL schemas to ingest, so we just register them as active
         import asyncpg
         conn = await asyncpg.connect(settings.database_url)
         try:
             await conn.execute("""
                 INSERT INTO data_sources (source_id, tenant_id, name, description, db_url, db_type, status)
                 VALUES ($1, $2, $1, $3, $4, $5, 'active')
-                ON CONFLICT (source_id) DO UPDATE 
+                ON CONFLICT (source_id) DO UPDATE
                 SET status = 'active', error_message = NULL, db_url = EXCLUDED.db_url;
             """, source_id, tenant_id, f"{manifest.display_name} Connection", f"{connector}://oauth", connector)
         finally:

@@ -1,4 +1,5 @@
 import logging
+import urllib.parse
 import uuid
 import json
 import asyncio
@@ -632,6 +633,222 @@ async def delete_source(tenant_id: str, source_id: str, user_id: str = Depends(v
     except Exception as exc:
         logger.exception("Failed to delete source: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── n8n integration endpoints ────────────────────────────────────────────────
+
+class N8nProvisionRequest(BaseModel):
+    service_id: str
+    source_id: str
+    source_name: str
+    tenant_id: str
+    credentials: Dict[str, Any] = {}   # API key / bearer fields; empty for OAuth2 (handled separately)
+
+
+class N8nOAuthCallbackRequest(BaseModel):
+    credential_id: str
+    service_id: str
+    source_id: str
+    source_name: str
+    tenant_id: str
+
+
+@app.get("/api/n8n/services")
+async def list_n8n_services(user_id: str = Depends(verify_token)) -> Dict[str, Any]:
+    """Return the catalog of supported third-party services."""
+    from axiom.connectors.n8n.services import services_by_category, SERVICES
+    by_cat = services_by_category()
+    return {
+        "services": [
+            {
+                "id": svc.id,
+                "label": svc.label,
+                "icon": svc.icon,
+                "category": svc.category,
+                "auth_type": svc.auth_type,
+                "description": svc.description,
+                "credential_fields": [
+                    {"key": f.key, "label": f.label, "placeholder": f.placeholder, "secret": f.secret}
+                    for f in svc.credential_fields
+                ],
+            }
+            for svc in SERVICES.values()
+        ],
+        "categories": list(by_cat.keys()),
+    }
+
+
+class N8nOAuthInitiateRequest(BaseModel):
+    service_id: str
+    source_name: str
+    credentials: Dict[str, Any] = {}   # clientId, clientSecret etc. passed upfront for OAuth2
+
+
+@app.post("/api/n8n/oauth/initiate")
+async def n8n_oauth_initiate(
+    req: N8nOAuthInitiateRequest,
+    user_id: str = Depends(verify_token),
+) -> Dict[str, Any]:
+    """
+    Start an OAuth2 flow for a service.
+    credentials must include clientId/clientSecret (or equivalent) so n8n
+    can generate a valid OAuth URL with a real client_id.
+    Returns {credential_id, auth_url}.
+    """
+    from axiom.connectors.n8n.client import N8nClient
+    from axiom.connectors.n8n.services import get_service, get_platform_oauth_credentials
+    svc = get_service(req.service_id)
+    if svc.auth_type != "oauth2":
+        raise HTTPException(status_code=400, detail=f"{svc.label} uses {svc.auth_type}, not OAuth2")
+
+    # Merge platform credentials (from .env) with any user-supplied overrides
+    creds = {**get_platform_oauth_credentials(req.service_id), **req.credentials}
+    if not creds.get("clientId"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Platform OAuth credentials for {svc.label} are not configured. Set GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET in .env."
+        )
+
+    # If the service declares explicit oauth_scopes, build the Google OAuth URL
+    # ourselves so n8n's hard-coded scopes are never used.  The callback will
+    # exchange the code, then inject the tokens into an n8n credential.
+    if svc.oauth_scopes:
+        from axiom.api.oauth_routes import _pkce_pair, _get_fernet
+        verifier, challenge = _pkce_pair()
+        state_dict = {
+            "flow": "n8n",
+            "n8n_credential_type": svc.n8n_credential_type,
+            "n8n_client_id": creds["clientId"],
+            "n8n_client_secret": creds["clientSecret"],
+            "token_url": svc.token_url,
+            "verifier": verifier,
+        }
+        fernet = _get_fernet()
+        state = fernet.encrypt(json.dumps(state_dict).encode()).decode()
+        redirect_uri = f"{settings.public_url}/api/oauth/callback"
+        params = urllib.parse.urlencode({
+            "client_id": creds["clientId"],
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": " ".join(svc.oauth_scopes),
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "access_type": "offline",
+            "prompt": "consent",
+        })
+        return {"credential_id": None, "auth_url": f"{svc.auth_url}?{params}"}
+
+    client = N8nClient()
+    result = await client.get_oauth_url(svc.n8n_credential_type, req.source_name, creds)
+    return result
+
+
+@app.post("/api/n8n/provision")
+async def n8n_provision(
+    req: N8nProvisionRequest,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(verify_token),
+) -> Dict[str, Any]:
+    """
+    Provision an n8n credential + workflow for a data source, then register it in data_sources.
+    For API-key services: call directly with credentials filled in.
+    For OAuth2: call after OAuth callback has stored the credential (pass credential_id via credentials={"_id": ...}).
+    """
+    import secrets as _secrets
+    from axiom.connectors.n8n.client import N8nClient
+    from axiom.connectors.n8n.services import get_service
+
+    svc = get_service(req.service_id)
+    client = N8nClient()
+    webhook_secret = _secrets.token_urlsafe(32)
+
+    # For OAuth2 the credential already exists in n8n; caller passes {"_id": "<credential_id>"}
+    if svc.auth_type == "oauth2":
+        credential_id = req.credentials.get("_id")
+        if not credential_id:
+            raise HTTPException(status_code=400, detail="OAuth2 credential_id missing. Complete OAuth flow first.")
+    else:
+        credential_id = await client.create_credential(
+            name=req.source_name,
+            credential_type=svc.n8n_credential_type,
+            data=req.credentials,
+        )
+
+    wf = await client.create_workflow(
+        source_name=req.source_name,
+        credential_type=svc.n8n_credential_type,
+        credential_id=credential_id,
+        webhook_secret=webhook_secret,
+        default_fetch_url=svc.default_fetch_url,
+    )
+
+    # Register as a data source in Axiom
+    mcp_config = {
+        "webhook_secret": webhook_secret,
+        "source_label": svc.label,
+        "service_id": req.service_id,
+        "n8n_workflow_id": wf["workflow_id"],
+        "n8n_credential_id": credential_id,
+        "default_fetch_url": svc.default_fetch_url,
+    }
+
+    from axiom.api.onboard import run_ingestion
+    background_tasks.add_task(
+        run_ingestion,
+        tenant_id=req.tenant_id,
+        source_id=req.source_id,
+        db_url=wf["webhook_url"],
+        db_type="n8n",
+        description=f"{svc.label} via n8n",
+        mcp_config=mcp_config,
+        custom_rules=None,
+    )
+
+    return {
+        "status": "provisioned",
+        "source_id": req.source_id,
+        "webhook_url": wf["webhook_url"],
+        "service": svc.label,
+    }
+
+
+@app.delete("/api/n8n/sources/{tenant_id}/{source_id}")
+async def n8n_delete_source(
+    tenant_id: str,
+    source_id: str,
+    user_id: str = Depends(verify_token),
+) -> Dict[str, Any]:
+    """Delete an n8n-backed source: remove workflow + credential from n8n, then delete from data_sources."""
+    import asyncpg
+    from axiom.connectors.n8n.client import N8nClient
+
+    async with asyncpg.connect(settings.database_url) as conn:
+        row = await conn.fetchrow(
+            "SELECT mcp_config FROM data_sources WHERE tenant_id=$1 AND source_id=$2",
+            tenant_id, source_id,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Source not found")
+
+        cfg = row["mcp_config"]
+        if isinstance(cfg, str):
+            cfg = json.loads(cfg)
+
+        client = N8nClient()
+        wf_id = cfg.get("n8n_workflow_id")
+        cred_id = cfg.get("n8n_credential_id")
+        if wf_id:
+            await client.delete_workflow(wf_id)
+        if cred_id:
+            await client.delete_credential(cred_id)
+
+        await conn.execute(
+            "DELETE FROM data_sources WHERE tenant_id=$1 AND source_id=$2",
+            tenant_id, source_id,
+        )
+
+    return {"status": "deleted", "source_id": source_id}
 
 
 @app.get("/threads")

@@ -12,14 +12,15 @@
   --font-mono: var(--font-mono), "Fira Code", ui-monospace, SFMono-Regular, monospace;
   --font-heading: var(--font-header), "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
   
-  /* Tactile Slate Palette */
-  --color-tactile-base: #1E1E1C;
-  --color-tactile-surface: #2A2927;
-  --color-tactile-text: #E6E1D8;
-  --color-tactile-primary: #638A70;
-  --color-tactile-primary-hover: #729E81;
-  --color-tactile-warning: #C26D5C;
-  --color-tactile-warning-bg: rgba(194, 109, 92, 0.08);
+  /* Tactile Studio Palette */
+  --color-tactile-base: #1A1A18;      /* Deep Obsidian */
+  --color-tactile-surface: #242422;   /* Warm Charcoal */
+  --color-tactile-elevated: #2D2D2B;  /* Lighter Charcoal for depth */
+  --color-tactile-text: #EAE6DF;      /* Humanistic Off-White */
+  --color-tactile-primary: #7DA38B;   /* Refined Sage Green */
+  --color-tactile-primary-hover: #8DB59C;
+  --color-tactile-warning: #D17D6B;
+  --color-tactile-warning-bg: rgba(209, 125, 107, 0.08);
   --color-tactile-border: rgba(255, 255, 255, 0.05);
 
   --color-ring: var(--ring);
@@ -35,20 +36,21 @@
   --radius-lg: var(--radius);
 
   /* Shadows */
-  --shadow-tactile: 0 4px 12px rgba(0, 0, 0, 0.2);
+  --shadow-tactile: 0 4px 20px rgba(0, 0, 0, 0.4);
+  --shadow-tactile-inner: inset 0 2px 4px rgba(0, 0, 0, 0.3);
 }
 
 :root {
-  --background: #1E1E1C;
-  --foreground: #E6E1D8;
-  --primary: #638A70;
-  --primary-foreground: #1E1E1C;
-  --muted: #2A2927;
+  --background: #1A1A18;
+  --foreground: #EAE6DF;
+  --primary: #7DA38B;
+  --primary-foreground: #1A1A18;
+  --muted: #242422;
   --muted-foreground: #94a3b8;
   --border: rgba(255, 255, 255, 0.05);
   --input: rgba(255, 255, 255, 0.05);
-  --ring: #638A70;
-  --radius: 0.5rem;
+  --ring: #7DA38B;
+  --radius: 0.75rem;
 }
 
 @layer base {
@@ -56,28 +58,45 @@
     @apply border-border outline-ring/50;
   }
   body {
-    @apply bg-background text-foreground;
+    @apply bg-background text-foreground antialiased selection:bg-tactile-primary/30;
   }
   html {
-    @apply font-sans; /* Force dark mode via layout.tsx class */
+    @apply font-sans;
+  }
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-heading tracking-tight;
   }
 }
 
 /* Custom Tactile Studio Utilities */
-.tactile-card {
-  @apply bg-tactile-surface border border-tactile-border shadow-tactile rounded-lg;
-}
+@layer components {
+  .tactile-card {
+    @apply bg-tactile-surface border border-tactile-border shadow-tactile rounded-xl transition-all duration-300;
+  }
 
-.tactile-button {
-  @apply bg-tactile-primary hover:bg-tactile-primary-hover text-tactile-base font-semibold rounded-md transition-all duration-200 ease-out shadow-tactile;
-}
+  .tactile-card-elevated {
+    @apply bg-tactile-elevated border border-tactile-border shadow-tactile rounded-xl;
+  }
 
-.tactile-warning {
-  @apply bg-tactile-warning-bg border-l-4 border-tactile-warning text-tactile-text p-4 rounded-r-md;
-}
+  .tactile-button {
+    @apply bg-tactile-primary hover:bg-tactile-primary-hover text-tactile-base font-semibold rounded-lg px-5 py-2.5 transition-all duration-200 ease-out shadow-tactile active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed;
+  }
 
-.tactile-input {
-  @apply bg-tactile-base border border-tactile-border focus-within:border-tactile-primary focus-within:ring-1 focus-within:ring-tactile-primary rounded-lg transition-all duration-200 shadow-inner;
+  .tactile-button-outline {
+    @apply bg-transparent border border-tactile-border text-tactile-text hover:bg-white/5 font-semibold rounded-lg px-5 py-2.5 transition-all duration-200 ease-out active:scale-[0.98];
+  }
+
+  .tactile-input {
+    @apply bg-tactile-base border border-tactile-border focus-within:border-tactile-primary/50 focus-within:ring-1 focus-within:ring-tactile-primary/30 rounded-lg px-4 py-3 text-tactile-text outline-none transition-all duration-200 shadow-tactile-inner;
+  }
+
+  .tactile-sidebar-item {
+    @apply flex items-center gap-4 px-4 py-3.5 rounded-xl font-semibold transition-all duration-200;
+  }
+
+  .tactile-sidebar-item-active {
+    @apply bg-tactile-primary/10 text-tactile-primary border border-tactile-primary/20 shadow-tactile-inner;
+  }
 }
 
 .custom-scrollbar::-webkit-scrollbar {

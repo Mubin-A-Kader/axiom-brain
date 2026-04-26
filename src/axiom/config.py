@@ -40,6 +40,22 @@ class Settings(BaseSettings):
     # App connectors
     connector_master_key: str = "change-me-in-production-32-chars!!"
 
+    # n8n integration
+    n8n_url: str = "http://localhost:5678"
+    n8n_user: str = "axiom@axiom.local"
+    n8n_password: str = "axiom-n8n-password"
+
+    # OAuth app credentials — registered once by the platform operator, never exposed to end users
+    google_oauth_client_id: str = ""
+    google_oauth_client_secret: str = ""
+    salesforce_oauth_client_id: str = ""
+    salesforce_oauth_client_secret: str = ""
+    slack_oauth_client_id: str = ""
+    slack_oauth_client_secret: str = ""
+
+    # Public base URL — used for OAuth redirect URIs
+    public_url: str = "http://localhost:8080"
+
     # App
     log_level: str = "info"
 

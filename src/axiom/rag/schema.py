@@ -107,7 +107,7 @@ class SchemaRAG:
                 fk_list.append({"to": fk["references"], "via": fk["column"]})
 
             ids.append(f"{tenant_id}_{source_id}_{table_name}")
-            texts.append(meta["ddl"])
+            texts.append(meta.get("ddl") or f"Table: {table_name}\nColumns: {', '.join(meta.get('columns', {}).keys())}")
             metadatas.append({
                 "tenant_id": tenant_id,
                 "source_id": source_id,

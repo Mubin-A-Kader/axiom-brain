@@ -14,9 +14,13 @@ import {
 } from "../types";
 import { createClient } from "./supabase/client";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
+export const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080";
 
-async function getAuthHeaders() {
+export function getApiUrl() {
+  return API_URL;
+}
+
+export async function getAuthHeaders(): Promise<Record<string, string>> {
   const supabase = createClient();
   const { data: { session } } = await supabase.auth.getSession();
 

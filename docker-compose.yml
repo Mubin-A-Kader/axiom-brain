@@ -116,6 +116,15 @@ services:
       TEMPORAL_URL: temporal:7233
       GMAIL_CLIENT_ID: ${GMAIL_CLIENT_ID:-}
       GMAIL_CLIENT_SECRET: ${GMAIL_CLIENT_SECRET:-}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      SALESFORCE_OAUTH_CLIENT_ID: ${SALESFORCE_OAUTH_CLIENT_ID:-}
+      SALESFORCE_OAUTH_CLIENT_SECRET: ${SALESFORCE_OAUTH_CLIENT_SECRET:-}
+      SLACK_OAUTH_CLIENT_ID: ${SLACK_OAUTH_CLIENT_ID:-}
+      SLACK_OAUTH_CLIENT_SECRET: ${SLACK_OAUTH_CLIENT_SECRET:-}
+      N8N_URL: http://n8n:5678
+      N8N_USER: ${N8N_USER:-axiom@axiom.local}
+      N8N_PASSWORD: ${N8N_PASSWORD:-Axiom-n8n-Password1}
       OPENSSL_armcap: "0"
     depends_on:
       postgres:
@@ -128,6 +137,8 @@ services:
         condition: service_healthy
       notebook-executor:
         condition: service_started
+      n8n:
+        condition: service_healthy
 
   notebook-executor:
     build:
@@ -144,6 +155,31 @@ services:
       AXIOM_ARTIFACT_ROOT: /tmp/axiom-artifacts
     mem_limit: 1g
     cpus: 1.0
+
+  n8n:
+    image: n8nio/n8n:latest
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    environment:
+      N8N_HOST: 0.0.0.0
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-change-me-n8n-encryption-key-32ch}
+      N8N_USER_MANAGEMENT_JWT_SECRET: ${N8N_JWT_SECRET:-change-me-n8n-jwt-secret-32chars}
+      # Pre-configure the owner account so /rest/login works without manual UI setup
+      N8N_SKIP_SETUP_WIZARD: "true"
+      N8N_PERSONALIZATION_ENABLED: "false"
+      N8N_SECURE_COOKIE: "false"
+      # Must be browser-accessible so OAuth callbacks (Google → n8n) work
+      WEBHOOK_URL: ${N8N_WEBHOOK_URL:-http://localhost:5678}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   # Temporal worker — runs the execution-phase activities (execute_sql, critic,
   # discovery, notebook, synthesize) with durable retries and execution logs.
@@ -214,3 +250,4 @@ volumes:
   redis_data:
   chroma_data:
   axiom_artifacts:
+  n8n_data:

@@ -79,6 +79,9 @@ class ConnectorFactory:
         except ImportError:
             logger.warning("MCP dependencies not found. MCPConnector disabled.")
 
+        from axiom.connectors.n8n.connector import N8nConnector
+        cls.register("n8n", N8nConnector)
+
     @classmethod
     async def get_query_mode(cls, db_type: str) -> "QueryMode | None":
         """
