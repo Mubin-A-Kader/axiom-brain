@@ -97,7 +97,6 @@ SERVICES: Dict[str, ServiceDefinition] = {
                 base_params={
                     "resource": "sheet",
                     "operation": "read",
-                    "sheetName": {"__rl": True, "value": "Sheet1", "mode": "name"},
                     "options": {},
                 },
                 provision_fields=[
@@ -108,6 +107,14 @@ SERVICES: Dict[str, ServiceDefinition] = {
                         extract_pattern=r"/spreadsheets/d/([a-zA-Z0-9_-]+)",
                         user_param_key="documentId",
                         user_param_template={"__rl": True, "mode": "id"}
+                    ),
+                    ProvisionField(
+                        key="sheet_name",
+                        label="Sheet Name (Tab)",
+                        placeholder="Sheet1",
+                        required=True,
+                        user_param_key="sheetName",
+                        user_param_template={"__rl": True, "mode": "name"}
                     )
                 ]
             ),
@@ -123,6 +130,33 @@ SERVICES: Dict[str, ServiceDefinition] = {
                 CredentialField(key="accessToken", label="API Token", placeholder="pat...", secret=True),
             ],
             description="Query Airtable bases and tables",
+            native_node=NativeNodeConfig(
+                node_type="n8n-nodes-base.airtable",
+                type_version=2,
+                credential_key="airtableTokenApi",
+                base_params={
+                    "resource": "table",
+                    "operation": "list",
+                },
+                provision_fields=[
+                    ProvisionField(
+                        key="base_id",
+                        label="Base ID",
+                        placeholder="app...",
+                        required=True,
+                        user_param_key="base",
+                        user_param_template={"__rl": True, "mode": "id"}
+                    ),
+                    ProvisionField(
+                        key="table_name",
+                        label="Table Name",
+                        placeholder="My Table",
+                        required=True,
+                        user_param_key="table",
+                        user_param_template={"__rl": True, "mode": "id"}
+                    )
+                ]
+            ),
         ),
         # ── CRM ───────────────────────────────────────────────────────────
         ServiceDefinition(
@@ -133,6 +167,25 @@ SERVICES: Dict[str, ServiceDefinition] = {
             auth_type="oauth2",
             n8n_credential_type="salesforceOAuth2Api",
             description="Query Salesforce objects (Leads, Opportunities, Accounts...)",
+            native_node=NativeNodeConfig(
+                node_type="n8n-nodes-base.salesforce",
+                type_version=4,
+                credential_key="salesforceOAuth2Api",
+                base_params={
+                    "resource": "sobject",
+                    "operation": "getAll",
+                },
+                provision_fields=[
+                    ProvisionField(
+                        key="object_name",
+                        label="Salesforce Object",
+                        placeholder="Lead",
+                        required=True,
+                        user_param_key="sobject",
+                        user_param_template={"__rl": True, "mode": "id"}
+                    )
+                ]
+            ),
         ),
         ServiceDefinition(
             id="hubspot",
