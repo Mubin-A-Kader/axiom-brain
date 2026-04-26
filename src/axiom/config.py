@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     litellm_url: str = "http://localhost:8000"
     litellm_key: str = "sk-axiom-local"
     llm_model: str = "gemini-1.5-flash"
+    llm_embed_model: str = "text-embedding-3-large"
     llm_temperature: float = 0.0
 
     # Database

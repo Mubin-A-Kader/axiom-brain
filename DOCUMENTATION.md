@@ -8,11 +8,13 @@ Axiom Brain is a "Reasoning-as-Infrastructure" Text-to-SQL agent built using the
 
 The system relies on a modern, asynchronous tech stack tailored for AI agents:
 
-- **Language:** Python 3.11+
-- **Agent Orchestration:** [LangGraph](https://langchain-ai.github.io/langgraph/) for stateful, cyclic agent workflows.
-- **LLM Interface:** [LiteLLM](https://docs.litellm.ai/) for unified model access (configured currently for `gemini-2.5-flash`).
+- **Language:** Python 3.12+
+- **Agent Orchestration:** [LangGraph](https://langchain-ai.github.io/langgraph/) ≥1.0 for stateful, cyclic agent workflows.
+- **LLM Interface:** LiteLLM proxy (via OpenAI SDK — `openai.AsyncOpenAI(base_url=litellm_url)`) for unified model access. Never use the litellm Python client directly.
+- **Embeddings:** `text-embedding-3-large` (3072 dims) via LiteLLM proxy. ChromaDB collection dimension is fixed at creation — changing models requires wiping the `chroma_data` volume and re-ingesting.
+- **Schema RAG:** Direct ChromaDB + `rank_bm25` — no LlamaIndex. Hybrid retrieval: vector similarity + BM25, merged with BM25 hits ranked first.
 - **API Framework:** [FastAPI](https://fastapi.tiangolo.com/) for exposing the query and approval endpoints.
-- **Vector Database:** [ChromaDB](https://www.trychroma.com/) for Schema Retrieval-Augmented Generation (RAG).
+- **Vector Database:** [ChromaDB](https://www.trychroma.com/) for Schema RAG (DDLs, table summaries, sample rows).
 - **Control/Target Database:** [PostgreSQL](https://www.postgresql.org/) (managed via `asyncpg`) for control plane data (`data_sources`) and SQL execution.
 - **State Persistence:** [Redis Stack](https://redis.io/docs/latest/operate/oss_and_stack/install/install-stack/) used as a LangGraph checkpointer (`AsyncRedisSaver`) for persistent conversational threads and interrupts.
 - **Security:** [Lakera Guard](https://www.lakera.ai/guard) for prompt injection protection.

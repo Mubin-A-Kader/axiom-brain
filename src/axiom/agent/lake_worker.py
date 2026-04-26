@@ -13,7 +13,7 @@ import logging
 import re
 import time
 from dataclasses import asdict, dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import asyncpg
 
@@ -168,28 +168,28 @@ class LakeWorker:
             tenant_id, self._source_id, question, n_results=2
         )
 
-        # 4. SQL generation
-        sql = await self._generate_sql(
+        # 4. Query generation — connector owns the prompt and extraction logic
+        from axiom.connectors.factory import ConnectorFactory
+        connector = await ConnectorFactory.get_connector(self._source_id, db_type, db_url, mcp_config)
+        sql = await self._generate_query(
+            connector=connector,
             question=question,
             schema_context=schema_context,
             few_shot_examples=few_shot,
             custom_rules=custom_rules,
-            db_type=db_type,
             history_context=history_context,
             llm_model=llm_model,
-            query_type=query_type,
         )
         if not sql:
             return LakeWorkerResult.failure(
-                self._source_id, db_type, "SQL generation produced no valid query"
+                self._source_id, db_type, "Query generation produced no valid output"
             )
 
         # 5. Execution
         return await self._execute(
+            connector=connector,
             sql=sql,
             db_type=db_type,
-            db_url=db_url,
-            mcp_config=mcp_config,
         )
 
     # Patterns that indicate a pure visualization change with no new data needed
@@ -198,45 +198,18 @@ class LakeWorker:
         re.IGNORECASE,
     )
 
-    async def _generate_sql(
+    async def _generate_query(
         self,
         *,
+        connector: Any,
         question: str,
         schema_context: str,
         few_shot_examples: str,
         custom_rules: str,
-        db_type: str,
         history_context: str,
         llm_model: str,
-        query_type: str = "NEW_TOPIC",
     ) -> Optional[str]:
-        from axiom.connectors.factory import ConnectorFactory
-
-        dialect_name, dialect_rules = await ConnectorFactory.get_dialect_info(db_type)
-
-        prompt = (
-            f"You are a precise SQL expert.\n"
-            f"Target database: {dialect_name.upper()}\n\n"
-            f"### SCHEMA:\n{schema_context}\n\n"
-            f"### BUSINESS GLOSSARY:\n{custom_rules or 'None'}\n\n"
-            f"### EXAMPLES:\n{few_shot_examples or 'None'}\n\n"
-            f"### HISTORY:\n{history_context or 'None'}\n\n"
-            f"### DIALECT RULES:\n{dialect_rules}\n\n"
-            f"Generate a SELECT query to answer: {question}\n"
-            "Output ONLY the SQL inside <sql></sql> tags. "
-            "SELECT only — no writes, no DDL."
-        )
-
-        # Pure visualization refinement: if the question only changes chart type and
-        # there's a previous working SQL in history, reuse it directly without an LLM call.
-        if query_type == "REFINEMENT" and self._VIZ_ONLY_RE.match(question):
-            sql_matches = re.findall(r"SQL:\s*(SELECT.*?)\n", history_context, re.DOTALL | re.IGNORECASE)
-            if sql_matches:
-                logger.info(
-                    "LakeWorker %s: visualization refinement — reusing previous SQL", self._source_id
-                )
-                return sql_matches[-1].strip()
-
+        prompt = connector.build_query_prompt(question, schema_context, custom_rules, few_shot_examples, history_context)
         try:
             response = await self._client.chat.completions.create(
                 model=llm_model,
@@ -244,51 +217,25 @@ class LakeWorker:
                 temperature=0.0,
             )
             content = response.choices[0].message.content or ""
-            # Strip reasoning blocks emitted by some models
             content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
-
-            sql_match = re.search(r"<sql>(.*?)</sql>", content, re.DOTALL)
-            if sql_match:
-                sql = sql_match.group(1).strip()
-            else:
-                sql = content.replace("```sql", "").replace("```", "").strip()
-
-            if sql and sql.upper().startswith("SELECT"):
-                return sql
-
-            # General REFINEMENT fallback: if LLM produced nothing valid, borrow last SQL
-            if query_type == "REFINEMENT":
-                sql_matches = re.findall(r"SQL:\s*(SELECT.*?)\n", history_context, re.DOTALL | re.IGNORECASE)
-                if sql_matches:
-                    logger.info(
-                        "LakeWorker %s: REFINEMENT fallback — reusing previous SQL", self._source_id
-                    )
-                    return sql_matches[-1].strip()
-
-            return None
+            return connector.extract_query(content)
         except Exception as exc:
-            logger.warning("LakeWorker %s SQL generation error: %s", self._source_id, exc)
+            logger.warning("LakeWorker %s query generation error: %s", self._source_id, exc)
             return None
 
     async def _execute(
         self,
         *,
+        connector: Any,
         sql: str,
         db_type: str,
-        db_url: str,
-        mcp_config: dict,
     ) -> LakeWorkerResult:
-        if not sql.strip().upper().startswith("SELECT"):
+        if not connector.is_read_only_query(sql):
             return LakeWorkerResult.failure(
-                self._source_id, db_type, "Non-SELECT query blocked by security policy"
+                self._source_id, db_type, "Query blocked by security policy"
             )
 
         try:
-            from axiom.connectors.factory import ConnectorFactory
-
-            connector = await ConnectorFactory.get_connector(
-                self._source_id, db_type, db_url, mcp_config
-            )
             result = await connector.execute_query(sql)
             rows = result["rows"]
 

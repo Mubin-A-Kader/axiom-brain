@@ -73,6 +73,13 @@ def _should_correct(state: SQLAgentState) -> str:
     return "synthesize_response"
 
 
+def _should_retry_notebook(state: SQLAgentState) -> str:
+    """Route back to code generation if execution failed and retries remain."""
+    if state.get("python_error") and not state.get("artifact"):
+        return "generate_python_code"
+    return "synthesize_response"
+
+
 def _route_supervisor(state: GlobalAgentState) -> str:
     agent = state.get("next_agent", "SQL_AGENT")
     if agent == "SQL_AGENT":
@@ -137,7 +144,11 @@ async def build_graph(hitl: bool = True):
     sql_graph.add_edge("critic", "generate_sql")
     sql_graph.add_edge("discovery", "generate_sql")
     sql_graph.add_edge("generate_python_code", "build_notebook_artifact")
-    sql_graph.add_edge("build_notebook_artifact", "synthesize_response")
+    sql_graph.add_conditional_edges(
+        "build_notebook_artifact",
+        _should_retry_notebook,
+        {"generate_python_code": "generate_python_code", "synthesize_response": "synthesize_response"},
+    )
     sql_graph.add_edge("synthesize_response", END)
     
     # Compile SQL sub-graph — HITL interrupt only for the web app, not CLI

@@ -49,6 +49,12 @@ model_list:
       model: gemini/gemini-2.5-pro
       api_key: os.environ/GEMINI_API_KEY
 
+  # ── Embeddings ───────────────────────────────────────────────────────────
+  - model_name: text-embedding-3-large
+    litellm_params:
+      model: openai/text-embedding-3-large
+      api_key: os.environ/OPENAI_API_KEY
+
 general_settings:
   master_key: sk-axiom-local
 

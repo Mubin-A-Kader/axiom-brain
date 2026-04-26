@@ -67,6 +67,7 @@ class SQLAgentState(GlobalAgentState):
     # Python Artifacts
     python_code: Optional[str]
     python_error: Optional[str]
+    notebook_attempts: int
     
     # RCA Specific Fields
     problem_statement: Optional[str]

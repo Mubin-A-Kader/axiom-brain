@@ -164,3 +164,28 @@ class BaseConnector(ABC):
         """Specific instructions to inject into the LLM prompt for this database."""
         pass
 
+    def build_query_prompt(self, question: str, schema_context: str, custom_rules: str, few_shot_examples: str, history_context: str) -> str:
+        """Build the LLM prompt for query generation. SQL connectors use the default; override for other query languages."""
+        return (
+            f"You are a precise SQL expert.\n"
+            f"Target database: {self.dialect_name.upper()}\n\n"
+            f"### SCHEMA:\n{schema_context}\n\n"
+            f"### BUSINESS GLOSSARY:\n{custom_rules or 'None'}\n\n"
+            f"### EXAMPLES:\n{few_shot_examples or 'None'}\n\n"
+            f"### HISTORY:\n{history_context or 'None'}\n\n"
+            f"### DIALECT RULES:\n{self.llm_prompt_instructions}\n\n"
+            f"Generate a SELECT query to answer: {question}\n"
+            "Output ONLY the SQL inside <sql></sql> tags. SELECT only — no writes, no DDL."
+        )
+
+    def extract_query(self, llm_content: str) -> Optional[str]:
+        """Extract the query from raw LLM output. Override for non-SQL connectors."""
+        import re
+        match = re.search(r"<sql>(.*?)</sql>", llm_content, re.DOTALL)
+        query = match.group(1).strip() if match else llm_content.replace("```sql", "").replace("```", "").strip()
+        return query if query.upper().startswith("SELECT") else None
+
+    def is_read_only_query(self, query: str) -> bool:
+        """Return True if the query is safe to execute. Override for non-SQL connectors."""
+        return query.strip().upper().startswith("SELECT")
+

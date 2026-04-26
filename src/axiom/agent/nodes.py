@@ -20,14 +20,21 @@ from axiom.agent.lake_worker import LakeWorker, LakeWorkerResult
 logger = logging.getLogger(__name__)
 
 
+import ipaddress
+
 def _to_json(rows: list, cols: list[str]) -> str:
     def _convert(v):
         if isinstance(v, Decimal):
             return float(v)
         if isinstance(v, (datetime, date)):
             return v.isoformat()
+        if isinstance(v, (ipaddress.IPv4Address, ipaddress.IPv6Address, ipaddress.IPv4Interface, ipaddress.IPv6Interface, ipaddress.IPv4Network, ipaddress.IPv6Network)):
+            return str(v)
         return v
-    return json.dumps({"columns": cols, "rows": [[_convert(v) for v in row] for row in rows]})
+    return json.dumps(
+        {"columns": cols, "rows": [[_convert(v) for v in row] for row in rows]},
+        default=str
+    )
 
 
 def _get_content(response) -> str:
@@ -1497,6 +1504,24 @@ class NotebookArtifactNode:
                 artifact_id=artifact_id,
                 notebook=notebook,
             )
+
+            execution_error = execution.get("execution_error")
+            notebook_attempts = state.get("notebook_attempts", 0) + 1
+
+            # If execution failed and we haven't exhausted retries, feed the error
+            # back to PythonCodeGenerationNode for self-correction.
+            if execution_error and notebook_attempts <= 3:
+                logger.warning(
+                    "Notebook execution failed (attempt %d/3): %s",
+                    notebook_attempts, execution_error[:200],
+                )
+                return {
+                    "python_error": execution_error,
+                    "notebook_attempts": notebook_attempts,
+                    "artifact": None,
+                }
+
+            # Success or exhausted retries — save whatever we have.
             artifact = self._store.save(
                 artifact_id=artifact_id,
                 tenant_id=tenant_id,
@@ -1505,10 +1530,10 @@ class NotebookArtifactNode:
                 status=execution.get("status", "failed"),
                 outputs=execution.get("outputs", []),
                 cells_summary=cells_summary,
-                execution_error=execution.get("execution_error"),
+                execution_error=execution_error,
                 logs=execution.get("logs"),
             )
-            return {"artifact": artifact}
+            return {"artifact": artifact, "python_error": None, "notebook_attempts": 0}
         except Exception as exc:
             logger.warning("Failed to build notebook artifact: %s", exc)
             try:
@@ -1531,7 +1556,7 @@ class NotebookArtifactNode:
                 cells_summary=cells_summary,
                 execution_error=str(exc),
             )
-            return {"artifact": artifact}
+            return {"artifact": artifact, "python_error": None, "notebook_attempts": 0}
 
 
 class ResponseSynthesizerNode:

@@ -5,11 +5,12 @@ import { DataTable } from "../components/DataTable";
 import { useState, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
-import { 
-  Database, Check, X, Copy, 
-  Terminal, Activity, LayoutDashboard, Settings, 
+import {
+  Database, Check, X, Copy,
+  Terminal, Activity, LayoutDashboard, Settings,
   CornerDownLeft, Loader2, AlertCircle, ChevronRight, ChevronDown, Search, Network, Sparkles, Cpu, RefreshCw,
-  PanelRightClose, PanelRightOpen, ArrowRight, Zap, ShieldCheck, MessageSquare, Plus, Waves
+  PanelRightClose, PanelRightOpen, ArrowRight, Zap, ShieldCheck, MessageSquare, Plus, Waves,
+  Mail, Server, Globe
 } from "lucide-react";
 import { ChatProvider, useChat } from "../hooks/useAxiomChatContext";
 import { Sidebar } from "../components/Sidebar";
@@ -42,12 +43,42 @@ function TactileButton({ children, onClick, className = "", disabled = false, va
   );
 }
 
+const SOURCE_ICONS: Record<string, any> = {
+  postgresql: Database,
+  mysql: Database,
+  mongodb: Server,
+  gmail: Mail,
+  mcp: Terminal,
+};
+
+function SourceMiniCard({ source }: { source: any }) {
+  const Icon = SOURCE_ICONS[source.db_type] || Globe;
+  const statusClass =
+    source.status === "active"
+      ? "bg-[#638A70]"
+      : source.status === "syncing"
+      ? "bg-amber-400 animate-pulse"
+      : "bg-red-500";
+  return (
+    <div className="flex items-center gap-3 bg-[#2A2927] border border-white/5 rounded-xl px-4 py-3">
+      <Icon className="w-4 h-4 text-[#638A70] shrink-0" />
+      <div className="flex-1 min-w-0">
+        <p className="text-sm font-medium text-[#E6E1D8] truncate">{source.source_id}</p>
+        <p className="text-[10px] font-mono text-[#E6E1D8]/30 uppercase tracking-widest">{source.db_type}</p>
+      </div>
+      <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusClass}`} />
+    </div>
+  );
+}
+
 function ChatInner({ tenantId, lakes, selectedLakeId, setSelectedLakeId }: any) {
   const { messages, isLoading, sendMessage, handleApprove, markAsWrong, selectedModel, setSelectedModel, threads, activeThreadId, switchThread, startNewThread, isThreadsLoading } = useChat();
   const [input, setInput] = useState("");
   const [showArtifacts, setShowArtifacts] = useState(true);
   const [showHistory, setShowHistory] = useState(false);
   const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null);
+  const [sources, setSources] = useState<any[]>([]);
+  const [lakeSources, setLakeSources] = useState<string[] | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const router = useRouter();
 
@@ -65,6 +96,26 @@ function ChatInner({ tenantId, lakes, selectedLakeId, setSelectedLakeId }: any) 
   }, [latestArtifactMsg?.id, selectedArtifactId]);
 
   const isArtifactActive = !!activeArtifactMsg && showArtifacts;
+
+  useEffect(() => {
+    if (!tenantId) return;
+    import("@/lib/api").then(({ fetchSources }) => {
+      fetchSources(tenantId).then(setSources).catch(() => {});
+    });
+  }, [tenantId]);
+
+  useEffect(() => {
+    if (!selectedLakeId) { setLakeSources(null); return; }
+    import("@/lib/api").then(({ fetchLakeSources }) => {
+      fetchLakeSources(selectedLakeId)
+        .then((d: any) => setLakeSources(d.sources.map((s: any) => s.source_id)))
+        .catch(() => setLakeSources(null));
+    });
+  }, [selectedLakeId]);
+
+  const displayedSources = lakeSources === null
+    ? sources
+    : sources.filter((s) => lakeSources.includes(s.source_id));
 
   useEffect(() => {
     if (messagesEndRef.current) {
@@ -255,15 +306,36 @@ function ChatInner({ tenantId, lakes, selectedLakeId, setSelectedLakeId }: any) 
               {messages.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-center mt-20">
                   <div className="relative mb-8">
-                     <div className="absolute inset-0 bg-[#638A70]/20 blur-3xl rounded-full" />
-                     <Network className="w-20 h-20 text-[#638A70] relative z-10" />
+                    <div className="absolute inset-0 bg-[#638A70]/20 blur-3xl rounded-full" />
+                    <Network className="w-20 h-20 text-[#638A70] relative z-10" />
                   </div>
                   <h1 className="text-4xl font-heading font-bold text-[#E6E1D8] mb-4 tracking-tight">
                     Axiom Intelligence
                   </h1>
-                  <p className="text-[#E6E1D8]/40 text-lg max-w-md mx-auto leading-relaxed">
+                  <p className="text-[#E6E1D8]/40 text-lg max-w-md mx-auto leading-relaxed mb-12">
                     How can I help you analyze your data infrastructure today?
                   </p>
+
+                  {displayedSources.length > 0 && (
+                    <div className="w-full max-w-2xl text-left">
+                      <div className="flex items-center justify-between mb-3">
+                        <span className="text-[10px] font-mono font-bold uppercase tracking-widest text-[#E6E1D8]/25">
+                          {selectedLakeId ? "Lake sources" : "Connected sources"} &middot; {displayedSources.length}
+                        </span>
+                        <button
+                          onClick={() => router.push("/data-sources")}
+                          className="text-[10px] font-mono uppercase tracking-widest text-[#638A70]/50 hover:text-[#638A70] transition-colors"
+                        >
+                          Manage →
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                        {displayedSources.map((src: any) => (
+                          <SourceMiniCard key={src.source_id} source={src} />
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               ) : (
                 messages.map((msg: any) => (
@@ -381,23 +453,22 @@ function ChatInner({ tenantId, lakes, selectedLakeId, setSelectedLakeId }: any) 
                         )}
 
                         {msg.status === "pending_approval" && (!msg.metadata?.probing_options || msg.metadata.probing_options.length === 0) && (
-                          <div className="bg-[#C26D5C]/5 border border-[#C26D5C]/30 rounded-2xl p-8 flex flex-col gap-6 mt-8 shadow-2xl relative overflow-hidden">
-                            <div className="absolute top-0 right-0 p-4 opacity-5">
-                               <ShieldCheck className="w-20 h-20 text-[#C26D5C]" />
-                            </div>
-                            <div className="flex items-center gap-3 text-[#C26D5C]">
-                              <ShieldCheck className="w-6 h-6" />
-                              <h3 className="text-xs font-bold uppercase tracking-[0.3em]">Execution Gate</h3>
-                            </div>
-                            <p className="text-base text-[#E6E1D8]/80 leading-relaxed font-medium">Manual verification of the generated execution plan is required before proceeding.</p>
-                            <div className="flex gap-4">
-                              <TactileButton variant="primary" onClick={() => handleApprove(true, msg.metadata!.thread_id!)} disabled={isLoading} className="flex-1 py-4 text-base rounded-xl">
-                                Approve Execution
-                              </TactileButton>
-                              <TactileButton variant="outline" onClick={() => handleApprove(false, msg.metadata!.thread_id!)} disabled={isLoading} className="px-6 rounded-xl">
-                                <X className="w-6 h-6 text-[#C26D5C]" />
-                              </TactileButton>
-                            </div>
+                          <div className="flex items-center gap-3 mt-4">
+                            <span className="text-[10px] font-mono text-[#E6E1D8]/30 uppercase tracking-widest">run query?</span>
+                            <button
+                              onClick={() => handleApprove(true, msg.metadata!.thread_id!)}
+                              disabled={isLoading}
+                              className="px-3 py-1 text-[11px] font-mono font-bold uppercase tracking-widest bg-[#638A70]/10 text-[#638A70] border border-[#638A70]/30 rounded hover:bg-[#638A70]/20 transition-colors disabled:opacity-40"
+                            >
+                              Allow
+                            </button>
+                            <button
+                              onClick={() => handleApprove(false, msg.metadata!.thread_id!)}
+                              disabled={isLoading}
+                              className="px-3 py-1 text-[11px] font-mono font-bold uppercase tracking-widest bg-transparent text-[#E6E1D8]/30 border border-white/10 rounded hover:text-[#C26D5C] hover:border-[#C26D5C]/30 transition-colors disabled:opacity-40"
+                            >
+                              Deny
+                            </button>
                           </div>
                         )}
 

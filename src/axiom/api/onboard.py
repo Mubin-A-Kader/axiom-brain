@@ -8,7 +8,6 @@ import asyncpg
 import openai
 from axiom.config import settings
 from axiom.rag.schema import SchemaRAG
-from axiom.connectors.factory import ConnectorFactory
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -63,10 +62,11 @@ async def _generate_table_summary(
     ddl: str,
     connector,
     sem: asyncio.Semaphore,
-) -> str:
-    """Sample table data and ask the LLM for a rich semantic summary."""
+) -> tuple[str, list]:
+    """Sample table data and ask the LLM for a rich semantic summary. Returns (summary, samples)."""
     async with sem:
         sample_text = "No sample available."
+        sample_rows = []
         try:
             # Detect EAV key columns from the DDL and sample their DISTINCT values
             import re
@@ -90,6 +90,7 @@ async def _generate_table_summary(
             rows = result.get("rows", [])
             cols = result.get("columns", [])
             if rows and cols:
+                sample_rows = [dict(zip(cols, row)) for row in rows[:5]]
                 lines = [", ".join(str(v) for v in row) for row in rows[:5]]
                 sample_text = "columns: " + ", ".join(cols) + "\n" + "\n".join(lines)
                 if extra_samples:
@@ -109,10 +110,10 @@ async def _generate_table_summary(
                 max_tokens=150,
                 temperature=0.2,
             )
-            return _get_content(resp).strip()
+            return _get_content(resp).strip(), sample_rows
         except Exception as exc:
             logger.warning("Summary generation failed for %s: %s", table_name, exc)
-            return f"Table containing {table_name} data."
+            return f"Table containing {table_name} data.", sample_rows
 
 
 async def enrich_schema_with_summaries(
@@ -121,24 +122,25 @@ async def enrich_schema_with_summaries(
     model: str,
     concurrency: int = 5,
 ) -> dict:
-    """Generate rich LLM summaries for every table in the schema dict (in-place)."""
+    """Generate rich LLM summaries and store data samples for every table in the schema dict."""
     client = openai.AsyncOpenAI(
         base_url=f"{settings.litellm_url}/v1",
         api_key=settings.litellm_key,
     )
     sem = asyncio.Semaphore(concurrency)
 
-    async def _enrich(table_name: str, meta: dict) -> tuple[str, str]:
-        summary = await _generate_table_summary(
+    async def _enrich(table_name: str, meta: dict) -> tuple[str, str, list]:
+        summary, samples = await _generate_table_summary(
             client, model, table_name, meta["ddl"], connector, sem
         )
-        return table_name, summary
+        return table_name, summary, samples
 
     tasks = [_enrich(t, m) for t, m in schema.items()]
     results = await asyncio.gather(*tasks)
 
-    for table_name, summary in results:
+    for table_name, summary, samples in results:
         schema[table_name]["description"] = summary
+        schema[table_name]["sample_data"] = samples
 
     return schema
 
@@ -164,9 +166,19 @@ async def run_ingestion(
             SET status = 'syncing', error_message = NULL, custom_rules = EXCLUDED.custom_rules;
         """, source_id, tenant_id, description, db_url, db_type, json.dumps(mcp_config) if mcp_config else None, custom_rules_str if custom_rules_str else "")
 
-        # 2. Get the appropriate connector
+        # 2. Get the appropriate connector — skip for app connectors (gmail, etc.)
+        from axiom.connectors.factory import ConnectorFactory
+        query_mode = await ConnectorFactory.get_query_mode(db_type)
+        if query_mode is None:
+            await cp_conn.execute("""
+                UPDATE data_sources SET status = 'active', error_message = NULL
+                WHERE source_id = $1
+            """, source_id)
+            logger.info(f"App connector '{db_type}' source {source_id} registered (no schema ingestion)")
+            return
+
         connector = await ConnectorFactory.get_connector(source_id, db_type, db_url, mcp_config)
-        
+
         # 3. Extract schema using the connector's dialect-specific logic
         schema = await connector.get_schema()
         if not schema:
@@ -178,7 +190,7 @@ async def run_ingestion(
 
         logger.info(f"Ingesting {len(schema)} tables into ChromaDB...")
         rag = SchemaRAG()
-        rag.ingest(tenant_id, source_id, schema)
+        await rag.ingest(tenant_id, source_id, schema)
         
         # 4. Final update: mark as active
         await cp_conn.execute("""
@@ -200,6 +212,7 @@ async def run_ingestion(
     finally:
         await cp_conn.close()
         # Important: Close the connector session if it was MCP or just cleanup
+        from axiom.connectors.factory import ConnectorFactory
         await ConnectorFactory.shutdown()
 
 if __name__ == "__main__":

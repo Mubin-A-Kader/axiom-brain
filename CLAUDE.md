@@ -9,7 +9,7 @@ Stack: LangGraph + LiteLLM (via OpenAI SDK) + ChromaDB + NetworkX + Redis (check
 
 ## Commands
 
-**Python (backend, uv + Python ≥3.11):**
+**Python (backend, uv + Python ≥3.12):**
 ```bash
 uv sync                                           # install (incl. dev extras: uv sync --extra dev)
 uv run uvicorn axiom.api.app:app --reload --port 8080
@@ -62,7 +62,7 @@ Checkpointer: `AsyncRedisSaver` with a `MemorySaver` fallback if Redis is unreac
 Nodes are class-based with `__call__`; deps injected via constructor (see `nodes.py`, `rca_nodes.py`, `planner.py`, `probing.py`, `memory_manager.py`). RCA nodes in `rca_nodes.py` drive the hypothesis-driven investigation; SQL nodes in `nodes.py` drive generation/execution/criticism.
 
 ### Schema RAG (`src/axiom/rag/schema.py`)
-ChromaDB holds two types of documents per source: *table summaries* (for routing) and *precise DDLs* (for generation). `SchemaRAG` also maintains an in-memory `networkx.Graph` where nodes are tables and edges are foreign keys — neighbor expansion on this graph is how the agent gets joinable context without blowing the context window. All vector searches are filtered by `{"source_id": ...}` for tenant isolation.
+ChromaDB holds three document types per source: *DDL schemas* (for generation), *table summaries* (for routing), and *sample rows* (for context). Embeddings are generated via `openai.AsyncOpenAI` against the LiteLLM proxy (`text-embedding-3-large`, 3072 dims) — no LlamaIndex, no litellm Python client. Retrieval is hybrid: vector similarity via ChromaDB + BM25 keyword search via `rank_bm25`, merged with BM25 hits ranked first. `SchemaRAG` also maintains an in-memory `networkx.Graph` for FK-aware neighbor expansion. All searches are filtered by `{"tenant_id": ..., "source_id": ...}`. `ingest()` is async — always `await rag.ingest(...)`.
 
 ### Connectors (`src/axiom/connectors/`)
 `ConnectorFactory` is a classmethod-based LRU cache (max 20) of `BaseConnector` instances keyed by `source_id`. Built-ins registered lazily: `postgresql` (asyncpg), `mysql` (aiomysql), and an experimental `mcp` adapter. Each connector exposes `dialect_name` and `llm_prompt_instructions` used by `generate_sql`.
@@ -85,7 +85,8 @@ Supabase GoTrue runs behind an nginx "gateway" that rewrites paths so the Supaba
 - `/artifacts/{id}`, `/artifacts/{id}/download`, `/artifacts/{id}/rerun`: notebook lifecycle.
 
 ## Key Design Decisions
-- **LiteLLM via OpenAI SDK, not the litellm client.** Always use `openai.AsyncOpenAI(base_url=f"{settings.litellm_url}/v1", api_key=settings.litellm_key)`. The litellm client's provider auto-detection has been known to hijack Gemini requests.
+- **LiteLLM via OpenAI SDK, not the litellm client.** Always use `openai.AsyncOpenAI(base_url=f"{settings.litellm_url}/v1", api_key=settings.litellm_key)`. The litellm client's provider auto-detection has been known to hijack Gemini requests and bypass the proxy. This rule applies to embeddings too — `SchemaRAG._embed()` uses `AsyncOpenAI`, not LiteLLMEmbedding or any LlamaIndex wrapper.
+- **Embedding model is `text-embedding-3-large` (3072 dims).** Registered in `litellm_config.yaml` as `openai/text-embedding-3-large`. Changing the model requires wiping and re-ingesting the ChromaDB collection (`chroma_data` volume) — dimensions are fixed at collection creation time.
 - **Schema-first prompt ordering.** `generate_sql` places schema context before the question to maximize vLLM prefix-cache hits.
 - **Lakera Guard is a no-op** when `LAKERA_API_KEY` is empty — safe to develop without a key. Applied to both user input and generated SQL.
 - **Redis checkpointer with MemorySaver fallback.** Don't assume Redis is always available in code paths that read checkpointer state.

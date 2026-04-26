@@ -2,14 +2,14 @@
 name = "axiom-brain"
 version = "0.1.0"
 description = "Axiom — Reasoning-as-Infrastructure Text-to-SQL agent"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 
 dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
     "pydantic>=2.7.0",
     "pydantic-settings>=2.3.0",
-    "langgraph>=0.2.0,<1.0.0",
+    "langgraph>=1.0.0",
     "langchain-community>=0.2.0",
     "litellm>=1.40.0",
     "chromadb>=0.5.0",

@@ -51,11 +51,15 @@ class PostgresConnector(BaseConnector):
 
     def _serialize(self, v: Any) -> Any:
         import uuid
+        import ipaddress
         if isinstance(v, Decimal):
             return float(v)
         if isinstance(v, (datetime, date)):
             return v.isoformat()
         if isinstance(v, uuid.UUID):
+            return str(v)
+        if isinstance(v, (ipaddress.IPv4Address, ipaddress.IPv6Address,
+                          ipaddress.IPv4Network, ipaddress.IPv6Network)):
             return str(v)
         return v
 

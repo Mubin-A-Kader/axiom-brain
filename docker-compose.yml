@@ -116,6 +116,7 @@ services:
       TEMPORAL_URL: temporal:7233
       GMAIL_CLIENT_ID: ${GMAIL_CLIENT_ID:-}
       GMAIL_CLIENT_SECRET: ${GMAIL_CLIENT_SECRET:-}
+      OPENSSL_armcap: "0"
     depends_on:
       postgres:
         condition: service_healthy
@@ -166,6 +167,7 @@ services:
       LAKERA_API_KEY: ${LAKERA_API_KEY:-}
       NOTEBOOK_EXECUTOR_URL: http://notebook-executor:8090
       NOTEBOOK_EXECUTION_TIMEOUT: ${NOTEBOOK_EXECUTION_TIMEOUT:-60}
+      OPENSSL_armcap: "0"
     depends_on:
       postgres:
         condition: service_healthy

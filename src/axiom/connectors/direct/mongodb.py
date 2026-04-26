@@ -122,6 +122,38 @@ MONGODB QUERY RULES — you MUST follow these exactly:
    Output ONLY the raw JSON object.
         """.strip()
 
+    def build_query_prompt(self, question: str, schema_context: str, custom_rules: str, few_shot_examples: str, history_context: str) -> str:
+        return (
+            f"You are a MongoDB aggregation pipeline expert.\n"
+            f"Target database: MONGODB\n\n"
+            f"### SCHEMA:\n{schema_context}\n\n"
+            f"### BUSINESS GLOSSARY:\n{custom_rules or 'None'}\n\n"
+            f"### EXAMPLES:\n{few_shot_examples or 'None'}\n\n"
+            f"### HISTORY:\n{history_context or 'None'}\n\n"
+            f"### DIALECT RULES:\n{self.llm_prompt_instructions}\n\n"
+            f"Generate a MongoDB aggregation pipeline to answer: {question}\n"
+        )
+
+    def extract_query(self, llm_content: str) -> Optional[str]:
+        import re, json
+        content = llm_content.replace("```json", "").replace("```", "").strip()
+        try:
+            json.loads(content)
+            return content
+        except json.JSONDecodeError:
+            match = re.search(r'(\{.*?"collection".*?\})', content, re.DOTALL)
+            return match.group(1).strip() if match else None
+
+    def is_read_only_query(self, query: str) -> bool:
+        import json
+        try:
+            parsed = json.loads(query)
+            pipeline = parsed.get("pipeline", [])
+            write_stages = {"$out", "$merge"}
+            return not any(stage.keys() & write_stages for stage in pipeline if isinstance(stage, dict))
+        except Exception:
+            return False
+
     async def connect(self) -> None:
         if self._client:
             return
@@ -129,11 +161,17 @@ MONGODB QUERY RULES — you MUST follow these exactly:
         db_name = self.config.get("database") or self._parse_db_name()
         # Cap pool size: 100 sites × 5 connections = 500 max — within Atlas M10 limits.
         # Raise maxPoolSize if a single site needs high concurrency.
+        # SECLEVEL=1 is set globally in /etc/ssl/openssl.cnf (Dockerfile).
+        # Only inject tls=True if the URI doesn't already carry ssl=/tls=.
+        tls_kwargs = {}
+        if ".mongodb.net" in self.db_url and "tls=" not in self.db_url and "ssl=" not in self.db_url:
+            tls_kwargs["tls"] = True
         self._client = motor.AsyncIOMotorClient(
             self.db_url,
             maxPoolSize=self.config.get("max_pool_size", 5),
             minPoolSize=0,
             serverSelectionTimeoutMS=10000,
+            **tls_kwargs,
         )
         self._db = self._client[db_name]
         await self._client.admin.command("ping")
