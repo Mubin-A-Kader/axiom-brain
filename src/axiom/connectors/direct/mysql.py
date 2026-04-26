@@ -19,14 +19,15 @@ class MySQLConnector(BaseConnector):
     def _parse_url(self, url: str) -> Dict[str, Any]:
         """Simple MySQL URL parser."""
         # Expected: mysql://user:password@host:port/dbname
-        from urllib.parse import urlparse
-        p = urlparse(url)
+        from axiom.core.cleansing import safe_db_urlparse
+        from urllib.parse import unquote
+        p = safe_db_urlparse(url)
         return {
-            "host": p.hostname,
-            "port": p.port or 3306,
-            "user": p.username,
-            "password": p.password,
-            "db": p.path.lstrip('/'),
+            "host": p["hostname"],
+            "port": p["port"] or 3306,
+            "user": unquote(p["username"]) if p["username"] else None,
+            "password": unquote(p["password"]) if p["password"] else None,
+            "db": unquote(p["path"].lstrip('/')),
         }
 
     async def connect(self) -> None:
@@ -113,7 +114,7 @@ class MySQLConnector(BaseConnector):
 
         async with self._pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
-                # 1. Get all tables
+                # 1. Get all tables (use backticks for db_name to handle hyphens)
                 await cur.execute(f"SHOW TABLES FROM `{db_name}`")
                 tables = await cur.fetchall()
                 

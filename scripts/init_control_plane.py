@@ -76,7 +76,79 @@ async def main():
             END $$;
         """)
 
-        print("Control plane 'data_sources' table initialized and migrated successfully.")
+        # App connections — per-tenant OAuth2 / API-key credentials for external apps
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_connections (
+                id           TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+                tenant_id    TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                connector    TEXT NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'connected',
+                credentials  TEXT NOT NULL,
+                connected_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at   TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE (tenant_id, connector)
+            );
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_app_connections_tenant ON app_connections(tenant_id);"
+        )
+
+        # User-defined agents — compose multiple connectors into a named agent
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_agents (
+                id           TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+                tenant_id    TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                name         TEXT NOT NULL,
+                description  TEXT NOT NULL,
+                instructions TEXT,
+                connectors   TEXT[] NOT NULL DEFAULT '{}',
+                created_at   TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_agents_tenant ON user_agents(tenant_id);"
+        )
+
+        # Lakes — named curated subsets of sources
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS lakes (
+                id          TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+                tenant_id   TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                name        TEXT NOT NULL,
+                description TEXT,
+                created_at  TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_lakes_tenant ON lakes(tenant_id);")
+
+        # Lake sources — junction table for lakes and data_sources
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS lake_sources (
+                lake_id    TEXT NOT NULL REFERENCES lakes(id) ON DELETE CASCADE,
+                source_id  TEXT NOT NULL REFERENCES data_sources(source_id) ON DELETE CASCADE,
+                added_at   TIMESTAMPTZ DEFAULT NOW(),
+                PRIMARY KEY (lake_id, source_id)
+            );
+        """)
+
+        # Migration: If there are entries in data_lake but no lakes, create a "Default Lake"
+        tenants_with_data = await conn.fetch("SELECT DISTINCT tenant_id FROM data_lake")
+        for r in tenants_with_data:
+            tid = r["tenant_id"]
+            # Check if this tenant already has a lake
+            has_lake = await conn.fetchval("SELECT id FROM lakes WHERE tenant_id = $1 LIMIT 1", tid)
+            if not has_lake:
+                lake_id = await conn.fetchval(
+                    "INSERT INTO lakes (tenant_id, name, description) VALUES ($1, $2, $3) RETURNING id",
+                    tid, "Default Lake", "Automatic migration of your existing data lake."
+                )
+                # Move sources
+                await conn.execute(
+                    "INSERT INTO lake_sources (lake_id, source_id) SELECT $1, source_id FROM data_lake WHERE tenant_id = $2",
+                    lake_id, tid
+                )
+
+        print("Control plane tables initialized successfully.")
     finally:
         await conn.close()
 

@@ -2,35 +2,41 @@ model_list:
   # ── Claude (best for SQL reasoning + tool use) ──────────────────────────
   - model_name: claude-sonnet
     litellm_params:
-      model: anthropic/claude-sonnet-4-6
+      model: anthropic/claude-3-5-sonnet-20241022
       api_key: os.environ/ANTHROPIC_API_KEY
+      fallbacks: [gpt-4o, gemini-2.5-pro]
 
   - model_name: claude-opus
     litellm_params:
-      model: anthropic/claude-opus-4-7
+      model: anthropic/claude-3-opus-20240229
       api_key: os.environ/ANTHROPIC_API_KEY
+      fallbacks: [gpt-4o, gemini-2.5-pro]
 
   # ── OpenAI ───────────────────────────────────────────────────────────────
   - model_name: gpt-4o
     litellm_params:
       model: openai/gpt-4o
       api_key: os.environ/OPENAI_API_KEY
+      fallbacks: [gemini-2.5-pro, claude-sonnet]
 
   - model_name: gpt-4o-mini
     litellm_params:
       model: openai/gpt-4o-mini
       api_key: os.environ/OPENAI_API_KEY
+      fallbacks: [gemini-2.5-flash]
 
   # ── DeepSeek ─────────────────────────────────────────────────────────────
   - model_name: deepseek-chat
     litellm_params:
       model: deepseek/deepseek-chat
       api_key: os.environ/DEEPSEEK_API_KEY
+      fallbacks: [gpt-4o-mini]
 
   - model_name: deepseek-reasoner
     litellm_params:
       model: deepseek/deepseek-reasoner
       api_key: os.environ/DEEPSEEK_API_KEY
+      fallbacks: [gpt-4o]
 
   # ── Google Gemini ────────────────────────────────────────────────────────
   - model_name: gemini-2.5-flash
@@ -48,3 +54,9 @@ general_settings:
 
 litellm_settings:
   drop_params: true
+  set_verbose: true
+
+router_settings:
+  routing_strategy: simple-shuffle
+  allowed_fails: 3
+  cooldown_time: 30

@@ -5,6 +5,7 @@ import re
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Optional
 
 import asyncpg
 import sqlglot
@@ -14,6 +15,7 @@ from axiom.agent.state import SQLAgentState
 from axiom.config import settings
 from axiom.rag.schema import SchemaRAG
 from axiom.core.inference import AdaptiveInferenceManager
+from axiom.agent.lake_worker import LakeWorker, LakeWorkerResult
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,28 @@ def _to_json(rows: list, cols: list[str]) -> str:
             return v.isoformat()
         return v
     return json.dumps({"columns": cols, "rows": [[_convert(v) for v in row] for row in rows]})
+
+
+def _get_content(response) -> str:
+    """Safely extract string content from OpenAI/LiteLLM response."""
+    content = response.choices[0].message.content
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        # Handle content blocks (e.g. from some Anthropic/Gemini models via LiteLLM)
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(block.get("text", ""))
+            else:
+                parts.append(str(block))
+        content_str = "".join(parts)
+    else:
+        content_str = str(content)
+    
+    # Remove <think> blocks (often present in reasoning models) to avoid breaking JSON parsing
+    content_str = re.sub(r"<think>.*?</think>", "", content_str, flags=re.DOTALL)
+    return content_str
 
 
 class DatabaseSelectionNode:
@@ -56,58 +80,204 @@ class DatabaseSelectionNode:
             finally:
                 await cp_conn.close()
 
-        tenant_id = state["tenant_id"]
-        question = state["question"]
+        tenant_id = state.get("tenant_id", "")
+        question = state.get("question", "")
 
-        # 1. Fetch available sources for this tenant
+        # 1. Determine the source pool: lake_scope > lake_id > all active sources
+        lake_scope = state.get("lake_scope") or []
+        lake_id = state.get("lake_id")
         cp_conn = await asyncpg.connect(settings.database_url)
         try:
-            sources = await cp_conn.fetch(
-                "SELECT source_id, description, db_type, custom_rules FROM data_sources WHERE tenant_id = $1 AND status = 'active'", 
-                tenant_id
-            )
+            if lake_scope:
+                # User explicitly scoped to specific sources
+                sources = await cp_conn.fetch(
+                    """SELECT source_id, description, db_type, custom_rules
+                       FROM data_sources
+                       WHERE tenant_id = $1 AND status = 'active' AND source_id = ANY($2::text[])""",
+                    tenant_id, lake_scope
+                )
+            else:
+                # Use lake_id from state or fall back to the first available lake
+                target_lake = lake_id
+                if not target_lake:
+                    target_lake = await cp_conn.fetchval(
+                        "SELECT id FROM lakes WHERE tenant_id = $1 ORDER BY created_at LIMIT 1",
+                        tenant_id
+                    )
+
+                if target_lake:
+                    lake_sources = await cp_conn.fetch(
+                        "SELECT source_id FROM lake_sources WHERE lake_id = $1", target_lake
+                    )
+                    ids = [r["source_id"] for r in lake_sources]
+                    sources = await cp_conn.fetch(
+                        """SELECT source_id, description, db_type, custom_rules
+                           FROM data_sources
+                           WHERE tenant_id = $1 AND status = 'active' AND source_id = ANY($2::text[])""",
+                        tenant_id, ids
+                    )
+                else:
+                    # No lake configured — search all active sources
+                    sources = await cp_conn.fetch(
+                        """SELECT source_id, description, db_type, custom_rules
+                           FROM data_sources WHERE tenant_id = $1 AND status = 'active'""",
+                        tenant_id
+                    )
         finally:
             await cp_conn.close()
 
-        if not sources:
-            logger.warning("No active sources found for tenant %s. Falling back.", tenant_id)
-            return {"source_id": "default_tenant", "db_type": "postgresql", "custom_rules": ""} # Fallback
+        # Partition sources by query mode.
+        # get_query_mode returns None for app connectors (Gmail, Slack, …) that are stored
+        # in data_sources but are not queryable by the database worker pipeline.
+        # Adding any new database connector (Snowflake, BigQuery, Redshift, DuckDB, …) only
+        # requires registering it with ConnectorFactory — no changes needed here.
+        from axiom.connectors.factory import ConnectorFactory
+        from axiom.connectors.base import QueryMode
 
-        if len(sources) == 1:
-            logger.info("Single source found for tenant, auto-selecting: %s", sources[0]["source_id"])
+        db_sources = []
+        skipped_app = []
+        for s in sources:
+            mode = await ConnectorFactory.get_query_mode(s["db_type"])
+            if mode is None:
+                skipped_app.append(s["source_id"])
+            else:
+                s = dict(s)
+                s["_query_mode"] = mode
+                db_sources.append(s)
+
+        if skipped_app:
+            logger.info(
+                "Lake routing: skipped %d app connector(s) not queryable as databases: %s",
+                len(skipped_app), skipped_app,
+            )
+
+        sources = db_sources
+
+        if not sources:
+            if lake_id:
+                # Lake explicitly selected but contains no active SQL-queryable sources.
+                # Return an error that _route_after_db_selection will catch and short-circuit.
+                logger.warning(
+                    "Lake %s has no active SQL-queryable sources for tenant %s. "
+                    "Skipped app connectors: %s",
+                    lake_id, tenant_id, skipped_app,
+                )
+                return {
+                    "source_id": None,
+                    "lake_mode": False,
+                    "error": (
+                        "The selected lake has no active SQL-queryable data sources. "
+                        "Add a PostgreSQL, MySQL, or MongoDB connection to the lake and "
+                        "make sure it has been ingested successfully."
+                    ),
+                }
+            logger.warning("No active data sources configured for tenant %s.", tenant_id)
             return {
-                "source_id": sources[0]["source_id"], 
-                "db_type": sources[0]["db_type"],
-                "custom_rules": sources[0]["custom_rules"] or ""
+                "source_id": None,
+                "lake_mode": False,
+                "error": "No active data sources found. Connect and ingest a database first.",
             }
 
-        # 2. Let the LLM pick the best source based on descriptions
-        source_list = "\n".join([f"- {s['source_id']} ({s['db_type']}): {s['description']}" for s in sources])
-        prompt = f"""You are a database router.
-    A user asked: "{question}"
-    Which of the following databases is most likely to contain the answer?
+        if len(sources) == 1:
+            logger.info("Single source, auto-selecting: %s", sources[0]["source_id"])
+            return {
+                "source_id": sources[0]["source_id"],
+                "db_type": sources[0]["db_type"],
+                "custom_rules": sources[0]["custom_rules"] or "",
+                "needs_source_clarification": False,
+                "routing_candidates": [],
+                "lake_mode": False,
+            }
 
-    ### AVAILABLE DATABASES:
-    {source_list}
+        # 2. Lake fan-out: when an explicit lake_id is set, activate multi-source mode.
+        #    lake_scope carries (source_id, query_mode) pairs so LakeOrchestratorNode
+        #    can dispatch the right worker type per source without any hardcoding.
+        if lake_id:
+            scope = [
+                {"source_id": s["source_id"], "query_mode": s["_query_mode"]}
+                for s in sources
+            ]
+            logger.info(
+                "Lake mode activated for lake_id=%s — fanning out to %d sources: %s",
+                lake_id,
+                len(scope),
+                [(e["source_id"], e["query_mode"]) for e in scope],
+            )
+            return {
+                "lake_scope": [e["source_id"] for e in scope],  # keep plain list for state compat
+                "lake_scope_meta": scope,                        # rich list for orchestrator dispatch
+                "lake_mode": True,
+                "needs_source_clarification": False,
+                "routing_candidates": [],
+            }
 
-    Respond ONLY with the source_id. No other text."""
+        # 3. No explicit lake — LLM routing with confidence scoring
+        source_list = "\n".join(
+            [f'- {s["source_id"]} ({s["db_type"]}): {s["description"] or "no description"}' for s in sources]
+        )
+        prompt = f"""You are a database router. A user asked: "{question}"
+
+### AVAILABLE DATABASES:
+{source_list}
+
+Score each database's relevance (0.0–1.0) and pick the best match.
+Respond ONLY with valid JSON:
+{{
+  "selected": "<source_id>",
+  "confidence": <0.0-1.0>,
+  "candidates": [
+    {{"source_id": "<id>", "reason": "<one sentence>", "score": <0.0-1.0>}}
+  ]
+}}
+Include ALL databases in candidates, sorted by score descending."""
 
         response = await self._client.chat.completions.create(
             model=state.get("llm_model") or settings.llm_model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
+            response_format={"type": "json_object"},
         )
 
-        selected_id = response.choices[0].message.content.strip()
+        try:
+            result = json.loads(_get_content(response).strip())
+            selected_id = result.get("selected", "")
+            confidence = float(result.get("confidence", 1.0))
+            candidates = result.get("candidates", [])
+        except Exception:
+            selected_id = ""
+            confidence = 1.0
+            candidates = []
 
-        # Verify it's a valid ID from our list and get its db_type
         selected_source = next((s for s in sources if s["source_id"] == selected_id), sources[0])
         selected_id = selected_source["source_id"]
         db_type = selected_source["db_type"]
         custom_rules = selected_source["custom_rules"] or ""
 
-        logger.info("Routed query to database source: %s (%s)", selected_id, db_type)
-        return {"source_id": selected_id, "db_type": db_type, "custom_rules": custom_rules}
+        # 4. Low confidence → surface ambiguity to the user (HITL)
+        CONFIDENCE_THRESHOLD = 0.65
+        if confidence < CONFIDENCE_THRESHOLD and len(sources) > 1:
+            logger.info(
+                "Routing ambiguous (confidence=%.2f) for tenant %s — surfacing to user",
+                confidence, tenant_id,
+            )
+            return {
+                "source_id": selected_id,
+                "db_type": db_type,
+                "custom_rules": custom_rules,
+                "needs_source_clarification": True,
+                "routing_candidates": candidates,
+                "lake_mode": False,
+            }
+
+        logger.info("Routed to %s (%s) confidence=%.2f", selected_id, db_type, confidence)
+        return {
+            "source_id": selected_id,
+            "db_type": db_type,
+            "custom_rules": custom_rules,
+            "needs_source_clarification": False,
+            "routing_candidates": [],
+            "lake_mode": False,
+        }
 
 
 
@@ -219,7 +389,7 @@ Respond ONLY with a JSON list of table names, e.g. ["table1", "table2"]. No othe
         )
         
         try:
-            content = response.choices[0].message.content.strip()
+            content = _get_content(response).strip()
             import re
             match = re.search(r"\[.*\]", content, re.DOTALL)
             raw = match.group(0) if match else content
@@ -262,61 +432,25 @@ class SchemaRetrievalNode:
         selected_tables = state.get("selected_tables", [])
         search_query = state["question"]
 
-        # If there's history, include the last question to help retrieve related examples
         history = state.get("history_context", "")
         if history and "No prior" not in history:
             try:
-                # Extract the most recent Q: from history
                 last_q = history.split("Q: ")[-1].split("\n")[0]
                 search_query = f"{last_q} {search_query}"
             except Exception:
                 pass
 
-        # --- Phase 2: Decentralized Identity (Zero Trust) ---
         from axiom.security.trust.ans import AgentNamingService
         session_did = AgentNamingService.generate_session_did(tenant_id, state.get("session_id", "default"))
         agent_did = AgentNamingService.generate_agent_did("knowledge_retrieval", session_did)
-        logger.info(f"Agent {agent_did} initiated schema retrieval")
+        logger.info(f"Agent {agent_did} initiated schema retrieval (direct RAG)")
 
-        # --- Phase 1: Force Knowledge Retrieval through MCP ---
-        from axiom.connectors.mcp_adapter import MCPConnector
-        base_url = os.environ.get("AXIOM_API_URL", "http://localhost:8080")
-        knowledge_hub_url = f"{base_url}/mcp/knowledge/sse"
+        if selected_tables:
+            schema_context = await self._rag.retrieve_exact(tenant_id, source_id, selected_tables)
+        else:
+            schema_context = await self._rag.retrieve(tenant_id, source_id, search_query, n_results=5)
 
-        # Pass DID in headers for the MCP Hub to verify
-        connector = MCPConnector("knowledge_retrieval", knowledge_hub_url, {"headers": {"X-Agent-DID": agent_did}})
-        await connector.connect()
-
-        try:
-            if selected_tables:
-                # Note: Knowledge MCP server currently has retrieve_schema but not retrieve_exact 
-                # mapped as a separate tool, it uses retrieve_schema with question.
-                # Let's ensure we use the MCP tool.
-                res = await connector._session.call_tool("retrieve_schema", arguments={
-                    "tenant_id": tenant_id,
-                    "source_id": source_id,
-                    "question": " ".join(selected_tables) if selected_tables else search_query,
-                    "n_results": 10
-                })
-                schema_context = res.content[0].text if res.content else "No schema context found."
-            else:
-                res = await connector._session.call_tool("retrieve_schema", arguments={
-                    "tenant_id": tenant_id,
-                    "source_id": source_id,
-                    "question": search_query,
-                    "n_results": 5
-                })
-                schema_context = res.content[0].text if res.content else "No schema context found."
-
-            res_ex = await connector._session.call_tool("retrieve_examples", arguments={
-                "tenant_id": tenant_id,
-                "source_id": source_id,
-                "question": search_query,
-                "n_results": 2
-            })
-            few_shot_examples = res_ex.content[0].text if res_ex.content else ""
-        finally:
-            await connector.disconnect()
+        few_shot_examples = await self._rag.retrieve_examples(tenant_id, source_id, search_query, n_results=2)
 
         return {
             "schema_context": schema_context,
@@ -335,8 +469,8 @@ class SQLGenerationNode:
     async def _build_prompt(
         self, state: SQLAgentState
     ) -> str:
-        schema_context = state["schema_context"]
-        question = state["question"]
+        schema_context = state.get("schema_context", "")
+        question = state.get("question", "")
         error = state.get("error")
         history_context = state.get("history_context", "")
         query_type = state.get("query_type", "NEW_TOPIC")
@@ -384,6 +518,7 @@ CRITICAL: If a table or join path is listed in Negative Constraints, it was flag
 3. Use the VERIFIED EXAMPLES as a guide for how this specific tenant structures their queries.
 4. If Query Type is NEW_TOPIC, IGNORE the CONVERSATION HISTORY and generate a fresh query for the current Question.
 5. If Query Type is REFINEMENT, use the CONVERSATION HISTORY to resolve entities and pronouns, and to understand the base dataset being queried.
+   - PURE VISUALIZATION REFINEMENT: If the user purely asks for a chart type change (e.g. "make a pie chart", "show as a scatter plot") and the underlying data needs no changes, you MUST output the EXACT SAME <sql> query from the CONVERSATION HISTORY. You MUST ALWAYS output a valid <sql> query.
    - If the user asks to filter, sort, or select a subset of the previous results (e.g., "in that who is top"), REUSE the SQL from the previous turn and append the necessary ORDER BY, LIMIT, or WHERE clauses to answer the new question.
    - If resolving pronouns or partial names, look for the EXACT literal values (IDs, full names, emails) in the "Result" field of the CONVERSATION HISTORY and use them directly in your SQL.
 6. If the user asks for a "date", find the closest column like "created_at" or "timestamp". Do NOT use "order_date" if it is not in the schema.
@@ -427,7 +562,22 @@ Question: {question}"""
     async def __call__(self, state: SQLAgentState) -> dict:
         attempts = state.get("attempts", 0)
         error = state.get("error")
-        
+
+        # Fail fast: if there is no schema context and no previous error driving a retry,
+        # the database was unreachable or never ingested. Don't burn LLM calls — the LLM
+        # will correctly say "no schema" every single time.
+        schema_context = state.get("schema_context", "")
+        if not schema_context and not error:
+            source_id = state.get("source_id") or "unknown"
+            return {
+                "sql_query": "",
+                "error": (
+                    f"No schema available for source '{source_id}'. "
+                    "Ensure the data source is connected and has been ingested (synced) successfully."
+                ),
+                "attempts": settings.max_correction_attempts,  # skip retry loop
+            }
+
         # 1. Semantic Caching (Skip LLM if semantically identical query exists)
         if not state.get("error") and state.get("query_type") != "REFINEMENT":
             source_id = state.get("source_id", "default_source")
@@ -458,7 +608,7 @@ Question: {question}"""
             messages=messages,
             **params
         )
-        content = response.choices[0].message.content.strip()
+        content = _get_content(response).strip()
         
         # Log thought process for debugging
         thought = ""
@@ -486,7 +636,17 @@ Question: {question}"""
             sql = re.sub(r"<thought>.*?</thought>", "", content, flags=re.DOTALL)
             sql = sql.replace("```sql", "").replace("```", "").strip()
             
-        return {"sql_query": sql, "error": None, "agent_thought": thought, "attempts": state["attempts"] + 1}
+        # PURE VISUALIZATION REFINEMENT FALLBACK:
+        # If the LLM was lazy and didn't output SQL (or output conversational text)
+        # because it's just a chart change, automatically borrow the last working SQL from the history.
+        if (not sql or not sql.upper().startswith("SELECT")) and state.get("query_type") == "REFINEMENT":
+            history_context = state.get("history_context", "")
+            sql_matches = re.findall(r"SQL:\s*(.*?)\nResult:", history_context, re.DOTALL)
+            if sql_matches:
+                sql = sql_matches[-1].strip()
+                logger.info("SQLGenerationNode output invalid/empty SQL during REFINEMENT. Auto-reusing last SQL from history.")
+            
+        return {"sql_query": sql, "error": None, "agent_thought": thought, "attempts": state.get("attempts", 0) + 1}
 
 
 class SQLCriticNode:
@@ -845,8 +1005,9 @@ FEEDBACK: <your instructions here>
 1. Diagnose the root cause of the error.
 2. If the error is caused by a placeholder value (e.g. '<some_id>', 'actual-uuid-here') — run an INVESTIGATE query to find the real value, then tell the generator to use a JOIN or subquery so no hard-coded IDs are ever needed.
 3. If the error is a type/cast issue, instruct the generator to use the correct CAST (e.g. `column::numeric`).
-4. Keep feedback concise and strictly technical.
-5. Output:
+4. If the error is 'No SQL query generated.', instruct the SQL generator that it MUST output a valid SQL query, even if the user's request is purely about visualization. It should reuse the previous working SQL.
+5. Keep feedback concise and strictly technical.
+6. Output:
 FEEDBACK: <your instructions here>"""
 
         # ── Tool definitions ──────────────────────────────────────────────────
@@ -945,7 +1106,11 @@ FEEDBACK: <your instructions here>"""
                     return json.dumps([row[0] for row in r["rows"]], default=str)
 
                 if name == "run_query":
-                    raw = args["sql"].strip()
+                    raw = args.get("sql", "").strip()
+                    if not raw:
+                        return "Error: SQL is empty."
+                    if not isinstance(raw, str):
+                        raw = str(raw).strip()
                     if not raw.upper().startswith("SELECT"):
                         return "Blocked: only SELECT queries allowed."
                     # Auto-fix jsonb ILIKE on the fly
@@ -999,7 +1164,7 @@ FEEDBACK: <your instructions here>"""
                     continue   # send tool results back to the model
 
                 # ── Final text response ──────────────────────────────────────
-                content = (msg.content or "").strip()
+                content = _get_content(response).strip()
 
                 # VERIFIED_SQL: critic already confirmed this query returns rows
                 # → skip generate_sql entirely, inject directly as the next query
@@ -1072,20 +1237,22 @@ class SQLExecutionNode:
             # If an error was intentionally set (like missing tables), bypass execution.
             return {"sql_result": None, "error": state.get("error")}
 
-        sql = (state["sql_query"] or "").strip()
+        sql = (state.get("sql_query") or "").strip()
         if not sql:
              return {"sql_result": None, "error": "No SQL query generated."}
-        
-        # 1. Robust Security Validation
+
         db_type = state.get("db_type", "postgresql")
-        safe, sec_error = await self._is_read_only(sql, db_type)
-        if not safe:
-            # If it's a syntax error, we don't use the scary "Security violation" prefix in the logger
-            if "Syntax Error" in sec_error:
-                logger.info("SQL Validation failed: %s (Query: %s)", sec_error, sql)
-            else:
-                logger.error("Security Violation Blocked: %s (Query: %s)", sec_error, sql)
-            return {"sql_result": None, "error": sec_error}
+
+        # MongoDB pipelines are JSON — skip the SQL AST security check entirely.
+        # The connector itself is read-only (aggregate only, no write operations).
+        if db_type != "mongodb":
+            safe, sec_error = await self._is_read_only(sql, db_type)
+            if not safe:
+                if "Syntax Error" in sec_error:
+                    logger.info("SQL Validation failed: %s (Query: %s)", sec_error, sql)
+                else:
+                    logger.error("Security Violation Blocked: %s (Query: %s)", sec_error, sql)
+                return {"sql_result": None, "error": sec_error}
         
         source_id = state.get("source_id", "default_source")
         result_update = {}
@@ -1109,25 +1276,11 @@ class SQLExecutionNode:
                     db_type = row["db_type"]
                     config = json.loads(row["mcp_config"]) if row["mcp_config"] else {}
                 
-                # --- Phase 1: Force Protocol Standardization (MCP) ---
-                # All postgres queries are now routed through the internal Data Retrieval MCP Server
-                if db_type == "postgresql":
-                    logger.info("Routing PostgreSQL query through internal MCP Hub (SSE)")
-                    
-                    # --- Phase 2: Decentralized Identity (Zero Trust) ---
-                    from axiom.security.trust.ans import AgentNamingService
-                    session_did = AgentNamingService.generate_session_did(state.get("tenant_id", "default"), state.get("session_id", "default"))
-                    agent_did = AgentNamingService.generate_agent_did("sql_execution", session_did)
-                    
-                    db_type = "mcp"
-                    # We use the internal SSE endpoint of our hub
-                    base_url = os.environ.get("AXIOM_API_URL", "http://localhost:8080")
-                    target_db_url = f"{base_url}/mcp/postgres/sse"
-                    config = {
-                        "command": None, 
-                        "args": [],
-                        "headers": {"X-Agent-DID": agent_did}
-                    } 
+                # Zero Trust: log agent identity for audit trail
+                from axiom.security.trust.ans import AgentNamingService
+                session_did = AgentNamingService.generate_session_did(state.get("tenant_id", "default"), state.get("session_id", "default"))
+                agent_did = AgentNamingService.generate_agent_did("sql_execution", session_did)
+                logger.info(f"Agent {agent_did} executing SQL directly on {db_type}://{source_id}")
             finally:
                 await cp_conn.close()
 
@@ -1180,7 +1333,7 @@ class SQLExecutionNode:
                 state["thread_id"],
                 state.get("tenant_id", "default"),
                 state["question"],
-                state["sql_query"],
+                state.get("sql_query", ""),
                 result_update.get("sql_result", ""),
                 active_filters=state.get("active_filters", []),
                 verified_joins=state.get("verified_joins", []),
@@ -1190,6 +1343,108 @@ class SQLExecutionNode:
             )
         
         return result_update
+
+class PythonCodeGenerationNode:
+    """Generate dynamic Python code for data analysis based on the actual result set."""
+    def __init__(self) -> None:
+        import openai
+        self._client = openai.AsyncOpenAI(
+            base_url=f"{settings.litellm_url}/v1",
+            api_key=settings.litellm_key,
+        )
+
+    async def __call__(self, state: SQLAgentState) -> dict:
+        raw_result = state.get("sql_result") or state.get("last_sql_result")
+        if not raw_result or raw_result == "CONCLUDED":
+            return {"python_code": None}
+
+        try:
+            result_json = json.loads(raw_result)
+            columns = result_json.get("columns", [])
+            sample_rows = result_json.get("rows", [])[:5]
+            question = state["question"]
+            insight = state.get("response_text", "")
+            error = state.get("python_error")
+
+            prompt = f"""**Role & Objective**
+You are an expert Data Visualization Engineer. Your task is to generate Python code using the `plotly` library (preferably `plotly.express`) to create dynamic, highly accurate, and visually premium charts based on the provided dataset.
+
+### USER QUESTION:
+"{question}"
+
+### GENERATED INSIGHT:
+"{insight}"
+
+### DATASET PREVIEW:
+Columns: {columns}
+Sample Data: {sample_rows}
+
+### LIBRARIES AVAILABLE:
+- pandas (as pd)
+- numpy (as np)
+- plotly.express (as px)
+- plotly.graph_objects (as go)
+- IPython.display (HTML, display)
+
+### EXECUTION CONTEXT:
+The data is already loaded into a pandas DataFrame named `df`. 
+The environment supports Plotly's interactive charts.
+
+**Core Directives & Responsiveness (CRITICAL)**
+You must never hardcode absolute pixel dimensions (`width` or `height`) for the figures. The visualization must be fully fluid and responsive to fit seamlessly into modern frontend containers. 
+1. Always use `fig.update_layout(autosize=True)`.
+2. Set tight margins to prevent wasted space, but allow enough room on the right for legends: `margin=dict(l=20, r=150, t=40, b=20)`.
+
+**Legend & High-Cardinality Management**
+Overlapping text and massive legends ruin the user experience. You must dynamically handle data cardinality:
+1. **Placement:** Always anchor the legend strictly outside the plotting area. Use: 
+   `fig.update_layout(legend=dict(yanchor="top", y=1, xanchor="left", x=1.02))`
+2. **Cardinality Limit:** Before plotting, check the number of unique categories in the `color` or `symbol` grouping. 
+   * If unique categories <= 10: Display the legend normally outside the plot.
+   * If unique categories > 10: **Disable the legend entirely** (`showlegend=False`). Instead, heavily format the `hover_data` (tooltips) so the user can identify data points by hovering over them. Do not let a massive legend break the UI.
+
+**Premium Aesthetic Standards**
+The generated charts must look professional, clean, and humanistic. Avoid default, harsh, or overly "robotic" visual choices.
+1. **Background:** Use a transparent background for both the paper and the plot so it blends into the application's theme: `paper_bgcolor='rgba(0,0,0,0)'`, `plot_bgcolor='rgba(0,0,0,0)'`.
+2. **Gridlines:** Use very subtle, muted gridlines to guide the eye without adding clutter. (e.g., `gridcolor='rgba(128, 128, 128, 0.2)'`, `zeroline=False`).
+3. **Color Palettes:** Default to sophisticated, muted, and accessible color palettes (e.g., Plotly's `px.colors.qualitative.Pastel` or `Safe`). Avoid harsh primary colors.
+4. **Typography:** Keep fonts clean and readable. Use a sans-serif font standard, muting the color of axis titles slightly so the data stands out.
+
+**Data Handling & Tooltips**
+1. **Hover Templates:** Always utilize Plotly's interactive strengths. Build rich hover templates that clearly display the X value, Y value, and the specific Category. 
+2. **Axis Formatting:** Automatically format large numbers (e.g., 1,000,000 to 1M) and use readable date formats if the X-axis is a timeseries.
+3. **NO HARDCODING**: Do not hardcode specific table names or column names that are not in the DATASET PREVIEW.
+
+**Output Constraints**
+Output ONLY valid Python code. The code must be self-contained, import `plotly.express` or `plotly.graph_objects`, assume the data is already loaded into a pandas DataFrame named `df`, and end by passing the figure to the `_show_plotly(fig)` helper. Do not include conversational filler.
+
+### HELPER FUNCTIONS ALREADY DEFINED:
+```python
+def _show_plotly(fig):
+    # This renders the plotly figure in the Axiom workspace
+    # The font color is automatically handled, but you must set the rest of the layout
+    _display(HTML(fig.to_html(include_plotlyjs="cdn", full_html=False)))
+```
+"""
+
+            if error:
+                prompt += f"\n\n### PREVIOUS ATTEMPT FAILED WITH ERROR:\n{error}\nFix the code to resolve this error."
+
+            response = await self._client.chat.completions.create(
+                model=state.get("llm_model") or settings.llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+            
+            code = _get_content(response).strip()
+            # Strip markdown fences if the LLM ignored instructions
+            code = re.sub(r"```python\n|```", "", code)
+            
+            return {"python_code": code}
+        except Exception as exc:
+            logger.warning("Failed to generate dynamic Python code: %s", exc)
+            return {"python_code": None}
+
 
 class HumanApprovalNode:
     """A pass-through node used purely to trigger LangGraph's interrupt_before."""
@@ -1233,6 +1488,7 @@ class NotebookArtifactNode:
                 sql=state.get("sql_query") or "",
                 result=result_json,
                 insight=state.get("response_text"),
+                python_code=state.get("python_code"),
             )
 
             execution = await self._executor.execute(
@@ -1264,6 +1520,7 @@ class NotebookArtifactNode:
                 sql=state.get("sql_query") or "",
                 result=fallback_result,
                 insight=state.get("response_text"),
+                python_code=state.get("python_code"),
             )
             artifact = self._store.save(
                 artifact_id=artifact_id,
@@ -1309,7 +1566,7 @@ class ResponseSynthesizerNode:
 
     async def __call__(self, state: SQLAgentState) -> dict:
         if state.get("error"):
-            error = state["error"]
+            error = state.get("error", "")
             # For zero-result failures, surface only the clean investigation signal —
             # never the raw probe data which causes hallucination.
             if "ZERO_RESULTS" in error:
@@ -1331,7 +1588,7 @@ class ResponseSynthesizerNode:
                         )}],
                         temperature=0.2,
                     )
-                    return {"response_text": response.choices[0].message.content.strip()}
+                    return {"response_text": _get_content(response).strip()}
                 except Exception:
                     msg = f"No results found for your query."
                     if clean_signal:
@@ -1343,7 +1600,7 @@ class ResponseSynthesizerNode:
         if state.get("response_text") and not state.get("sql_result"):
             artifact = state.get("artifact")
             return {
-                "response_text": state["response_text"],
+                "response_text": state.get("response_text", ""),
                 "layout": "notebook" if artifact else "default",
                 "action_bar": [],
             }
@@ -1357,7 +1614,7 @@ class ResponseSynthesizerNode:
         interceptor = MLGradeInterceptor()
         
         # Apply deterministic ML-grade data cleaning
-        cleaned_response = interceptor.process(state["sql_result"], anomaly_method="iqr")
+        cleaned_response = interceptor.process(state.get("sql_result", ""), anomaly_method="iqr")
         cleaned_data = cleaned_response.data
         metadata = cleaned_response.metadata
         
@@ -1406,11 +1663,275 @@ Response:"""
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.7,
             )
-            content = response.choices[0].message.content.strip()
+            content = _get_content(response).strip()
             return {"response_text": content, "sql_result": cleaned_response.frontend_json, "layout": "notebook" if artifact else "default", "action_bar": cleaned_response.action_bar}
         except Exception as exc:
             logger.warning("Failed to synthesize response: %s", exc)
             return {"response_text": "Here are the results for your query:", "sql_result": cleaned_response.frontend_json, "layout": "notebook" if artifact else "default", "action_bar": cleaned_response.action_bar}
+
+
+class LakeOrchestratorNode:
+    """
+    Fan-out node for Data Lake queries.
+
+    Spawns one LakeWorker per source in lake_scope, runs them concurrently
+    under a configurable semaphore, and collects results.  Worker failures are
+    isolated — a single bad source never aborts the entire fan-out.
+    """
+
+    def __init__(self, rag: SchemaRAG) -> None:
+        self._rag = rag
+        import openai
+        self._client = openai.AsyncOpenAI(
+            base_url=f"{settings.litellm_url}/v1",
+            api_key=settings.litellm_key,
+        )
+
+    async def __call__(self, state: SQLAgentState) -> dict:
+        from axiom.connectors.base import QueryMode
+
+        # Prefer the rich meta list; fall back to plain scope with unknown mode
+        scope_meta: list[dict] = state.get("lake_scope_meta") or []
+        lake_scope: list[str] = state.get("lake_scope") or []
+        if not scope_meta and lake_scope:
+            scope_meta = [{"source_id": sid, "query_mode": QueryMode.SQL} for sid in lake_scope]
+
+        if not scope_meta:
+            logger.warning("LakeOrchestratorNode called with empty scope — skipping fan-out")
+            return {"lake_worker_results": []}
+
+        semaphore = asyncio.Semaphore(settings.lake_max_concurrent_workers)
+        workers = []
+        for entry in scope_meta:
+            sid = entry["source_id"]
+            mode = entry.get("query_mode", QueryMode.SQL)
+            if mode in (QueryMode.SQL, QueryMode.PIPELINE):
+                # LakeWorker handles both SQL databases and pipeline stores (MongoDB).
+                # Dialect-specific LLM instructions handle the query language differences.
+                workers.append((sid, LakeWorker(sid, self._rag, self._client)))
+            else:
+                # APP connectors in a lake are not yet dispatchable via LakeWorker.
+                # AppLakeWorker (tool-use loop) is planned; log clearly for now.
+                logger.warning(
+                    "Lake fan-out: source '%s' has query_mode=%s — app connectors in lakes "
+                    "require AppLakeWorker (not yet implemented). Skipping.",
+                    sid, mode,
+                )
+
+        tasks = [
+            w.run(
+                question=state["question"],
+                tenant_id=state["tenant_id"],
+                llm_model=state.get("llm_model"),
+                semaphore=semaphore,
+                history_context=state.get("history_context", ""),
+                query_type=state.get("query_type", "NEW_TOPIC"),
+            )
+            for _, w in workers
+        ]
+        source_ids = [sid for sid, _ in workers]
+
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        worker_results: list[dict] = []
+        for sid, result in zip(source_ids, raw_results):
+            if isinstance(result, Exception):
+                logger.error("LakeWorker %s raised: %s", sid, result)
+                worker_results.append(
+                    LakeWorkerResult.failure(sid, "unknown", str(result)).to_dict()
+                )
+            else:
+                worker_results.append(result.to_dict())
+                logger.info(
+                    "Worker %-40s  rows=%3d  error=%-30s  %.0fms",
+                    result.source_id, result.row_count,
+                    result.error or "none", result.duration_ms,
+                )
+
+        return {"lake_worker_results": worker_results}
+
+
+class LakeCuratorNode:
+    """
+    Synthesises results from all lake workers into a single unified response.
+
+    Merges row-level data where schemas are compatible (adds a _source column),
+    and uses an LLM to produce a cross-source narrative answer.
+    """
+
+    def __init__(self) -> None:
+        import openai
+        self._client = openai.AsyncOpenAI(
+            base_url=f"{settings.litellm_url}/v1",
+            api_key=settings.litellm_key,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Result merging                                                      #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _merge_results(worker_results: list[dict]) -> Optional[str]:
+        """
+        Merge successful per-source results into a single result JSON.
+
+        If all sources share the same column set, rows are interleaved with a
+        leading _source column.  When schemas differ, we still emit a _source
+        column but pad missing columns with None so the frontend table renders
+        consistently.
+        """
+        successful = [r for r in worker_results if r.get("sql_result")]
+        if not successful:
+            return None
+
+        # Collect per-source parsed data
+        parsed: list[tuple[str, list, list]] = []  # (source_id, columns, rows)
+        for r in successful:
+            try:
+                data = json.loads(r["sql_result"])
+                parsed.append((r["source_id"], data.get("columns", []), data.get("rows", [])))
+            except Exception:
+                continue
+
+        if not parsed:
+            return None
+
+        # Build superset of columns across all sources
+        seen: dict[str, None] = {}
+        for _, cols, _ in parsed:
+            for c in cols:
+                seen.setdefault(c, None)
+        all_columns = ["_source"] + list(seen)
+
+        merged_rows: list[list] = []
+        for source_id, cols, rows in parsed:
+            col_index = {c: i for i, c in enumerate(cols)}
+            for row in rows:
+                if isinstance(row, list):
+                    row_dict = {cols[i]: v for i, v in enumerate(row) if i < len(cols)}
+                elif isinstance(row, dict):
+                    row_dict = row
+                else:
+                    continue
+                merged_rows.append(
+                    [source_id] + [row_dict.get(c) for c in all_columns[1:]]
+                )
+
+        return json.dumps(
+            {
+                "columns": all_columns,
+                "rows": merged_rows[:100],
+                "total_count": len(merged_rows),
+                "is_lake_result": True,
+                "source_count": len(parsed),
+            },
+            default=str,
+        )
+
+    # ------------------------------------------------------------------ #
+    #  LLM narrative synthesis                                             #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _build_source_summary(worker_results: list[dict]) -> str:
+        parts: list[str] = []
+        for r in worker_results:
+            if r.get("sql_result"):
+                try:
+                    data = json.loads(r["sql_result"])
+                    sample = data["rows"][:3]
+                    parts.append(
+                        f"**{r['source_id']}** ({r['db_type']})\n"
+                        f"  SQL: {r.get('sql_query', 'N/A')}\n"
+                        f"  Rows returned: {r['row_count']}\n"
+                        f"  Columns: {data.get('columns', [])}\n"
+                        f"  Sample: {json.dumps(sample, default=str)}"
+                    )
+                except Exception:
+                    parts.append(f"**{r['source_id']}**: result parse error")
+            else:
+                parts.append(
+                    f"**{r['source_id']}** ({r['db_type']}): "
+                    f"no results — {r.get('error', 'unknown')}"
+                )
+        return "\n\n".join(parts)
+
+    async def __call__(self, state: SQLAgentState) -> dict:
+        worker_results: list[dict] = state.get("lake_worker_results") or []
+        question = state.get("question", "")
+
+        successful = [r for r in worker_results if r.get("sql_result")]
+        failed = [r for r in worker_results if r.get("error")]
+
+        if not successful:
+            per_source = "; ".join(
+                f"{r['source_id']} ({r['db_type']}): {r.get('error', 'no data')}"
+                for r in failed
+            )
+            return {
+                "response_text": (
+                    f"None of the {len(failed)} data source(s) in this lake returned results "
+                    f"for your question. Per-source details: {per_source}"
+                ),
+                "sql_result": None,
+                "error": None,   # curator handled it — don't let synthesizer overwrite with generic message
+            }
+
+        source_summary = self._build_source_summary(worker_results)
+        skipped_note = (
+            "\n\n"
+            + "\n".join(
+                f"- {r['source_id']} ({r['db_type']}): no results — {r.get('error', 'unknown')}"
+                for r in failed
+            )
+        ) if failed else ""
+
+        prompt = (
+            "You are a Senior Data Analyst synthesising query results from multiple "
+            "databases in a Data Lake.\n\n"
+            f"### USER QUESTION:\n{question}\n\n"
+            f"### RESULTS FROM EACH DATA SOURCE:\n{source_summary}{skipped_note}\n\n"
+            "### INSTRUCTIONS:\n"
+            "1. Write a concise, professional 2–4 sentence response combining all findings.\n"
+            "2. If sources returned complementary data, unify the insight.\n"
+            "3. If sources returned the same entity type (e.g. users), compare or aggregate.\n"
+            "4. If some sources had no results, note it briefly but focus on what was found.\n"
+            "5. No SQL, table names, internal IDs, or technical column names in the output.\n"
+            "6. No raw rows or JSON — summarise key numbers and trends only.\n"
+            "7. Attribute data to a source only when it adds meaningful context.\n\n"
+            "Response:"
+        )
+
+        try:
+            response = await self._client.chat.completions.create(
+                model=state.get("llm_model") or settings.llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+            )
+            content = response.choices[0].message.content or ""
+            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+            response_text = content.strip()
+        except Exception as exc:
+            logger.warning("LakeCuratorNode synthesis failed: %s", exc)
+            response_text = (
+                f"Found data from {len(successful)} source(s) across your Data Lake."
+            )
+
+        merged_sql_result = self._merge_results(worker_results)
+
+        # Promote the best worker's SQL to sql_query so it gets saved to thread history.
+        # This lets REFINEMENT follow-up queries (e.g. "give me a pie chart") find the
+        # previous SQL via history_context and reuse it without re-querying.
+        best_worker = max(successful, key=lambda r: r.get("row_count", 0))
+        best_sql = best_worker.get("sql_query") or ""
+
+        return {
+            "response_text": response_text,
+            "sql_result": merged_sql_result,
+            "sql_query": best_sql,
+            "layout": "default",
+            "action_bar": [],
+        }
 
 
 class DiscoveryNode:
@@ -1496,7 +2017,7 @@ class DiscoveryNode:
                 ],
                 **discovery_params
             )
-            search_terms = [t.strip() for t in res.choices[0].message.content.split(",")]
+            search_terms = [t.strip() for t in _get_content(res).split(",")]
 
             # C. Check for "Pivoting" needs if the user rejected the previous table
             pivot_hint = ""

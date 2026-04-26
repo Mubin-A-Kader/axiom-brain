@@ -19,8 +19,13 @@ from axiom.config import settings
 
 logging.basicConfig(level="INFO")
 logger = logging.getLogger(__name__)
+# anyio cancel-scope teardown noise from MCP stdio_client GC — not actionable
+logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+
+from axiom.api.oauth_routes import router as oauth_router
 
 app = FastAPI(title="Axiom Brain", version="0.1.0")
+app.include_router(oauth_router)
 
 # --- Security: Robust CORS ---
 # In development, we allow localhost and any local network IP on port 3000 or 3001.
@@ -64,18 +69,18 @@ _temporal_client = None
 @app.on_event("startup")
 async def startup() -> None:
     global _agent, _thread_mgr, _rag, _artifact_store, _temporal_client
-    # LangGraph Deprecation: _agent is now legacy
-    # _agent = await build_graph()
+    # LangGraph: primary fallback orchestrator + used when Temporal is unavailable
+    _agent = await build_graph()
     from axiom.notebooks.artifacts import NotebookArtifactStore
     _artifact_store = NotebookArtifactStore(settings.artifact_root)
 
-    # Initialize Temporal Client
+    # Temporal: preferred durable orchestrator (optional — graceful degradation to LangGraph)
     from temporalio.client import Client
     try:
         _temporal_client = await Client.connect(settings.temporal_url)
         logger.info(f"Connected to Temporal.io at {settings.temporal_url}")
     except Exception as e:
-        logger.warning(f"Failed to connect to Temporal: {e}. Event-sourced orchestration disabled.")
+        logger.warning(f"Temporal unavailable ({e}). Falling back to LangGraph orchestration.")
 
     # --- Initialize MCP Hub ---
 
@@ -103,7 +108,21 @@ class QueryRequest(BaseModel):
     thread_id: str = ""
     tenant_id: str = "default_tenant"
     source_id: Optional[str] = None
+    lake_id: Optional[str] = None        # specific named lake
+    lake_scope: Optional[List[str]] = None   # explicit source subset; None = use lake_id or all
     model: Optional[str] = None
+
+
+class LakeOut(BaseModel):
+    id: str
+    name: str
+    description: Optional[str]
+    created_at: datetime
+
+
+class LakeIn(BaseModel):
+    name: str
+    description: Optional[str] = ""
 
 
 class ApproveRequest(BaseModel):
@@ -127,6 +146,7 @@ class QueryResponse(BaseModel):
     thread_id: str
     tenant_id: str
     status: str = "completed"
+    routing_candidates: List[Dict[str, Any]] = []
 
     @field_validator("result", mode="before")
     @classmethod
@@ -435,6 +455,123 @@ async def sync_source(tenant_id: str, source_id: str, background_tasks: Backgrou
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+# ── Data Lake endpoints (Multi-lake support) ────────────────────────────────
+
+@app.get("/api/lakes/{tenant_id}", response_model=List[LakeOut])
+async def list_lakes(tenant_id: str, user_id: str = Depends(verify_token)) -> List[LakeOut]:
+    conn = await asyncpg.connect(settings.database_url)
+    try:
+        owner = await conn.fetchval("SELECT owner_id FROM tenants WHERE id = $1", tenant_id)
+        if owner != user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        rows = await conn.fetch(
+            "SELECT id, name, description, created_at FROM lakes WHERE tenant_id = $1 ORDER BY created_at",
+            tenant_id
+        )
+        return [LakeOut(**dict(r)) for r in rows]
+    finally:
+        await conn.close()
+
+
+@app.post("/api/lakes/{tenant_id}", response_model=LakeOut)
+async def create_lake(tenant_id: str, req: LakeIn, user_id: str = Depends(verify_token)) -> LakeOut:
+    conn = await asyncpg.connect(settings.database_url)
+    try:
+        owner = await conn.fetchval("SELECT owner_id FROM tenants WHERE id = $1", tenant_id)
+        if owner != user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        
+        row = await conn.fetchrow(
+            "INSERT INTO lakes (tenant_id, name, description) VALUES ($1, $2, $3) RETURNING id, name, description, created_at",
+            tenant_id, req.name, req.description
+        )
+        return LakeOut(**dict(row))
+    finally:
+        await conn.close()
+
+
+@app.delete("/api/lakes/{tenant_id}/{lake_id}")
+async def delete_lake(tenant_id: str, lake_id: str, user_id: str = Depends(verify_token)) -> dict:
+    conn = await asyncpg.connect(settings.database_url)
+    try:
+        owner = await conn.fetchval("SELECT owner_id FROM tenants WHERE id = $1", tenant_id)
+        if owner != user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        
+        await conn.execute("DELETE FROM lakes WHERE id = $1 AND tenant_id = $2", lake_id, tenant_id)
+        return {"status": "deleted"}
+    finally:
+        await conn.close()
+
+
+@app.get("/api/lake-sources/{lake_id}")
+async def get_lake_sources(lake_id: str, user_id: str = Depends(verify_token)) -> dict:
+    conn = await asyncpg.connect(settings.database_url)
+    try:
+        # Check lake ownership via tenant
+        tenant_id = await conn.fetchval("SELECT tenant_id FROM lakes WHERE id = $1", lake_id)
+        if not tenant_id:
+            raise HTTPException(status_code=404, detail="Lake not found")
+            
+        owner = await conn.fetchval("SELECT owner_id FROM tenants WHERE id = $1", tenant_id)
+        if owner != user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+        rows = await conn.fetch(
+            """SELECT ls.source_id, ls.added_at, ds.name, ds.db_type, ds.description, ds.status
+               FROM lake_sources ls
+               JOIN data_sources ds ON ds.source_id = ls.source_id
+               WHERE ls.lake_id = $1
+               ORDER BY ls.added_at""",
+            lake_id,
+        )
+        return {"sources": [dict(r) for r in rows]}
+    finally:
+        await conn.close()
+
+
+@app.post("/api/lake-sources/{lake_id}/{source_id:path}")
+async def add_source_to_lake(lake_id: str, source_id: str, user_id: str = Depends(verify_token)) -> dict:
+    conn = await asyncpg.connect(settings.database_url)
+    try:
+        tenant_id = await conn.fetchval("SELECT tenant_id FROM lakes WHERE id = $1", lake_id)
+        if not tenant_id:
+            raise HTTPException(status_code=404, detail="Lake not found")
+            
+        owner = await conn.fetchval("SELECT owner_id FROM tenants WHERE id = $1", tenant_id)
+        if owner != user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        
+        await conn.execute(
+            "INSERT INTO lake_sources (lake_id, source_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            lake_id, source_id,
+        )
+        return {"status": "added", "source_id": source_id}
+    finally:
+        await conn.close()
+
+
+@app.delete("/api/lake-sources/{lake_id}/{source_id:path}")
+async def remove_source_from_lake(lake_id: str, source_id: str, user_id: str = Depends(verify_token)) -> dict:
+    conn = await asyncpg.connect(settings.database_url)
+    try:
+        tenant_id = await conn.fetchval("SELECT tenant_id FROM lakes WHERE id = $1", lake_id)
+        if not tenant_id:
+            raise HTTPException(status_code=404, detail="Lake not found")
+            
+        owner = await conn.fetchval("SELECT owner_id FROM tenants WHERE id = $1", tenant_id)
+        if owner != user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        
+        await conn.execute(
+            "DELETE FROM lake_sources WHERE lake_id = $1 AND source_id = $2",
+            lake_id, source_id,
+        )
+        return {"status": "removed", "source_id": source_id}
+    finally:
+        await conn.close()
+
+
 @app.patch("/api/sources/{tenant_id}/{source_id}")
 async def update_source(tenant_id: str, source_id: str, req: Dict[str, Any], user_id: str = Depends(verify_token)) -> dict:
     try:
@@ -641,6 +778,13 @@ async def query_stream(req: QueryRequest, user_id: str = Depends(verify_token)):
         "custom_rules": "",
         "tenant_id": tenant_id,
         "source_id": req.source_id,
+        "lake_id": req.lake_id,
+        "lake_scope": req.lake_scope or [],
+        "lake_scope_meta": [],
+        "lake_mode": False,
+        "lake_worker_results": [],
+        "needs_source_clarification": False,
+        "routing_candidates": [],
         "sql_query": None,
         "sql_result": None,
         "error": None,
@@ -662,53 +806,81 @@ async def query_stream(req: QueryRequest, user_id: str = Depends(verify_token)):
                 return obj.__dict__
             return str(obj)
 
+        def _strip_heavy(d) -> dict:
+            if not isinstance(d, dict):
+                return {}
+            return {
+                k: v for k, v in d.items()
+                if not (isinstance(v, str) and len(v) > 50_000)
+            }
+
         try:
-            if not _temporal_client:
-                yield f"data: {json.dumps({'error': 'Temporal unavailable'})}\n\n"
+            # Streaming always goes through LangGraph — it has native astream() support.
+            # Temporal cannot stream; polling its workflow state causes the frontend to hang
+            # when the workflow is queued (no worker) or paused at the HITL gate.
+            if not _agent:
+                yield f"data: {json.dumps({'error': 'Agent not initialized'})}\n\n"
                 yield "data: [DONE]\n\n"
                 return
 
-            handle = await _temporal_client.start_workflow(
-                "SQLAgentWorkflow", # Use string name to avoid circular import if needed
-                initial_state,
-                id=f"sql-agent-stream-{thread_id}",
-                task_queue="sql-agent-tasks",
-            )
-
-            last_emitted_node = None
-            
-            while True:
-                desc = await handle.describe()
-                if desc.status == 1: # Running
-                    try:
-                        state = await handle.query("get_state")
-                        # Determine current progress based on state changes
-                        # This is a simplified version of node-based streaming
-                        current_node = None
-                        if state.get("sql_query") and not state.get("sql_result"):
-                             current_node = "generate_sql"
-                        elif state.get("schema_context") and not state.get("sql_query"):
-                             current_node = "retrieve_schema"
-                        
-                        if current_node and current_node != last_emitted_node:
-                            yield f"data: {json.dumps({current_node: state}, default=_json_serial)}\n\n"
-                            last_emitted_node = current_node
-                            
-                        # Check if waiting for approval
-                        if state.get("sql_query") and not state.get("sql_result") and not state.get("error"):
-                             # If we've been in this state for a bit, it's likely paused for HITL
-                             pass 
-                    except Exception:
-                        pass
+            async for event in _agent.astream(initial_state, config=config, stream_mode="updates", subgraphs=True):
+                # LangGraph with subgraphs=True returns a tuple (namespace, chunk)
+                if isinstance(event, tuple) and len(event) == 2:
+                    namespace, chunk = event
                 else:
-                    # Workflow finished (Completed, Failed, etc.)
-                    final_state = await handle.result()
-                    yield f"data: {json.dumps({'__final__': final_state, '__is_paused__': False}, default=_json_serial)}\n\n"
-                    break
+                    chunk = event
                 
-                await asyncio.sleep(0.5)
+                node_name = next(iter(chunk))
+                if node_name == "__interrupt__":
+                    continue
+                
+                update = chunk[node_name]
+                if isinstance(update, dict):
+                    yield f"data: {json.dumps({node_name: _strip_heavy(update)}, default=_json_serial)}\n\n"
 
+            # After the stream ends, check if the graph is paused at execute_sql (HITL gate)
+            # Use subgraphs=True so we can see the sql_subgraph's internal state (source_id,
+            # sql_query, etc.) which is stored in a separate checkpoint namespace and is NOT
+            # visible in the outer graph's snapshot.values when interrupted.
+            snapshot = await _agent.aget_state(config, subgraphs=True)
+            final_state = dict(snapshot.values)
+            is_paused = bool(snapshot.next)  # non-empty next means interrupted
+
+            # Flatten the interrupted sql_subgraph's state into final_state so the frontend
+            # receives source_id, sql_query, db_type, lake_mode, etc. that were set inside
+            # the subgraph before the execute_sql interrupt.
+            if is_paused and snapshot.tasks:
+                for task in snapshot.tasks:
+                    task_state = getattr(task, "state", None)
+                    if task_state and hasattr(task_state, "values"):
+                        for key, val in dict(task_state.values).items():
+                            if final_state.get(key) is None and val is not None:
+                                final_state[key] = val
+
+            yield f"data: {json.dumps({'__final__': _strip_heavy(final_state), '__is_paused__': is_paused}, default=_json_serial)}\n\n"
             yield "data: [DONE]\n\n"
+
+            # Persist the completed turn so subsequent turns have history context.
+            # Skip when paused at HITL — the turn will be saved after /approve completes.
+            if not is_paused and isinstance(final_state, dict):
+                try:
+                    await _thread_mgr.save_turn(
+                        thread_id,
+                        tenant_id,
+                        req.question,
+                        final_state.get("sql_query") or "",
+                        final_state.get("sql_result") or "",
+                        active_filters=final_state.get("active_filters") or [],
+                        verified_joins=final_state.get("verified_joins") or [],
+                        error_log=final_state.get("error_log") or [],
+                        llm_model=req.model,
+                        source_id=final_state.get("source_id"),
+                        artifact=final_state.get("artifact"),
+                        insight=final_state.get("response_text") or "",
+                        thought=final_state.get("agent_thought") or "",
+                    )
+                except Exception as _save_err:
+                    logger.warning("Failed to save stream turn to history: %s", _save_err)
         except Exception as e:
             logger.exception("Error in stream")
             yield f"data: {json.dumps({'error': str(e)}, default=_json_serial)}\n\n"
@@ -748,6 +920,11 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
             "custom_rules": "",
             "tenant_id": tenant_id,
             "source_id": req.source_id,
+            "lake_id": req.lake_id,
+            "lake_scope": req.lake_scope or [],
+            "lake_scope_meta": [],
+            "lake_mode": False,
+            "lake_worker_results": [],
             "sql_query": None,
             "sql_result": None,
             "error": None,
@@ -761,52 +938,18 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
             "llm_model": req.model,
         }
 
-        # --- Phase 3: Trigger Temporal Workflow ---
-        if _temporal_client:
-            from axiom.agent.temporal.workflows import SQLAgentWorkflow
-            
-            logger.info(f"Starting Temporal Workflow for thread {thread_id}")
-            handle = await _temporal_client.start_workflow(
-                SQLAgentWorkflow.run,
-                initial_state,
-                id=f"sql-agent-{thread_id}",
-                task_queue="sql-agent-tasks",
-            )
-            
-            # Poll for results with a timeout to see if it paused for approval
-            # In a production SSE setup, this would be handled via events.
-            # For this REST endpoint, we poll for up to 30s.
-            import asyncio
-            for _ in range(30):
-                desc = await handle.describe()
-                # If the workflow is still running, it might be waiting for approval
-                # or still executing activities.
-                # We check the execution history or use a Query to get current state.
-                # Simplification: we'll assume if it's running after activities, it's paused.
-                # Better: implement a Query handler in the workflow to return state.
-                
-                # For this implementation, we wait a bit and then check state via handle.query
-                await asyncio.sleep(1)
-                try:
-                    # We'll add this query handler to the workflow next
-                    state = await handle.query("get_state")
-                    if state.get("sql_query") and not state.get("sql_result") and not state.get("error"):
-                        is_paused = True
-                        break
-                    if state.get("sql_result") or state.get("error"):
-                        is_paused = False
-                        break
-                except Exception:
-                    continue
-            
-            if is_paused:
-                status = "pending_approval"
-            else:
-                state = await handle.result()
-                status = "completed"
-        else:
-            # Fallback (e.g. for tests if temporal not running)
-            raise HTTPException(status_code=503, detail="Temporal service unavailable")
+        # The blocking /query endpoint runs LangGraph directly.
+        # Temporal durability applies only to the execution phase (post-approval via /approve),
+        # not to the generation phase — a blocking HTTP call is abandoned if the caller
+        # disconnects regardless of what Temporal does on the server side.
+        if not _agent:
+            raise HTTPException(status_code=503, detail="Agent not initialized")
+
+        logger.info("Running LangGraph for thread %s", thread_id)
+        state = await _agent.ainvoke(initial_state, config=config)
+        snapshot = await _agent.aget_state(config)
+        is_paused = bool(snapshot.next)
+        status = "pending_approval" if is_paused else "completed"
 
         # Extract values for response
         sql = state.get("sql_query") or ""
@@ -832,7 +975,28 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
             )
 
         if sql and result and status == "completed":
-            await _thread_mgr.set_cached_result(thread_id, req.question, sql, result)
+            question = state.get("question", "")
+            source_id = state.get("source_id", "default_source")
+            if question:
+                await _thread_mgr.set_cached_result(thread_id, req.question, sql, result)
+                # Update the turn with the artifact if the query bypassed HITL
+                await _thread_mgr.save_turn(
+                    thread_id,
+                    tenant_id,
+                    question,
+                    sql,
+                    result,
+                    active_filters=state.get("active_filters", []),
+                    verified_joins=state.get("verified_joins", []),
+                    error_log=state.get("error_log", []),
+                    llm_model=req.model,
+                    source_id=source_id,
+                    artifact=state.get("artifact"),
+                    insight=state.get("response_text", ""),
+                    thought=state.get("agent_thought", ""),
+                )
+                if _rag:
+                    await _rag.search_semantic_cache(tenant_id, source_id, question)
 
         return QueryResponse(
             sql=sql,
@@ -859,34 +1023,70 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
 async def approve(req: ApproveRequest, user_id: str = Depends(verify_token)) -> QueryResponse:
 
     try:
-        # --- Phase 3: Signal Temporal Workflow ---
+        config = {"configurable": {"thread_id": req.thread_id}, "recursion_limit": 50}
+
+        # Rejected — no execution needed regardless of path
+        if not req.approved:
+            if _agent:
+                await _agent.aupdate_state(config, {"error": "Query rejected by user."})
+            return QueryResponse(
+                sql="", result="", session_id=req.session_id,
+                thread_id=req.thread_id, tenant_id=req.tenant_id, status="rejected"
+            )
+
+        # ── Read the LangGraph checkpoint to get the state at the HITL pause ──
+        # Streaming uses LangGraph up to generate_sql, saving state in Redis.
+        # We read that checkpoint here and hand it off to whichever executor runs next.
+        if not _agent:
+            raise HTTPException(status_code=503, detail="Agent not initialized")
+
+        snapshot = await _agent.aget_state(config, subgraphs=True)
+        if not snapshot or not snapshot.values:
+            raise HTTPException(status_code=404, detail="No paused query found for this thread")
+
+        paused_state = dict(snapshot.values)
+        # Flatten any interrupted subgraph state so the Temporal path gets source_id,
+        # sql_query, etc. that were set inside sql_subgraph before the HITL pause.
+        if snapshot.tasks:
+            for task in snapshot.tasks:
+                task_state = getattr(task, "state", None)
+                if task_state and hasattr(task_state, "values"):
+                    for key, val in dict(task_state.values).items():
+                        if paused_state.get(key) is None and val is not None:
+                            paused_state[key] = val
+
+        # ── Temporal path: durable execution with retries, logs, time-travel debug ──
         if _temporal_client:
-            handle = _temporal_client.get_workflow_handle(f"sql-agent-{req.thread_id}")
-            
-            # Send signal
-            await handle.signal("approve", req.approved)
-            
-            if not req.approved:
-                 return QueryResponse(
-                    sql="", result="", session_id=req.session_id, 
-                    thread_id=req.thread_id, tenant_id=req.tenant_id, status="rejected"
+            try:
+                from axiom.agent.temporal.workflows import ExecutionWorkflow
+                handle = await _temporal_client.start_workflow(
+                    ExecutionWorkflow.run,
+                    paused_state,
+                    id=f"exec-{req.thread_id}",
+                    task_queue="sql-agent-tasks",
                 )
+                state = await handle.result()
+                logger.info("Temporal ExecutionWorkflow completed for thread %s", req.thread_id)
+            except Exception as temporal_err:
+                logger.warning(
+                    "Temporal execution failed for thread %s (%s) — falling back to LangGraph",
+                    req.thread_id, temporal_err,
+                )
+                state = await _agent.ainvoke(None, config=config)
 
-            # Wait for workflow completion after approval
-            state = await handle.result()
-            is_paused = False
-            status = "completed"
+        # ── LangGraph fallback: resumes from Redis checkpoint directly ──
         else:
-             raise HTTPException(status_code=503, detail="Temporal service unavailable")
+            state = await _agent.ainvoke(None, config=config)
 
+        status = "completed"
         sql = state.get("sql_query") or ""
         result = state.get("sql_result") or ""
-        
+
         layout = state.get("layout", "default")
         action_bar = state.get("action_bar", [])
         probing_options = state.get("probing_options", [])
 
-        if state.get("error") and not state.get("sql_result") and not is_paused:
+        if state.get("error") and not state.get("sql_result"):
             raise HTTPException(status_code=422, detail=state["error"])
 
         if sql and result and status == "completed":
@@ -906,6 +1106,9 @@ async def approve(req: ApproveRequest, user_id: str = Depends(verify_token)) -> 
                     error_log=state.get("error_log", []),
                     llm_model=req.model,
                     source_id=source_id,
+                    artifact=state.get("artifact"),
+                    insight=state.get("response_text", ""),
+                    thought=state.get("agent_thought", ""),
                 )
                 if _rag:
                     await _rag.search_semantic_cache(req.tenant_id, source_id, question) # Trigger ingest on success

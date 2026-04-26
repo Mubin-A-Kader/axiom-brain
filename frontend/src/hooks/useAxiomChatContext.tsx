@@ -23,18 +23,16 @@ interface ChatContextType {
 
 const ChatContext = createContext<ChatContextType | undefined>(undefined);
 
-export function ChatProvider({ 
-  children, 
-  tenantId, 
-  selectedSourceId, 
-  onSourceRestored 
-}: { 
-  children: React.ReactNode, 
-  tenantId: string | null, 
-  selectedSourceId: string, 
-  onSourceRestored?: (sourceId: string) => void 
+export function ChatProvider({
+  children,
+  tenantId,
+  selectedLakeId,
+}: {
+  children: React.ReactNode,
+  tenantId: string | null,
+  selectedLakeId?: string,
 }) {
-  const chat = useAxiomChat(tenantId || "default", selectedSourceId);
+  const chat = useAxiomChat(tenantId || "default", selectedLakeId);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [isThreadsLoading, setIsThreadsLoading] = useState(false);
   const [refreshSignal, setRefreshSignal] = useState(0);
@@ -46,16 +44,6 @@ export function ChatProvider({
   const triggerRefresh = useCallback(() => {
     setRefreshSignal(prev => prev + 1);
   }, []);
-
-  // Synchronize source restoration when thread metadata is loaded
-  useEffect(() => {
-     if (chat.threadId && onSourceRestored) {
-        const activeThread = threads.find(t => t.thread_id === chat.threadId);
-        if (activeThread?.metadata?.source_id) {
-           onSourceRestored(activeThread.metadata.source_id);
-        }
-     }
-  }, [chat.threadId, threads, onSourceRestored]);
 
   const refreshThreads = useCallback(async () => {
     if (!tenantId) return;

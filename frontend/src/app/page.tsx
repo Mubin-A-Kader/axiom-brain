@@ -9,12 +9,11 @@ import {
   Database, Check, X, Copy, 
   Terminal, Activity, LayoutDashboard, Settings, 
   CornerDownLeft, Loader2, AlertCircle, ChevronRight, ChevronDown, Search, Network, Sparkles, Cpu, RefreshCw,
-  PanelRightClose, PanelRightOpen, ArrowRight, Zap, ShieldCheck
+  PanelRightClose, PanelRightOpen, ArrowRight, Zap, ShieldCheck, MessageSquare, Plus, Waves
 } from "lucide-react";
 import { ChatProvider, useChat } from "../hooks/useAxiomChatContext";
 import { Sidebar } from "../components/Sidebar";
 import { createClient } from "@/lib/supabase/client";
-import { Source } from "../types";
 import { IntelligenceOrb } from "../components/IntelligenceOrb";
 import { AxiomArtifacts } from "../components/AxiomArtifacts";
 import ReactMarkdown from "react-markdown";
@@ -43,10 +42,11 @@ function TactileButton({ children, onClick, className = "", disabled = false, va
   );
 }
 
-function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }: any) {
-  const { messages, isLoading, sendMessage, handleApprove, markAsWrong, selectedModel, setSelectedModel } = useChat();
+function ChatInner({ tenantId, lakes, selectedLakeId, setSelectedLakeId }: any) {
+  const { messages, isLoading, sendMessage, handleApprove, markAsWrong, selectedModel, setSelectedModel, threads, activeThreadId, switchThread, startNewThread, isThreadsLoading } = useChat();
   const [input, setInput] = useState("");
   const [showArtifacts, setShowArtifacts] = useState(true);
+  const [showHistory, setShowHistory] = useState(false);
   const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const router = useRouter();
@@ -80,43 +80,131 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
   };
 
   const MarkdownComponents: any = {
-    strong: ({node, ...props}: any) => <strong className="font-bold text-[#638A70]" {...props} />,
+    strong: ({node, ...props}: any) => <strong className="font-bold text-[#638A70] text-base" {...props} />,
     li: ({node, ...props}: any) => (
-      <li className="flex items-start gap-3 my-2">
-        <div className="w-1 h-1 rounded-full bg-[#638A70] mt-2.5" />
-        <span className="text-[#E6E1D8]/80" {...props} />
+      <li className="flex items-start gap-3 my-2 text-base">
+        <div className="w-1.5 h-1.5 rounded-full bg-[#638A70] mt-2" />
+        <span className="text-[#E6E1D8]/90 leading-relaxed" {...props} />
       </li>
     ),
-    ul: ({node, ...props}: any) => <ul className="space-y-1 my-4 list-none pl-0" {...props} />,
-    p: ({node, ...props}: any) => <p className="mb-4 leading-relaxed text-[#E6E1D8]/90" {...props} />
+    ul: ({node, ...props}: any) => <ul className="space-y-1.5 my-4 list-none pl-0" {...props} />,
+    p: ({node, ...props}: any) => <p className="mb-4 leading-relaxed text-[#E6E1D8] text-base" {...props} />
   };
 
   return (
-    <div className="h-full flex flex-col bg-[#1E1E1C] overflow-hidden">
-      {/* Header */}
-      <header className="h-14 border-b border-white/5 flex items-center justify-between px-6 bg-[#2A2927] flex-shrink-0 z-20">
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2 px-3 py-1 bg-[#1E1E1C] border border-white/5 rounded-md">
-            <Database className="w-3 h-3 text-[#638A70]" />
-            <select 
-              className="bg-transparent border-0 outline-none text-[10px] font-mono font-bold uppercase tracking-wider text-[#E6E1D8]/60 cursor-pointer appearance-none pr-4"
-              value={selectedSourceId}
-              onChange={(e) => setSelectedSourceId(e.target.value)}
+    <div className="h-full flex flex-col bg-[#1E1E1C] overflow-hidden relative">
+      {/* History Drawer Overlay */}
+      <AnimatePresence>
+        {showHistory && (
+          <>
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowHistory(false)}
+              className="absolute inset-0 bg-black/60 z-40 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ x: '-100%' }}
+              animate={{ x: 0 }}
+              exit={{ x: '-100%' }}
+              transition={{ type: "spring", damping: 25, stiffness: 200 }}
+              className="absolute top-0 left-0 bottom-0 w-80 bg-[#2A2927] z-50 shadow-2xl border-r border-white/5 flex flex-col"
             >
-              {sources.length === 0 ? (
-                <option value="">No Sources</option>
-              ) : (
-                sources.map((s: any) => (
-                  <option key={s.source_id} value={s.source_id}>{s.name}</option>
-                ))
-              )}
+              <div className="p-6 border-b border-white/5 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <MessageSquare className="w-5 h-5 text-[#638A70]" />
+                  <span className="font-bold text-lg text-[#E6E1D8]">History</span>
+                </div>
+                <button onClick={() => setShowHistory(false)} className="p-2 hover:bg-white/5 rounded-lg text-[#E6E1D8]/40 hover:text-white">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <div className="flex-1 overflow-y-auto p-4 space-y-2 custom-scrollbar">
+                {isThreadsLoading && threads.length === 0 ? (
+                  <div className="space-y-4 p-4">
+                    {[1, 2, 3, 4, 5].map((i) => (
+                      <div key={i} className="h-12 w-full bg-[#1E1E1C] animate-pulse rounded-xl opacity-50" />
+                    ))}
+                  </div>
+                ) : threads.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center h-40 text-center p-6">
+                    <MessageSquare className="w-8 h-8 text-white/5 mb-3" />
+                    <p className="text-sm text-[#E6E1D8]/30">No recent analysis history found.</p>
+                  </div>
+                ) : (
+                  threads.map((thread) => (
+                    <button
+                      key={thread.thread_id}
+                      onClick={() => {
+                        switchThread(thread.thread_id);
+                        setShowHistory(false);
+                      }}
+                      className={`w-full text-left px-4 py-3.5 rounded-xl text-sm transition-all border ${
+                        activeThreadId === thread.thread_id
+                        ? "bg-[#638A70]/10 text-[#638A70] border-[#638A70]/30 shadow-inner"
+                        : "text-[#E6E1D8]/60 hover:bg-white/5 hover:text-[#E6E1D8] border-transparent"
+                      }`}
+                    >
+                      <div className="font-semibold truncate mb-1">{thread.last_question}</div>
+                      <div className="text-[10px] uppercase tracking-widest opacity-40 font-mono">
+                        {new Date(thread.updated_at).toLocaleDateString()}
+                      </div>
+                    </button>
+                  ))
+                )}
+              </div>
+              <div className="p-4 border-t border-white/5">
+                <button 
+                  onClick={() => {
+                    startNewThread();
+                    setShowHistory(false);
+                  }}
+                  className="w-full flex items-center justify-center gap-2 py-3 bg-[#638A70] text-[#1E1E1C] rounded-xl font-bold text-sm hover:bg-[#729E81] transition-all"
+                >
+                  <Plus className="w-4 h-4" />
+                  New Analysis
+                </button>
+              </div>
+            </motion.div>
+          </>
+        )}
+      </AnimatePresence>
+
+      {/* Header */}
+      <header className="h-16 border-b border-white/5 flex items-center justify-between px-6 bg-[#2A2927] flex-shrink-0 z-20">
+        <div className="flex items-center gap-4">
+          <button 
+            onClick={() => setShowHistory(true)}
+            className="flex items-center gap-2.5 px-4 py-2 bg-[#1E1E1C] hover:bg-[#32312F] border border-white/5 rounded-xl text-[#E6E1D8] transition-all group"
+          >
+            <MessageSquare className="w-4 h-4 text-[#638A70]" />
+            <span className="text-sm font-bold uppercase tracking-widest">History</span>
+            <div className="ml-1 px-1.5 py-0.5 bg-[#638A70]/20 text-[#638A70] rounded text-[10px] font-mono">
+              {threads.length}
+            </div>
+          </button>
+
+          <div className="h-6 w-px bg-white/5 mx-2" />
+
+          <div className="flex items-center gap-2 px-4 py-2 bg-[#1E1E1C] border border-white/5 rounded-xl">
+            <Waves className="w-4 h-4 text-[#638A70]" />
+            <select 
+              className="bg-transparent border-0 outline-none text-[11px] font-mono font-bold uppercase tracking-widest text-[#E6E1D8]/80 cursor-pointer appearance-none pr-4"
+              value={selectedLakeId}
+              onChange={(e) => setSelectedLakeId(e.target.value)}
+            >
+              <option value="">Full Data Lake</option>
+              {lakes.map((l: any) => (
+                <option key={l.id} value={l.id}>{l.name}</option>
+              ))}
             </select>
           </div>
 
-          <div className="flex items-center gap-2 px-3 py-1 bg-[#1E1E1C] border border-white/5 rounded-md">
-            <Zap className="w-3 h-3 text-[#638A70]" />
+          <div className="flex items-center gap-2 px-4 py-2 bg-[#1E1E1C] border border-white/5 rounded-xl">
+            <Zap className="w-4 h-4 text-[#638A70]" />
             <select 
-              className="bg-transparent border-0 outline-none text-[10px] font-mono font-bold uppercase tracking-wider text-[#E6E1D8]/60 cursor-pointer appearance-none pr-4"
+              className="bg-transparent border-0 outline-none text-[11px] font-mono font-bold uppercase tracking-widest text-[#E6E1D8]/80 cursor-pointer appearance-none pr-4"
               value={selectedModel}
               onChange={(e) => setSelectedModel(e.target.value)}
             >
@@ -140,21 +228,21 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-3">
           {!!activeArtifactMsg && !showArtifacts && (
             <button 
               onClick={() => setShowArtifacts(true)}
-              className="flex items-center gap-2 px-3 py-1.5 bg-[#638A70]/10 text-[#638A70] rounded-md border border-[#638A70]/20 text-[10px] font-bold uppercase tracking-widest hover:bg-[#638A70]/20 transition-all"
+              className="flex items-center gap-2.5 px-4 py-2 bg-[#638A70]/10 text-[#638A70] rounded-xl border border-[#638A70]/20 text-[11px] font-bold uppercase tracking-widest hover:bg-[#638A70]/20 transition-all shadow-lg"
             >
-              <PanelRightOpen className="w-3.5 h-3.5" />
-              Show Workspace
+              <PanelRightOpen className="w-4 h-4" />
+              Open Workspace
             </button>
           )}
           <button 
-            className="p-1.5 rounded-md bg-[#1E1E1C] border border-white/5 text-[#E6E1D8]/40 hover:text-white"
+            className="p-2.5 rounded-xl bg-[#1E1E1C] border border-white/5 text-[#E6E1D8]/40 hover:text-white hover:bg-[#32312F] transition-all"
             onClick={() => router.push("/data-sources")}
           >
-            <Settings className="w-4 h-4" />
+            <Settings className="w-5 h-5" />
           </button>
         </div>
       </header>
@@ -163,23 +251,26 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
         {/* Main Chat Area */}
         <div className="flex-1 flex flex-col min-w-0 bg-[#1E1E1C] relative">
           <div className="flex-1 overflow-y-auto scroll-smooth custom-scrollbar px-6 py-10 pb-32">
-            <div className="max-w-3xl mx-auto space-y-12">
+            <div className="max-w-4xl mx-auto space-y-16">
               {messages.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-center mt-20">
-                  <Network className="w-12 h-12 text-[#638A70]/30 mb-6" />
-                  <h1 className="text-2xl font-heading font-semibold text-[#E6E1D8] mb-2">
+                  <div className="relative mb-8">
+                     <div className="absolute inset-0 bg-[#638A70]/20 blur-3xl rounded-full" />
+                     <Network className="w-20 h-20 text-[#638A70] relative z-10" />
+                  </div>
+                  <h1 className="text-4xl font-heading font-bold text-[#E6E1D8] mb-4 tracking-tight">
                     Axiom Intelligence
                   </h1>
-                  <p className="text-[#E6E1D8]/30 text-sm max-w-sm mx-auto">
-                    Analyze your data infrastructure through natural language.
+                  <p className="text-[#E6E1D8]/40 text-lg max-w-md mx-auto leading-relaxed">
+                    How can I help you analyze your data infrastructure today?
                   </p>
                 </div>
               ) : (
                 messages.map((msg: any) => (
                   <div key={msg.id} className="relative">
                     {msg.role === "user" && (
-                      <div className="flex flex-col items-start border-l-2 border-[#638A70] pl-6 py-1">
-                        <h2 className="text-xl font-heading font-semibold text-[#E6E1D8] tracking-tight">
+                      <div className="flex flex-col items-start border-l-4 border-[#638A70] pl-8 py-1.5 mb-2">
+                        <h2 className="text-lg font-heading font-bold text-[#E6E1D8] tracking-tight leading-tight">
                           {msg.content}
                         </h2>
                       </div>
@@ -187,9 +278,9 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
 
                         {msg.role === "agent" && (
                       <div 
-                        className={`relative pt-6 px-4 -mx-4 rounded-xl transition-all cursor-pointer group/msg ${
+                        className={`relative pt-8 px-6 -mx-6 rounded-2xl transition-all cursor-pointer group/msg ${
                           activeArtifactMsg?.id === msg.id && isArtifactActive 
-                          ? 'bg-[#2A2927]/30 border border-white/5 shadow-inner' 
+                          ? 'bg-[#2A2927]/40 border border-[#638A70]/10 shadow-2xl' 
                           : 'hover:bg-white/5 border border-transparent'
                         }`}
                         onClick={() => {
@@ -200,7 +291,7 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
                         }}
                       >
                         {/* Vertical connector line */}
-                        <div className="absolute top-0 left-0 w-px h-full bg-[#638A70]/10 ml-[-2px]" />
+                        <div className="absolute top-0 left-0 w-1 h-full bg-[#638A70]/5 ml-[-4px]" />
 
                         <div className="mt-2">
                           <IntelligenceOrb
@@ -213,16 +304,16 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
 
                         {/* Proactive Probing Comparison Card (Shows during pause) */}
                         {msg.metadata?.probing_options && msg.metadata.probing_options.length > 0 && (
-                           <div className="bg-[#2A2927] border border-[#638A70]/30 rounded-xl p-6 space-y-6 shadow-2xl mt-4 relative z-30">
-                              <div className="flex items-center gap-3">
-                                 <Search className="w-5 h-5 text-[#638A70]" />
-                                 <h3 className="text-sm font-bold text-[#E6E1D8] uppercase tracking-widest">Verify Business Intent</h3>
+                           <div className="bg-[#2A2927] border border-[#638A70]/30 rounded-2xl p-8 space-y-8 shadow-2xl mt-8 relative z-30">
+                              <div className="flex items-center gap-4">
+                                 <Search className="w-6 h-6 text-[#638A70]" />
+                                 <h3 className="text-base font-bold text-[#E6E1D8] uppercase tracking-[0.2em]">Verify Business Intent</h3>
                               </div>
-                              <p className="text-xs text-[#E6E1D8]/60 leading-relaxed">
+                              <p className="text-base text-[#E6E1D8]/70 leading-relaxed">
                                 I found multiple tables that could answer your question. Which one matches your logic?
                               </p>
                               
-                              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                                 {msg.metadata.probing_options.map((opt: any) => (
                                   <div 
                                     key={opt.id}
@@ -232,19 +323,19 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
                                       const userQ = prevMsg ? prevMsg.content : "";
                                       sendMessage(`CONFIRMED_SOURCE: Use the '${opt.table_name}' table to answer my question about '${userQ}'.`);
                                     }}
-                                    className="bg-[#1E1E1C] border border-white/5 rounded-lg p-4 cursor-pointer hover:border-[#638A70] transition-all group"
+                                    className="bg-[#1E1E1C] border border-white/5 rounded-xl p-6 cursor-pointer hover:border-[#638A70] hover:bg-[#638A70]/5 transition-all group/opt shadow-lg"
                                   >
-                                    <div className="flex items-center justify-between mb-2">
-                                      <span className="text-[10px] font-bold text-[#638A70] uppercase">{opt.business_name}</span>
-                                      <div className="w-4 h-4 rounded-full border border-[#638A70]/20 group-hover:bg-[#638A70]/20" />
+                                    <div className="flex items-center justify-between mb-4">
+                                      <span className="text-xs font-bold text-[#638A70] uppercase tracking-widest">{opt.business_name}</span>
+                                      <div className="w-5 h-5 rounded-full border-2 border-[#638A70]/20 group-hover/opt:border-[#638A70] transition-colors" />
                                     </div>
-                                    <p className="text-[10px] text-[#E6E1D8]/40 mb-4 h-8 overflow-hidden">{opt.description}</p>
+                                    <p className="text-sm text-[#E6E1D8]/60 mb-6 h-12 overflow-hidden leading-relaxed">{opt.description}</p>
                                     
-                                    <div className="bg-black/20 rounded p-2 overflow-hidden">
-                                       <span className="text-[8px] font-mono text-[#638A70]/50 block mb-1 uppercase">Sample Data</span>
-                                       <pre className="text-[9px] font-mono text-[#E6E1D8]/30">
+                                    <div className="bg-black/30 rounded-lg p-3 overflow-hidden border border-white/5">
+                                       <span className="text-[9px] font-mono text-[#638A70] block mb-2 uppercase tracking-widest font-bold">Sample Data</span>
+                                       <pre className="text-[10px] font-mono text-[#E6E1D8]/40 leading-tight">
                                           {opt.sample_data && opt.sample_data[0] 
-                                            ? JSON.stringify(opt.sample_data[0], null, 2).slice(0, 80) 
+                                            ? JSON.stringify(opt.sample_data[0], null, 2).slice(0, 100) 
                                             : "No sample data available"}...
                                        </pre>
                                     </div>
@@ -252,7 +343,7 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
                                 ))}
                               </div>
 
-                              <div className="pt-4 border-t border-white/5 flex justify-end">
+                              <div className="pt-6 border-t border-white/5 flex justify-end">
                                 <button 
                                   onClick={(e) => {
                                     e.stopPropagation();
@@ -261,9 +352,9 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
                                     const suggestedTables = msg.metadata.probing_options.map((opt: any) => `'${opt.table_name}'`).join(", ");
                                     sendMessage(`REJECTED_INTENT: The suggested tables [${suggestedTables}] are not what I meant. Please find other tables to answer my question about '${userQ}'.`);
                                   }}
-                                  className="text-[10px] font-bold uppercase tracking-widest text-[#E6E1D8]/40 hover:text-[#C26D5C] transition-all flex items-center gap-2"
+                                  className="text-xs font-bold uppercase tracking-widest text-[#E6E1D8]/30 hover:text-[#C26D5C] transition-all flex items-center gap-3 px-4 py-2 hover:bg-[#C26D5C]/5 rounded-lg"
                                 >
-                                  <X className="w-3 h-3" />
+                                  <X className="w-4 h-4" />
                                   None of these match my intent
                                 </button>
                               </div>
@@ -272,45 +363,48 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
 
                         {/* Click indicator for messages with artifacts */}
                         {(msg.metadata?.result || msg.metadata?.artifact) && (
-                          <div className={`absolute top-2 right-4 flex items-center gap-2 px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-widest transition-all ${
+                          <div className={`absolute top-4 right-6 flex items-center gap-3 px-4 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-[0.15em] transition-all shadow-lg ${
                             activeArtifactMsg?.id === msg.id && isArtifactActive
                             ? 'bg-[#638A70] text-[#1E1E1C]'
-                            : 'bg-[#2A2927] text-[#E6E1D8]/20 group-hover/msg:text-[#638A70]'
+                            : 'bg-[#2A2927] text-[#E6E1D8]/40 group-hover/msg:text-[#638A70] border border-white/5'
                           }`}>
-                            <LayoutDashboard className="w-3 h-3" />
-                            {activeArtifactMsg?.id === msg.id && isArtifactActive ? 'In Workspace' : 'View In Workspace'}
+                            <LayoutDashboard className="w-3.5 h-3.5" />
+                            {activeArtifactMsg?.id === msg.id && isArtifactActive ? 'Active in Workspace' : 'Inspect Results'}
                           </div>
                         )}
 
                         {msg.isError && (
-                          <div className="bg-[#C26D5C]/5 border border-[#C26D5C]/20 rounded-lg p-4 flex items-start gap-3 mt-4">
-                            <AlertCircle className="w-5 h-5 flex-shrink-0 text-[#C26D5C]" />
-                            <div className="text-sm text-[#E6E1D8]/80 font-medium">{msg.content}</div>
+                          <div className="bg-[#C26D5C]/10 border border-[#C26D5C]/30 rounded-2xl p-6 flex items-start gap-4 mt-8">
+                            <AlertCircle className="w-6 h-6 flex-shrink-0 text-[#C26D5C]" />
+                            <div className="text-base text-[#E6E1D8] font-semibold">{msg.content}</div>
                           </div>
                         )}
 
                         {msg.status === "pending_approval" && (!msg.metadata?.probing_options || msg.metadata.probing_options.length === 0) && (
-                          <div className="bg-[#C26D5C]/5 border border-[#C26D5C]/30 rounded-xl p-6 flex flex-col gap-4 mt-6">
-                            <div className="flex items-center gap-2 text-[#C26D5C]">
-                              <ShieldCheck className="w-5 h-5" />
-                              <h3 className="text-[10px] font-bold uppercase tracking-[0.2em]">Safety Gate</h3>
+                          <div className="bg-[#C26D5C]/5 border border-[#C26D5C]/30 rounded-2xl p-8 flex flex-col gap-6 mt-8 shadow-2xl relative overflow-hidden">
+                            <div className="absolute top-0 right-0 p-4 opacity-5">
+                               <ShieldCheck className="w-20 h-20 text-[#C26D5C]" />
                             </div>
-                            <p className="text-sm text-[#E6E1D8]/70">Manual verification of the execution plan is required.</p>
-                            <div className="flex gap-3">
-                              <TactileButton variant="primary" onClick={() => handleApprove(true, msg.metadata!.thread_id!)} disabled={isLoading} className="flex-1">
-                                Approve
+                            <div className="flex items-center gap-3 text-[#C26D5C]">
+                              <ShieldCheck className="w-6 h-6" />
+                              <h3 className="text-xs font-bold uppercase tracking-[0.3em]">Execution Gate</h3>
+                            </div>
+                            <p className="text-base text-[#E6E1D8]/80 leading-relaxed font-medium">Manual verification of the generated execution plan is required before proceeding.</p>
+                            <div className="flex gap-4">
+                              <TactileButton variant="primary" onClick={() => handleApprove(true, msg.metadata!.thread_id!)} disabled={isLoading} className="flex-1 py-4 text-base rounded-xl">
+                                Approve Execution
                               </TactileButton>
-                              <TactileButton variant="outline" onClick={() => handleApprove(false, msg.metadata!.thread_id!)} disabled={isLoading}>
-                                <X className="w-4 h-4" />
+                              <TactileButton variant="outline" onClick={() => handleApprove(false, msg.metadata!.thread_id!)} disabled={isLoading} className="px-6 rounded-xl">
+                                <X className="w-6 h-6 text-[#C26D5C]" />
                               </TactileButton>
                             </div>
                           </div>
                         )}
 
                         {msg.status === "completed" && !msg.isError && (
-                          <div className="mt-4 space-y-6">
+                          <div className="mt-8 space-y-10">
                             {msg.content && (
-                              <div className="prose prose-sm prose-zinc prose-invert max-w-none text-[#E6E1D8]/80 leading-relaxed">
+                              <div className="prose prose-lg prose-zinc prose-invert max-w-none">
                                 <ReactMarkdown remarkPlugins={[remarkGfm]} components={MarkdownComponents}>
                                   {msg.content}
                                 </ReactMarkdown>
@@ -318,22 +412,22 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
                             )}
 
                             {/* Feedback & Actions */}
-                            <div className="flex items-center gap-4 pt-2">
+                            <div className="flex items-center gap-6 pt-4">
                                <button 
                                  onClick={(e) => {
                                    e.stopPropagation();
                                    const comment = prompt("Why is this wrong? (e.g. wrong table, incorrect filter)");
                                    if (comment !== null) markAsWrong(msg.id, comment);
                                  }}
-                                 className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-[#E6E1D8]/20 hover:text-[#C26D5C] transition-colors"
+                                 className="flex items-center gap-2 text-xs font-bold uppercase tracking-widest text-[#E6E1D8]/20 hover:text-[#C26D5C] transition-all px-3 py-1.5 hover:bg-[#C26D5C]/5 rounded-lg"
                                >
-                                 <AlertCircle className="w-3 h-3" />
-                                 Mark as Wrong
+                                 <AlertCircle className="w-4 h-4" />
+                                 Feedback
                                </button>
                             </div>
 
                             {!isArtifactActive && (
-                               <div className="pt-4 border-t border-white/5">
+                               <div className="pt-8 border-t border-white/5">
                                  <AxiomArtifacts 
                                    message={msg}
                                    onActionClick={(action) => {
@@ -355,25 +449,25 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
           </div>
           
           {/* Simple Bottom Chat Input */}
-          <div className="p-6 bg-gradient-to-t from-[#1E1E1C] via-[#1E1E1C] to-transparent flex-shrink-0">
-             <div className="max-w-3xl mx-auto relative">
+          <div className="p-10 bg-gradient-to-t from-[#1E1E1C] via-[#1E1E1C] to-transparent flex-shrink-0 relative z-10">
+             <div className="max-w-4xl mx-auto relative">
                 <form 
                   onSubmit={handleSubmit} 
-                  className="relative flex items-center bg-[#2A2927] rounded-xl border border-white/5 p-1 pl-4 shadow-xl focus-within:border-[#638A70]/40"
+                  className="relative flex items-center bg-[#2A2927] rounded-2xl border-2 border-white/5 p-2 pl-6 shadow-[0_20px_50px_rgba(0,0,0,0.5)] focus-within:border-[#638A70]/40 transition-all"
                 >
                   <input
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
-                    placeholder="Ask Axiom..."
-                    className="flex-1 py-3 text-sm font-medium bg-transparent border-0 outline-none text-[#E6E1D8] placeholder:text-[#E6E1D8]/20"
+                    placeholder="Ask Axiom Intelligence..."
+                    className="flex-1 py-4 text-lg font-medium bg-transparent border-0 outline-none text-[#E6E1D8] placeholder:text-[#E6E1D8]/20"
                     disabled={isLoading}
                   />
                   <button 
                     type="submit" 
                     disabled={!input.trim() || isLoading}
-                    className="h-10 w-10 flex items-center justify-center rounded-lg bg-[#638A70] text-[#1E1E1C] hover:bg-[#729E81] transition-all disabled:opacity-20 cursor-pointer"
+                    className="h-14 w-14 flex items-center justify-center rounded-xl bg-[#638A70] text-[#1E1E1C] hover:bg-[#729E81] transition-all disabled:opacity-20 shadow-xl cursor-pointer active:scale-95"
                   >
-                    {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <ArrowRight className="w-4 h-4" />}
+                    {isLoading ? <Loader2 className="w-6 h-6 animate-spin" /> : <ArrowRight className="w-6 h-6" />}
                   </button>
                 </form>
              </div>
@@ -385,21 +479,24 @@ function ChatInner({ tenantId, sources, selectedSourceId, setSelectedSourceId }:
           {isArtifactActive && (
             <motion.div 
               initial={{ width: 0, opacity: 0 }}
-              animate={{ width: '50%', opacity: 1 }}
+              animate={{ width: '55%', opacity: 1 }}
               exit={{ width: 0, opacity: 0 }}
-              transition={{ duration: 0.3, ease: "easeInOut" }}
-              className="h-full bg-[#2A2927]/50 border-l border-white/5 relative flex flex-col min-w-0"
+              transition={{ duration: 0.4, ease: [0.23, 1, 0.32, 1] }}
+              className="h-full bg-[#2A2927]/60 border-l border-white/5 relative flex flex-col min-w-0 backdrop-blur-xl"
             >
-              <div className="h-14 border-b border-white/5 flex items-center justify-between px-6 flex-shrink-0">
-                 <span className="text-[10px] font-mono font-bold text-[#638A70] uppercase tracking-widest">Active Workspace</span>
+              <div className="h-16 border-b border-white/5 flex items-center justify-between px-8 flex-shrink-0">
+                 <div className="flex items-center gap-3">
+                    <Sparkles className="w-4 h-4 text-[#638A70]" />
+                    <span className="text-xs font-bold text-[#638A70] uppercase tracking-[0.2em]">Live Workspace</span>
+                 </div>
                  <button 
                     onClick={() => setShowArtifacts(false)}
-                    className="p-1.5 rounded-md hover:bg-white/5 text-[#E6E1D8]/20 hover:text-white transition-all"
+                    className="p-2.5 rounded-xl hover:bg-white/5 text-[#E6E1D8]/20 hover:text-white transition-all border border-transparent hover:border-white/5"
                   >
-                    <PanelRightClose className="w-4 h-4" />
+                    <PanelRightClose className="w-5 h-5" />
                   </button>
               </div>
-              <div className="flex-1 overflow-hidden p-8">
+              <div className="flex-1 overflow-hidden p-10">
                 <AxiomArtifacts 
                   message={activeArtifactMsg}
                   onActionClick={(action) => {
@@ -431,8 +528,8 @@ function SidebarConsumer() {
 
 export default function AxiomBrainUI() {
   const [tenantId, setTenantId] = useState<string | null>(null);
-  const [sources, setSources] = useState<Source[]>([]);
-  const [selectedSourceId, setSelectedSourceId] = useState<string>("");
+  const [lakes, setLakes] = useState<any[]>([]);
+  const [selectedLakeId, setSelectedLakeId] = useState<string>("");
   const [mounted, setMounted] = useState(false);
   const [isVerifying, setIsVerifying] = useState(true);
   const [connectionError, setConnectionError] = useState<string | null>(null);
@@ -479,14 +576,13 @@ export default function AxiomBrainUI() {
 
   useEffect(() => {
     if (tenantId) {
-      import("@/lib/api").then(({ fetchSources }) => {
-        fetchSources(tenantId).then((data) => {
-          setSources(data);
-          if (data.length > 0 && !selectedSourceId) setSelectedSourceId(data[0].source_id);
+      import("@/lib/api").then(({ fetchLakes }) => {
+        fetchLakes(tenantId).then((data) => {
+          setLakes(data);
         });
       });
     }
-  }, [tenantId, selectedSourceId]);
+  }, [tenantId]);
 
   if (!mounted || isVerifying || !tenantId) {
     return (
@@ -497,19 +593,18 @@ export default function AxiomBrainUI() {
   }
 
   return (
-    <ChatProvider 
-      tenantId={tenantId} 
-      selectedSourceId={selectedSourceId}
-      onSourceRestored={(sourceId) => setSelectedSourceId(sourceId)}
+    <ChatProvider
+      tenantId={tenantId}
+      selectedLakeId={selectedLakeId}
     >
       <div className="flex w-full h-screen overflow-hidden bg-[#1E1E1C]">
         <SidebarConsumer />
         <main className="flex-1 h-full overflow-hidden">
-          <ChatInner 
-            tenantId={tenantId} 
-            sources={sources} 
-            selectedSourceId={selectedSourceId} 
-            setSelectedSourceId={setSelectedSourceId} 
+          <ChatInner
+            tenantId={tenantId}
+            lakes={lakes}
+            selectedLakeId={selectedLakeId}
+            setSelectedLakeId={setSelectedLakeId}
           />
         </main>
       </div>

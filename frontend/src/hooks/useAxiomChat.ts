@@ -2,7 +2,7 @@ import { useState, useCallback } from "react";
 import { ChatMessage, QueryResponse, ReasoningStep } from "../types";
 import { askQuestionStream, approveQuery, fetchThreadHistory, sendFeedback } from "../lib/api";
 
-export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: string) {
+export function useAxiomChat(tenantId: string = "default_tenant", lakeId?: string) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sessionId, setSessionId] = useState<string>("");
   const [threadId, setThreadId] = useState<string>("");
@@ -47,12 +47,15 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
         newMessages.push({
           id: `history-a-${idx}`,
           role: "agent",
-          content: "", // Content might be in insight or we use thought
+          content: turn.insight || "", 
           status: "completed",
             metadata: {
               sql: turn.sql,
               result: typeof turn.result === "string" ? turn.result : JSON.stringify(turn.result),
-              thread_id: newThreadId
+              thread_id: newThreadId,
+              artifact: turn.artifact,
+              insight: turn.insight,
+              thought: turn.thought
             }
         });
       });
@@ -154,7 +157,7 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
         session_id: sessionId,
         thread_id: threadId,
         tenant_id: tenantId,
-        source_id: sourceId,
+        lake_id: lakeId || undefined,
         model: selectedModel || undefined,
       }, (chunk) => {
         if (chunk.__final__) {
@@ -263,7 +266,7 @@ export function useAxiomChat(tenantId: string = "default_tenant", sourceId?: str
     } finally {
       setIsLoading(false);
     }
-  }, [sessionId, threadId, tenantId, sourceId, selectedModel, appendMessage, updateLastMessage]);
+  }, [sessionId, threadId, tenantId, lakeId, selectedModel, appendMessage, updateLastMessage]);
 
   const handleApprove = useCallback(async (approved: boolean, currentThreadId: string) => {
     setIsLoading(true);

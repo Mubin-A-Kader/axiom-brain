@@ -7,6 +7,28 @@ from axiom.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _get_content(response) -> str:
+    """Safely extract string content from OpenAI/LiteLLM response."""
+    content = response.choices[0].message.content
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        # Handle content blocks
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(block.get("text", ""))
+            else:
+                parts.append(str(block))
+        content_str = "".join(parts)
+    else:
+        content_str = str(content)
+        
+    import re
+    content_str = re.sub(r"<think>.*?</think>", "", content_str, flags=re.DOTALL)
+    return content_str
+
+
 class QueryPlannerNode:
     """Decompose intent and categorize query as REFINEMENT or NEW_TOPIC."""
 
@@ -68,7 +90,7 @@ Respond strictly with valid JSON in this format:
                 response_format={"type": "json_object"}
             )
 
-            content = response.choices[0].message.content.strip()
+            content = _get_content(response).strip()
             result = json.loads(content)
             query_type = result.get("query_type", "NEW_TOPIC")
             logical_blueprint = result.get("logical_blueprint", "No blueprint generated.")

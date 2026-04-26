@@ -4,7 +4,21 @@ export interface QueryRequest {
   thread_id?: string;
   tenant_id?: string;
   source_id?: string;
+  lake_id?: string;
+  lake_scope?: string[];
   model?: string;
+}
+
+export interface LakeIn {
+  name: string;
+  description?: string;
+}
+
+export interface LakeOut {
+  id: string;
+  name: string;
+  description?: string;
+  created_at: string;
 }
 
 export interface ApproveRequest {
@@ -17,7 +31,7 @@ export interface ApproveRequest {
 
 export interface QueryResponse {
   sql: string;
-  result?: string; // JSON string of the results; absent when query returned 0 rows or errored
+  result?: string;
   artifact?: NotebookArtifact;
   insight?: string;
   thought?: string;
@@ -27,7 +41,23 @@ export interface QueryResponse {
   session_id: string;
   thread_id: string;
   tenant_id: string;
-  status: "completed" | "pending_approval" | "rejected";
+  status: "completed" | "pending_approval" | "rejected" | "needs_clarification";
+  routing_candidates?: RoutingCandidate[];
+}
+
+export interface RoutingCandidate {
+  source_id: string;
+  reason: string;
+  score: number;
+}
+
+export interface LakeSource {
+  source_id: string;
+  name: string;
+  db_type: string;
+  description?: string;
+  status: string;
+  added_at: string;
 }
 
 export interface NotebookOutput {
@@ -107,7 +137,7 @@ export interface ChatMessage {
   role: "user" | "agent";
   content: string; // Question for user, final answer or SQL block for agent
   isError?: boolean;
-  status?: "loading" | "completed" | "pending_approval" | "rejected";
+  status?: "loading" | "completed" | "pending_approval" | "rejected" | "needs_clarification";
   reasoning_steps?: ReasoningStep[];
   metadata?: {
     sql?: string;
@@ -142,6 +172,9 @@ export interface ThreadHistory {
     active_filters?: string[];
     verified_joins?: string[];
     error_log?: string[];
+    artifact?: NotebookArtifact;
+    insight?: string;
+    thought?: string;
   }[];
   metadata?: {
     llm_model?: string;

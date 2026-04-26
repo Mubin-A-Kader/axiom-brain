@@ -1,81 +1,147 @@
 from datetime import timedelta
-from typing import List, Optional
+from typing import Optional
+
 from temporalio import workflow
+
 from axiom.agent.state import SQLAgentState
 
-# Import activities
 with workflow.unsafe.imports_passed_through():
     from axiom.agent.temporal.activities import SQLActivities
+    from axiom.config import settings
+
+
+def _should_correct(state: SQLAgentState) -> str:
+    """
+    Mirrors graph.py::_should_correct exactly.
+    Pure deterministic function — safe to run inside the workflow.
+    """
+    error = state.get("error")
+    sql_result = state.get("sql_result")
+    attempts = state.get("attempts", 0)
+
+    if sql_result:
+        return "build_notebook"
+    if attempts >= settings.max_correction_attempts:
+        return "synthesize"
+    if error and (
+        "Exhausted maximum SQL correction" in error
+        or "permission denied" in error.lower()
+    ):
+        return "synthesize"
+    if error and "ZERO_RESULTS" in error:
+        return "critic"
+    if error and "does not exist" in error.lower() and attempts <= 1:
+        return "discovery"
+    if error:
+        return "critic"
+    return "synthesize"
+
 
 @workflow.defn
-class SQLAgentWorkflow:
+class ExecutionWorkflow:
     """
-    Main orchestrator workflow replacing the LangGraph execution path.
-    Implements a stateful, event-sourced agentic loop with HITL support.
+    Durable execution phase — runs after the user approves the generated SQL.
+
+    LangGraph handles everything up to and including SQL generation (streamed
+    to the frontend). This workflow takes over at the Approve boundary and
+    durably runs the execution + self-correction + synthesis pipeline.
+
+    Temporal provides per-activity retries, heartbeats, execution history,
+    and time-travel debugging for this critical write path.
     """
+
     def __init__(self) -> None:
-        self._approved = False
-        self._rejected = False
         self._state: Optional[SQLAgentState] = None
 
-    @workflow.signal
-    def approve(self, approved: bool) -> None:
-        if approved:
-            self._approved = True
-        else:
-            self._rejected = True
-            
     @workflow.query
     def get_state(self) -> Optional[SQLAgentState]:
         return self._state
-    
+
     @workflow.run
-    async def run(self, initial_state: SQLAgentState) -> SQLAgentState:
-        self._state = initial_state
-        state = self._state
-        
-        # 1. Retrieve Schema
-        # Increased timeout to 5 minutes to accommodate large schema retrievals
-        state = await workflow.execute_activity(
-            SQLActivities.retrieve_schema,
-            state,
-            start_to_close_timeout=timedelta(minutes=5),
-            heartbeat_timeout=timedelta(seconds=30),
-        )
-        self._state = state
-        
-        # 2. Plan & Generate
-        state = await workflow.execute_activity(
-            SQLActivities.generate_sql,
-            state,
-            start_to_close_timeout=timedelta(minutes=2),
-        )
+    async def run(self, state: SQLAgentState) -> SQLAgentState:
         self._state = state
 
-        # 3. Human-in-the-Loop Interrupt
-        # In this architecture, we pause for approval before the first execution
-        # of any generated SQL to ensure Zero Trust human verification.
-        await workflow.wait_condition(lambda: self._approved or self._rejected)
-        
-        if self._rejected:
-            state["error"] = "Query rejected by user."
-            return state
+        # Short LLM calls: 3 min, no heartbeat needed
+        act = {"start_to_close_timeout": timedelta(minutes=3)}
+        # DB + heavy calls: 5 min with 30s heartbeat so Temporal detects hangs
+        long_act = {
+            "start_to_close_timeout": timedelta(minutes=5),
+            "heartbeat_timeout": timedelta(seconds=30),
+        }
 
-        # 4. Execute SQL with Self-Correction Loop
-        max_attempts = 3
-        while state.get("attempts", 0) < max_attempts:
+        # ── Execute + self-correction loop ────────────────────────────────────
+        while True:
             state = await workflow.execute_activity(
-                SQLActivities.execute_sql,
-                state,
-                start_to_close_timeout=timedelta(minutes=2),
+                SQLActivities.execute_sql, state, **long_act
             )
-            
-            # If successful or terminal error, stop
-            if not state.get("error") or "ZERO_RESULTS" not in state.get("error", ""):
-                if "Syntax Error" not in str(state.get("error")):
-                    break
-                
-            state["attempts"] = state.get("attempts", 0) + 1
-            workflow.logger.info(f"Self-correction attempt {state['attempts']}")
+            self._state = state
+
+            next_step = _should_correct(state)
+            workflow.logger.info(
+                "thread=%s attempts=%s → %s",
+                state.get("thread_id"), state.get("attempts"), next_step,
+            )
+
+            if next_step == "build_notebook":
+                # ── Generate dynamic analysis code ───────────────────────────
+                state = await workflow.execute_activity(
+                    SQLActivities.generate_python_code, state, **act
+                )
+                self._state = state
+
+                # ── Execute + Fix Loop ───────────────────────────────────────
+                max_python_attempts = 3
+                python_attempts = 0
+                while python_attempts < max_python_attempts:
+                    python_attempts += 1
+                    state = await workflow.execute_activity(
+                        SQLActivities.build_notebook, state, **long_act
+                    )
+                    self._state = state
+                    
+                    artifact = state.get("artifact")
+                    if artifact and artifact.get("execution_error"):
+                        state["python_error"] = artifact["execution_error"]
+                        # Re-generate code with the error context
+                        state = await workflow.execute_activity(
+                            SQLActivities.generate_python_code, state, **act
+                        )
+                        self._state = state
+                    else:
+                        break
+                break
+
+            if next_step == "synthesize":
+                break
+
+            if next_step == "discovery":
+                state = await workflow.execute_activity(
+                    SQLActivities.run_discovery, state, **long_act
+                )
+                self._state = state
+                state = await workflow.execute_activity(
+                    SQLActivities.generate_sql, state, **act
+                )
+                self._state = state
+                continue
+
+            if next_step == "critic":
+                state = await workflow.execute_activity(
+                    SQLActivities.run_critic, state, **long_act
+                )
+                self._state = state
+                state = await workflow.execute_activity(
+                    SQLActivities.generate_sql, state, **act
+                )
+                self._state = state
+                continue
+
+            break  # safety
+
+        # ── Synthesize response ───────────────────────────────────────────────
+        state = await workflow.execute_activity(
+            SQLActivities.synthesize_response, state, **act
+        )
+        self._state = state
 
         return state

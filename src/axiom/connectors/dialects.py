@@ -50,12 +50,21 @@ class GenericDialect(BaseDialect):
     def get_table_name_column(self) -> str:
         return "table_name"
 
+class MongoDBDialect(BaseDialect):
+    def get_list_tables_query(self) -> str:
+        return ""  # MongoDB has no SQL list-tables; schema comes from get_schema()
+
+    def get_table_name_column(self) -> str:
+        return "name"
+
+
 class DialectRegistry:
     """Registry of known database dialects."""
     _dialects: Dict[str, BaseDialect] = {
         "postgresql": PostgresDialect(),
         "mysql": MySQLDialect(),
         "snowflake": SnowflakeDialect(),
+        "mongodb": MongoDBDialect(),
         "default": GenericDialect()
     }
 

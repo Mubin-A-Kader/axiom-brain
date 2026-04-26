@@ -8,6 +8,28 @@ from axiom.config import settings
 
 logger = logging.getLogger(__name__)
 
+def _get_content(response) -> str:
+    """Safely extract string content from OpenAI/LiteLLM response."""
+    content = response.choices[0].message.content
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        # Handle content blocks (e.g. from some Anthropic/Gemini models via LiteLLM)
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(block.get("text", ""))
+            else:
+                parts.append(str(block))
+        content_str = "".join(parts)
+    else:
+        content_str = str(content)
+        
+    import re
+    content_str = re.sub(r"<think>.*?</think>", "", content_str, flags=re.DOTALL)
+    return content_str
+
+
 class ProblemDefinitionNode:
     """Converts user query into a precise problem statement."""
     def __init__(self) -> None:
@@ -35,7 +57,7 @@ DEVIATION: <the difference between expected and actual>"""
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
         )
-        problem_statement = response.choices[0].message.content.strip()
+        problem_statement = _get_content(response).strip()
         logger.info(f"Problem Formulation:\n{problem_statement}")
         return {"problem_statement": problem_statement}
 
@@ -73,7 +95,7 @@ Example: ["A recent deployment broke the auth service", "A data pipeline failed 
         )
         
         try:
-            content = response.choices[0].message.content
+            content = _get_content(response)
             # Handle potential dictionary wrapping from JSON object requirement
             parsed = json.loads(content)
             if isinstance(parsed, dict) and len(parsed.keys()) == 1:
@@ -205,7 +227,7 @@ Output a JSON object with this schema:
         )
 
         try:
-            decision = json.loads(response.choices[0].message.content)
+            decision = json.loads(_get_content(response))
             action = decision.get("action")
 
             # Hard-enforce: never conclude before running at least one query when schema exists
@@ -304,7 +326,7 @@ Write the final report EXACTLY in this Markdown format. Do not deviate.
             temperature=0.3,
         )
         
-        report = response.choices[0].message.content.strip()
+        report = _get_content(response).strip()
         
         # In the context of the Axiom Brain UI, we store this in response_text or build a markdown artifact
         return {

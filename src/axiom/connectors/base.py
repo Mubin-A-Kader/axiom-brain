@@ -2,16 +2,46 @@ import asyncio
 import io
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from enum import Enum
+from typing import Any, ClassVar, Dict, List, Optional
 from urllib.parse import urlparse, urlunparse
 
 from sshtunnel import SSHTunnelForwarder
 
 logger = logging.getLogger(__name__)
 
+
+class QueryMode(str, Enum):
+    """
+    Declares how a connector is queried inside the Data Lake worker pipeline.
+
+    SQL        — any relational database that accepts SELECT statements.
+                 (PostgreSQL, MySQL, Snowflake, BigQuery, Redshift, DuckDB, SQLite, …)
+                 Adding a new SQL connector only requires subclassing BaseConnector and
+                 registering with ConnectorFactory — no other changes needed.
+
+    PIPELINE   — document / columnar stores with their own native query language.
+                 (MongoDB aggregation pipeline, Cassandra CQL, …)
+                 The LakeWorker uses dialect-specific LLM instructions and does NOT
+                 validate output as SQL. The connector's execute_query() handles parsing.
+
+    APP        — service connectors backed by tool-use rather than a query language.
+                 (Slack, GitHub, Notion, Salesforce, …)
+                 These are declared via AppConnectorManifest, not BaseConnector, and
+                 are dispatched by AppLakeWorker (tool-call loop), not LakeWorker.
+    """
+    SQL = "sql"
+    PIPELINE = "pipeline"
+    APP = "app"
+
+
 class BaseConnector(ABC):
     """Abstract base class for all Axiom database connectors."""
-    
+
+    # Every subclass declares its query mode. Defaults to SQL so new SQL connectors
+    # (Snowflake, BigQuery, Redshift, DuckDB, …) work in lake fan-out with zero extra wiring.
+    query_mode: ClassVar[QueryMode] = QueryMode.SQL
+
     def __init__(self, source_id: str, db_url: str, config: Optional[Dict[str, Any]] = None):
         self.source_id = source_id
         self.db_url = db_url
@@ -28,9 +58,10 @@ class BaseConnector(ABC):
             return self.db_url
 
         try:
-            parsed_url = urlparse(self.db_url)
-            remote_host = parsed_url.hostname or "localhost"
-            remote_port = parsed_url.port or (5432 if "postgres" in self.db_url else 3306)
+            from axiom.core.cleansing import safe_db_urlparse
+            parsed = safe_db_urlparse(self.db_url)
+            remote_host = parsed["hostname"] or "localhost"
+            remote_port = parsed["port"] or (5432 if "postgres" in self.db_url else 3306)
 
             ssh_host = ssh_config.get("host")
             ssh_port = int(ssh_config.get("port", 22))
@@ -75,9 +106,14 @@ class BaseConnector(ABC):
             await asyncio.to_thread(self._ssh_tunnel.start)
 
             # Rewrite URL to use the local tunnel port
+            from urllib.parse import quote
             local_port = self._ssh_tunnel.local_bind_port
-            netloc = f"{parsed_url.username}:{parsed_url.password}@127.0.0.1:{local_port}"
-            new_url = urlunparse(parsed_url._replace(netloc=netloc))
+            
+            user = parsed["username"]
+            pwd = parsed["password"]
+            user_part = f"{quote(user)}:{quote(pwd)}@" if user and pwd else f"{quote(user)}@" if user else ""
+            
+            new_url = f"{parsed['scheme']}://{user_part}127.0.0.1:{local_port}{parsed['path']}"
             
             logger.info(f"SSH tunnel started. Local port: {local_port}")
             return new_url

@@ -4,9 +4,9 @@ import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { 
   Database, Plus, Loader2, AlertCircle, Check, 
-  Terminal, Activity, Trash2, Globe, Server, Shield, Edit, RefreshCw, Code
+  Terminal, Trash2, Server, Shield, Edit, RefreshCw, Code, Mail
 } from "lucide-react";
-import { fetchSources, onboardSource, deleteSource, updateSource, syncSource } from "../../lib/api";
+import { fetchSources, onboardSource, deleteSource, updateSource, syncSource, fetchOAuthUrl } from "../../lib/api";
 import { Source, SourceIn } from "../../types";
 import { createClient } from "@/lib/supabase/client";
 
@@ -126,8 +126,8 @@ export default function DataSourcesPage() {
 
     try {
       let finalUrl = formData.db_url;
-      if (formData.db_type === 'mcp' && !finalUrl.startsWith('mcp://')) {
-        finalUrl = 'mcp://' + finalUrl;
+      if (formData.db_type === 'gmail') {
+        finalUrl = formData.db_url || 'gmail://oauth';
       }
 
       // Prepare config
@@ -306,7 +306,111 @@ export default function DataSourcesPage() {
               </div>
 
               <form onSubmit={handleSubmit} className="space-y-6">
-                <div className="grid grid-cols-2 gap-6">
+                <div className="space-y-6 mb-8">
+                  <div>
+                    <label className="text-[11px] font-mono text-[#E6E1D8]/50 uppercase tracking-widest block ml-1 mb-3">
+                      Databases
+                    </label>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                      {[
+                        { id: "postgresql", name: "PostgreSQL", desc: "Direct DB Connection", iconUrl: "https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/postgresql/postgresql-original.svg" },
+                        { id: "mysql", name: "MySQL", desc: "Direct DB Connection", iconUrl: "https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/mysql/mysql-original.svg" },
+                        { id: "mongodb", name: "MongoDB", desc: "Document Database", iconUrl: "https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/mongodb/mongodb-original.svg", disabled: false }
+                      ].map((type) => {
+                        const Icon = type.icon;
+                        const isSelected = formData.db_type === type.id;
+                        return (
+                          <div
+                            key={type.id}
+                            onClick={() => !type.disabled && setFormData({...formData, db_type: type.id})}
+                            className={`relative p-4 rounded-xl border transition-all duration-200 flex flex-col items-center text-center gap-3 ${
+                              type.disabled 
+                                ? "opacity-50 cursor-not-allowed bg-[#1E1E1C] border-white/5" 
+                                : isSelected
+                                  ? "bg-[#638A70]/10 border-[#638A70] shadow-[0_0_15px_rgba(99,138,112,0.15)] cursor-pointer"
+                                  : "bg-[#1E1E1C] border-[rgba(255,255,255,0.05)] hover:border-[#638A70]/50 cursor-pointer"
+                            }`}
+                          >
+                            <div className={`w-12 h-12 rounded-full flex items-center justify-center ${
+                              isSelected ? "bg-[#638A70]/20 text-[#638A70]" : "bg-[#2A2927] text-[#E6E1D8]/50"
+                            }`}>
+                              {type.iconUrl ? (
+                                <img src={type.iconUrl} alt={type.name} className="w-7 h-7 object-contain" />
+                              ) : Icon ? (
+                                <Icon className="w-6 h-6" />
+                              ) : null}
+                            </div>
+                            <div>
+                              <div className={`font-semibold ${isSelected ? "text-[#638A70]" : "text-[#E6E1D8]"}`}>
+                                {type.name}
+                              </div>
+                              <div className="text-[10px] text-[#E6E1D8]/40 mt-1">
+                                {type.desc}
+                              </div>
+                            </div>
+                            {isSelected && (
+                              <div className="absolute top-3 right-3 text-[#638A70]">
+                                <Check className="w-4 h-4" />
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="text-[11px] font-mono text-[#E6E1D8]/50 uppercase tracking-widest block ml-1 mb-3">
+                      App Adapters (MCP)
+                    </label>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                      {[
+                        { id: "gmail", name: "Gmail Adapter", desc: "OAuth 2.0 Flow", iconUrl: "https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/google/google-original.svg", disabled: false },
+                      ].map((type) => {
+                        const Icon = (type as any).icon;
+                        const isSelected = formData.db_type === type.id;
+                        return (
+                          <div
+                            key={type.id}
+                            onClick={() => !type.disabled && setFormData({...formData, db_type: type.id})}
+                            className={`relative p-4 rounded-xl border transition-all duration-200 flex flex-col items-center text-center gap-3 ${
+                              type.disabled 
+                                ? "opacity-50 cursor-not-allowed bg-[#1E1E1C] border-white/5" 
+                                : isSelected
+                                  ? "bg-[#638A70]/10 border-[#638A70] shadow-[0_0_15px_rgba(99,138,112,0.15)] cursor-pointer"
+                                  : "bg-[#1E1E1C] border-[rgba(255,255,255,0.05)] hover:border-[#638A70]/50 cursor-pointer"
+                            }`}
+                          >
+                            <div className={`w-12 h-12 rounded-full flex items-center justify-center ${
+                              isSelected ? "bg-[#638A70]/20 text-[#638A70]" : "bg-[#2A2927] text-[#E6E1D8]/50"
+                            }`}>
+                              {type.iconUrl ? (
+                                <img src={type.iconUrl} alt={type.name} className="w-6 h-6 object-contain" />
+                              ) : Icon ? (
+                                <Icon className="w-6 h-6" />
+                              ) : null}
+                            </div>
+                            <div>
+                              <div className={`font-semibold ${isSelected ? "text-[#638A70]" : "text-[#E6E1D8]"}`}>
+                                {type.name}
+                              </div>
+                              <div className="text-[10px] text-[#E6E1D8]/40 mt-1">
+                                {type.desc}
+                              </div>
+                            </div>
+                            {isSelected && (
+                              <div className="absolute top-3 right-3 text-[#638A70]">
+                                <Check className="w-4 h-4" />
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                   <div className="space-y-2">
                     <label className="text-[11px] font-mono text-[#E6E1D8]/50 uppercase tracking-widest block ml-1">
                       Source Identifier
@@ -314,42 +418,64 @@ export default function DataSourcesPage() {
                     <input 
                       required
                       disabled={!!editingSourceId}
-                      placeholder="e.g. sales_db"
+                      placeholder={formData.db_type === 'gmail' ? "e.g. primary_gmail" : "e.g. sales_db"}
                       className="w-full bg-[#1E1E1C] border border-[rgba(255,255,255,0.05)] rounded-lg px-4 py-3 text-[#E6E1D8] focus:border-[#638A70]/50 outline-none transition-all shadow-inner disabled:opacity-50 disabled:cursor-not-allowed"
                       value={formData.source_id}
                       onChange={e => setFormData({...formData, source_id: e.target.value})}
                     />
                   </div>
-                  <div className="space-y-2">
-                    <label className="text-[11px] font-mono text-[#E6E1D8]/50 uppercase tracking-widest block ml-1">
-                      Database Type
-                    </label>
-                    <select 
-                      className="w-full bg-[#1E1E1C] border border-[rgba(255,255,255,0.05)] rounded-lg px-4 py-3 text-[#E6E1D8] focus:border-[#638A70]/50 outline-none transition-all shadow-inner appearance-none cursor-pointer"
-                      value={formData.db_type}
-                      onChange={e => setFormData({...formData, db_type: e.target.value})}
-                    >
-                      <option value="postgresql">PostgreSQL (Direct)</option>
-                      <option value="mysql">MySQL (Direct)</option>
-                      <option value="mcp">Universal MCP Adapter</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div className="space-y-2">
-                  <label className="text-[11px] font-mono text-[#E6E1D8]/50 uppercase tracking-widest block ml-1">
-                    Connection URL / Command
-                  </label>
-                  <div className="relative">
-                    <input 
-                      required
-                      placeholder={formData.db_type === 'mcp' ? "npx -y @modelcontextprotocol/server-postgres" : "postgresql://user:pass@localhost:5432/dbname"}
-                      className="w-full bg-[#1E1E1C] border border-[rgba(255,255,255,0.05)] rounded-lg px-4 py-3 pl-11 text-[#E6E1D8] focus:border-[#638A70]/50 outline-none transition-all shadow-inner font-mono text-sm"
-                      value={formData.db_url}
-                      onChange={e => setFormData({...formData, db_url: e.target.value})}
-                    />
-                    <Terminal className="w-4 h-4 absolute left-4 top-1/2 -translate-y-1/2 text-[#638A70]/50" />
-                  </div>
+                  {formData.db_type !== 'gmail' ? (
+                    <div className="space-y-2">
+                      <label className="text-[11px] font-mono text-[#E6E1D8]/50 uppercase tracking-widest block ml-1">
+                        Connection URL
+                      </label>
+                      <div className="relative">
+                        <input 
+                          required
+                          placeholder="postgresql://user:pass@localhost:5432/dbname"
+                          className="w-full bg-[#1E1E1C] border border-[rgba(255,255,255,0.05)] rounded-lg px-4 py-3 pl-11 text-[#E6E1D8] focus:border-[#638A70]/50 outline-none transition-all shadow-inner font-mono text-sm"
+                          value={formData.db_url}
+                          onChange={e => setFormData({...formData, db_url: e.target.value})}
+                        />
+                        <Terminal className="w-4 h-4 absolute left-4 top-1/2 -translate-y-1/2 text-[#638A70]/50" />
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      <label className="text-[11px] font-mono text-[#E6E1D8]/50 uppercase tracking-widest block ml-1">
+                        Authentication
+                      </label>
+                      <div className="w-full bg-[rgba(99,138,112,0.05)] border border-[#638A70]/20 rounded-lg px-4 py-3 flex items-center justify-between">
+                        <span className="text-sm text-[#E6E1D8]/80">Connect with Google Workspace</span>
+                        <button 
+                          type="button"
+                          disabled={isLoading}
+                          onClick={async () => {
+                            if (!formData.source_id) {
+                              setError("Please enter a Source Identifier before starting OAuth.");
+                              return;
+                            }
+                            try {
+                              setIsLoading(true);
+                              setError(null);
+                              const res = await fetchOAuthUrl({
+                                connector: "gmail",
+                                tenant_id: tenantId!,
+                                source_id: formData.source_id
+                              });
+                              window.location.href = res.url;
+                            } catch (err: any) {
+                              setError(err.message || "Failed to generate OAuth URL.");
+                              setIsLoading(false);
+                            }
+                          }}
+                          className="bg-[#638A70] text-[#1E1E1C] text-xs font-semibold px-3 py-1.5 rounded cursor-pointer hover:bg-[#729E81] transition-colors shadow-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          {isLoading ? "Starting..." : "OAuth Flow →"}
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 <div className="space-y-2">
@@ -424,23 +550,6 @@ export default function DataSourcesPage() {
                         </div>
                       </div>
                     )}
-                  </div>
-                )}
-
-                {formData.db_type === 'mcp' && (
-                  <div className="space-y-2">
-                    <label className="text-[11px] font-mono text-[#E6E1D8]/50 uppercase tracking-widest block ml-1">
-                      Advanced Configuration (JSON)
-                    </label>
-                    <textarea 
-                      placeholder='{ "env": { "SNOWFLAKE_ACCOUNT": "..." } }'
-                      className="w-full bg-[#1E1E1C] border border-[rgba(255,255,255,0.05)] rounded-lg px-4 py-3 text-[#E6E1D8] focus:border-[#638A70]/50 outline-none transition-all shadow-inner h-32 font-mono text-xs resize-none"
-                      value={formData.config_json}
-                      onChange={e => setFormData({...formData, config_json: e.target.value})}
-                    />
-                    <p className="text-[10px] text-[#E6E1D8]/30 ml-1">
-                      Optional JSON to pass to the MCP server (e.g., env variables, tool maps).
-                    </p>
                   </div>
                 )}
 
@@ -649,7 +758,17 @@ export default function DataSourcesPage() {
 
                     <div className="flex items-start gap-4 mb-6">
                       <div className="w-12 h-12 rounded-lg bg-[#1E1E1C] flex items-center justify-center text-[#638A70] border border-[rgba(255,255,255,0.05)] shadow-inner">
-                        {source.db_type === 'mcp' ? <Globe className="w-6 h-6" /> : <Database className="w-6 h-6" />}
+                        {source.db_type === 'postgresql' ? (
+                          <img src="https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/postgresql/postgresql-original.svg" className="w-6 h-6" alt="PostgreSQL" />
+                        ) : source.db_type === 'mysql' ? (
+                          <img src="https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/mysql/mysql-original.svg" className="w-6 h-6" alt="MySQL" />
+                        ) : source.db_type === 'mongodb' ? (
+                          <img src="https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/mongodb/mongodb-original.svg" className="w-6 h-6" alt="MongoDB" />
+                        ) : source.db_type === 'gmail' ? (
+                          <img src="https://cdn.jsdelivr.net/gh/devicons/devicon@latest/icons/google/google-original.svg" className="w-6 h-6" alt="Gmail" />
+                        ) : (
+                          <Database className="w-6 h-6" />
+                        )}
                       </div>
                       <div className="flex-1">
                         <div className="flex items-center justify-between">

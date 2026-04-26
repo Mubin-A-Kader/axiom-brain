@@ -1,5 +1,8 @@
 import {
   ApproveRequest,
+  LakeIn,
+  LakeOut,
+  LakeSource,
   NotebookArtifact,
   NotebookDocument,
   QueryRequest,
@@ -40,6 +43,7 @@ export async function askQuestion(req: QueryRequest): Promise<QueryResponse> {
       thread_id: req.thread_id || "",
       tenant_id: req.tenant_id || "default_tenant",
       source_id: req.source_id,
+      lake_id: req.lake_id,
       model: req.model,
     }),
   });
@@ -70,6 +74,7 @@ export async function askQuestionStream(
       thread_id: req.thread_id || "",
       tenant_id: req.tenant_id || "default_tenant",
       source_id: req.source_id,
+      lake_id: req.lake_id,
       model: req.model,
     }),
   });
@@ -311,4 +316,83 @@ export async function sendFeedback(data: {
   if (!response.ok) {
     throw new Error("Failed to send feedback");
   }
+}
+
+// ── Data Lake (Multi-lake support) ──────────────────────────────────────────
+
+export async function fetchLakes(tenantId: string): Promise<LakeOut[]> {
+  const headers = await getAuthHeaders();
+  const res = await fetch(`${API_URL}/api/lakes/${tenantId}`, { headers });
+  if (!res.ok) throw new Error("Failed to fetch lakes");
+  return res.json();
+}
+
+export async function createLake(tenantId: string, data: LakeIn): Promise<LakeOut> {
+  const headers = await getAuthHeaders();
+  const res = await fetch(`${API_URL}/api/lakes/${tenantId}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error("Failed to create lake");
+  return res.json();
+}
+
+export async function deleteLake(tenantId: string, lakeId: string): Promise<void> {
+  const headers = await getAuthHeaders();
+  const res = await fetch(`${API_URL}/api/lakes/${tenantId}/${lakeId}`, {
+    method: "DELETE",
+    headers,
+  });
+  if (!res.ok) throw new Error("Failed to delete lake");
+}
+
+export async function fetchLakeSources(lakeId: string): Promise<{ sources: any[] }> {
+  const headers = await getAuthHeaders();
+  const res = await fetch(`${API_URL}/api/lake-sources/${lakeId}`, { headers });
+  if (!res.ok) throw new Error("Failed to fetch lake sources");
+  return res.json();
+}
+
+export async function addSourceToLake(lakeId: string, sourceId: string): Promise<{ status: string }> {
+  const headers = await getAuthHeaders();
+  const res = await fetch(`${API_URL}/api/lake-sources/${lakeId}/${sourceId}`, {
+    method: "POST",
+    headers,
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || "Failed to add source to lake");
+  }
+  return res.json();
+}
+
+export async function removeSourceFromLake(lakeId: string, sourceId: string): Promise<{ status: string }> {
+  const headers = await getAuthHeaders();
+  const res = await fetch(`${API_URL}/api/lake-sources/${lakeId}/${sourceId}`, {
+    method: "DELETE",
+    headers,
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || "Failed to remove source from lake");
+  }
+  return res.json();
+}
+
+export async function fetchOAuthUrl(data: { connector: string, tenant_id: string, source_id: string }): Promise<{ url: string }> {
+  const headers = await getAuthHeaders();
+  const response = await fetch(`${API_URL}/api/oauth/url`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(data),
+  });
+
+  if (!response.ok) {
+    if (response.status === 401) throw new Error("Unauthorized. Please log in again.");
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.detail || "Failed to generate OAuth URL");
+  }
+
+  return response.json();
 }

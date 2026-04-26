@@ -34,12 +34,12 @@ export function AxiomArtifacts({ message, onActionClick }: AxiomArtifactsProps) 
           )}
           
           {hasResult && (
-            <div className="space-y-4">
-               <div className="flex items-center gap-3 px-2">
-                 <div className="w-1.5 h-1.5 rounded-full bg-[#638A70]" />
-                 <h3 className="text-[10px] font-mono font-bold text-[#E6E1D8]/30 uppercase tracking-[0.2em]">Source Records</h3>
+            <div className="space-y-6">
+               <div className="flex items-center gap-4 px-4">
+                 <div className="w-2 h-2 rounded-full bg-[#638A70] shadow-[0_0_10px_rgba(99,138,112,0.5)]" />
+                 <h3 className="text-xs font-mono font-bold text-[#638A70] uppercase tracking-[0.3em]">Source Intelligence Records</h3>
                </div>
-               <div className="bg-[#1E1E1C] border border-white/5 rounded-xl overflow-hidden shadow-xl">
+               <div className="bg-[#1E1E1C] border border-white/5 rounded-2xl overflow-hidden shadow-2xl">
                  <DataTable 
                    result={message.metadata.result} 
                    actionBar={message.metadata.action_bar}

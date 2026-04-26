@@ -114,6 +114,8 @@ services:
       LAKERA_API_KEY: ${LAKERA_API_KEY:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       TEMPORAL_URL: temporal:7233
+      GMAIL_CLIENT_ID: ${GMAIL_CLIENT_ID:-}
+      GMAIL_CLIENT_SECRET: ${GMAIL_CLIENT_SECRET:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -141,6 +143,43 @@ services:
       AXIOM_ARTIFACT_ROOT: /tmp/axiom-artifacts
     mem_limit: 1g
     cpus: 1.0
+
+  # Temporal worker — runs the execution-phase activities (execute_sql, critic,
+  # discovery, notebook, synthesize) with durable retries and execution logs.
+  temporal-worker:
+    build:
+      context: .
+      target: runtime
+    command: ["python", "-m", "axiom.agent.temporal.worker"]
+    volumes:
+      - ./src:/app/src
+      - axiom_artifacts:/tmp/axiom-artifacts
+    environment:
+      DATABASE_URL: postgresql://axiom:${POSTGRES_PASSWORD:-axiom}@postgres:5432/axiomdb?search_path=auth,public
+      REDIS_URL: redis://redis:6379
+      LITELLM_URL: http://litellm:8000
+      LLM_MODEL: ${LLM_MODEL:-gemini-2.5-flash}
+      CHROMA_URL: http://chromadb:8000
+      CHROMA_TOKEN: ${CHROMA_TOKEN:-secret-chroma-token}
+      ARTIFACT_ROOT: /tmp/axiom-artifacts
+      TEMPORAL_URL: temporal:7233
+      LAKERA_API_KEY: ${LAKERA_API_KEY:-}
+      NOTEBOOK_EXECUTOR_URL: http://notebook-executor:8090
+      NOTEBOOK_EXECUTION_TIMEOUT: ${NOTEBOOK_EXECUTION_TIMEOUT:-60}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      chromadb:
+        condition: service_started
+      litellm:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+      notebook-executor:
+        condition: service_started
+    restart: on-failure
 
   # --- Temporal.io Infrastructure ---
   temporal:

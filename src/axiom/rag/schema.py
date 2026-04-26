@@ -208,12 +208,26 @@ class SchemaRAG:
         if not tables:
             return "No schema context found."
             
-        related: set[str] = set(tables)
         graph = self._ensure_graph_loaded(tenant_id, source_id)
+        
+        # Resolve table names: if 'users' is requested, but graph has 'public.users', use 'public.users'
+        resolved_tables = []
+        for t in tables:
+            if t in graph:
+                resolved_tables.append(t)
+            else:
+                # Try finding a node that ends with .t or is exactly t
+                match = next((n for n in graph.nodes if n.endswith(f".{t}") or n.lower() == t.lower()), None)
+                if match:
+                    resolved_tables.append(match)
+                else:
+                    resolved_tables.append(t) # Keep original just in case
+                    
+        related: set[str] = set(resolved_tables)
         
         # Priority 1: Exact tables
         # Priority 2: Direct neighbors
-        for t in tables:
+        for t in resolved_tables:
             if t in graph:
                 related.update(nx.neighbors(graph, t))
 
@@ -224,7 +238,7 @@ class SchemaRAG:
         if related:
             # We want to process tables in 'related' such that the explicitly selected tables come first
             # to ensure they are included if we hit token limits.
-            ordered_related = tables + [t for t in related if t not in tables]
+            ordered_related = resolved_tables + [t for t in related if t not in resolved_tables]
             
             for table in ordered_related:
                 table_id = f"{tenant_id}_{source_id}_{table}"

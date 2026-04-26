@@ -22,9 +22,18 @@ class PostgresConnector(BaseConnector):
             # 1. Start SSH tunnel if configured
             effective_url = await self._start_ssh_tunnel()
             
-            # 2. Create the pool using the (possibly rewritten) URL
+            # 2. Parse and unquote components to handle hyphens/special chars
+            from axiom.core.cleansing import safe_db_urlparse
+            from urllib.parse import unquote
+            p = safe_db_urlparse(effective_url)
+            
+            # Create the pool using explicit args to be more robust than just passing the URL string
             self._pool = await asyncpg.create_pool(
-                effective_url,
+                user=unquote(p["username"]) if p["username"] else None,
+                password=unquote(p["password"]) if p["password"] else None,
+                database=unquote(p["path"].lstrip('/')) if p["path"] else None,
+                host=p["hostname"],
+                port=p["port"] or 5432,
                 min_size=self.config.get("min_pool_size", 1),
                 max_size=self.config.get("max_pool_size", 10)
             )

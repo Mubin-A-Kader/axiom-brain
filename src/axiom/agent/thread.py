@@ -11,7 +11,7 @@ from axiom.config import settings
 logger = logging.getLogger(__name__)
 
 
-class Turn(TypedDict):
+class Turn(TypedDict, total=False):
     timestamp: float
     question: str
     sql: str
@@ -19,6 +19,9 @@ class Turn(TypedDict):
     active_filters: list[str]
     verified_joins: list[str]
     error_log: list[str]
+    artifact: dict[str, Any]
+    insight: str
+    thought: str
 
 
 class ThreadManager:
@@ -58,6 +61,9 @@ class ThreadManager:
                     "active_filters": t.get("active_filters", []),
                     "verified_joins": t.get("verified_joins", []),
                     "error_log": t.get("error_log", []),
+                    "artifact": t.get("artifact", None),
+                    "insight": t.get("insight", ""),
+                    "thought": t.get("thought", "")
                 }
                 for t in turns if isinstance(t, dict)
             ]
@@ -92,22 +98,32 @@ class ThreadManager:
         token_count = len(schema_context) // 4
 
         for turn in history[-self._history_size :]:
-            # Include a snippet of the result to help resolve entity IDs/names
+            q = turn.get("question", "")
+            sql = turn.get("sql", "")
+            insight = turn.get("insight", "")
             res_val = turn.get("result", "")
             if len(res_val) > 200:
                 res_val = res_val[:200] + "..."
-            
-            turn_text = f"Q: {turn['question']}\nSQL: {turn['sql']}\nResult: {res_val}\n"
+
+            # Estimate tokens before committing
+            turn_text = f"Q: {q}\n"
+            if sql:
+                turn_text += f"SQL: {sql}\nResult: {res_val}\n"
+            if insight:
+                turn_text += f"Answer: {insight[:400]}\n"
             turn_tokens = len(turn_text) // 4
             token_count += turn_tokens
 
-            # Stop adding if we exceed 80% of typical context
             if token_count > int(128000 * self._token_limit):
                 context_lines.append("[... history truncated due to token limit ...]")
                 break
-            context_lines.append(f"Q: {turn['question']}")
-            context_lines.append(f"SQL: {turn['sql']}")
-            context_lines.append(f"Result: {res_val}")
+
+            context_lines.append(f"Q: {q}")
+            if sql:
+                context_lines.append(f"SQL: {sql}")
+                context_lines.append(f"Result: {res_val}")
+            if insight:
+                context_lines.append(f"Answer: {insight[:400]}")
 
         context = "\n".join(context_lines)
         return context, is_stale
@@ -124,8 +140,11 @@ class ThreadManager:
         error_log: list[str] | None = None,
         llm_model: str | None = None,
         source_id: str | None = None,
+        artifact: dict[str, Any] | None = None,
+        insight: str = "",
+        thought: str = "",
     ) -> None:
-        """Save a conversation turn to Redis with 24h TTL."""
+        """Save a conversation turn to Redis with 24h TTL. Updates last turn if question matches."""
         client = await self._get_client()
         key = f"axiom:thread:{thread_id}"
 
@@ -152,8 +171,26 @@ class ThreadManager:
             "active_filters": active_filters or [],
             "verified_joins": verified_joins or [],
             "error_log": error_log or [],
+            "artifact": artifact,
+            "insight": insight,
+            "thought": thought,
         }
-        history.append(turn)
+        
+        # If the last turn has the exact same question, we are probably updating it 
+        # (e.g. adding the artifact after execution) rather than creating a duplicate
+        if history and history[-1].get("question") == question:
+             # Merge existing artifact if we aren't providing a new one, otherwise overwrite
+             if not artifact and history[-1].get("artifact"):
+                 turn["artifact"] = history[-1]["artifact"]
+             # Merge existing insight/thought if new ones are blank
+             if not insight and history[-1].get("insight"):
+                 turn["insight"] = history[-1]["insight"]
+             if not thought and history[-1].get("thought"):
+                 turn["thought"] = history[-1]["thought"]
+             history[-1] = turn
+        else:
+             history.append(turn)
+             
         history = history[-self._history_size :]
 
         data = json.dumps({

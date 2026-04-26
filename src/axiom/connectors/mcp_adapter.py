@@ -28,6 +28,14 @@ class MCPConnector(BaseConnector):
     def dialect_name(self) -> str:
         return "postgres" 
 
+    @property
+    def llm_prompt_instructions(self) -> str:
+        return """
+    - SCHEMA QUALIFICATION (STRICT): Always use the fully qualified table name as shown in the SCHEMA CONTEXT.
+    - STRICT QUOTING RULE: You MUST enclose any column or table name that contains an uppercase letter in double quotes.
+    - For partial text searches on string columns, ALWAYS use `ILIKE '%<text>%'` for case-insensitive search.
+        """.strip()
+
     async def connect(self) -> None:
         if self._session:
             return

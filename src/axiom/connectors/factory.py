@@ -11,7 +11,7 @@ class ConnectorFactory:
     
     _connectors: Dict[str, BaseConnector] = OrderedDict()
     _registry: Dict[str, Type[BaseConnector]] = {}
-    MAX_CONNECTORS = 20  # LRU limit for active connectors/pools
+    MAX_CONNECTORS = 100  # LRU limit — raised for 100-site MongoDB deployments
 
     @classmethod
     def register(cls, db_type: str, connector_class: Type[BaseConnector]):
@@ -68,10 +68,34 @@ class ConnectorFactory:
             logger.warning("MySQL dependencies not found. MySQLConnector disabled.")
 
         try:
+            from axiom.connectors.direct.mongodb import MongoDBConnector
+            cls.register("mongodb", MongoDBConnector)
+        except ImportError:
+            logger.warning("MongoDB dependencies not found (motor). MongoDBConnector disabled.")
+
+        try:
             from axiom.connectors.mcp_adapter import MCPConnector
             cls.register("mcp", MCPConnector)
         except ImportError:
             logger.warning("MCP dependencies not found. MCPConnector disabled.")
+
+    @classmethod
+    async def get_query_mode(cls, db_type: str) -> "QueryMode | None":
+        """
+        Return the QueryMode for *db_type*, or None if it is not a registered
+        database connector (e.g. it is an app/OAuth connector like 'gmail').
+
+        This is the canonical way to decide whether a data source belongs in the
+        SQL/pipeline lake worker path vs. the app tool-use path.
+        Adding a new connector only requires registering it here — no other
+        routing changes are needed.
+        """
+        from axiom.connectors.base import QueryMode
+        if db_type not in cls._registry:
+            await cls._lazy_load_registry()
+        if db_type not in cls._registry:
+            return None          # unregistered = app connector, not a DB connector
+        return cls._registry[db_type].query_mode
 
     @classmethod
     async def get_dialect_info(cls, db_type: str) -> tuple[str, str]:

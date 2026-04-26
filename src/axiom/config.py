@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     max_correction_attempts: int = 5
     max_schema_tokens: int = 4000
 
+    # Data Lake fan-out
+    lake_max_concurrent_workers: int = 5
+    lake_worker_timeout_secs: int = 30
+
+    # App connectors
+    connector_master_key: str = "change-me-in-production-32-chars!!"
+
     # App
     log_level: str = "info"
 

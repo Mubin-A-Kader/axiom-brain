@@ -1,237 +1,273 @@
 import json
-import logging
-from typing import Any, Dict, List
+import re
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
-import numpy as np
-import pandas as pd
-from pydantic import BaseModel
+def safe_db_urlparse(url: str) -> Dict[str, Any]:
+    """
+    A more robust URL parser for database connection strings.
+    Handles special characters in passwords (like brackets) that crash urllib.parse.
+    
+    Returns a dict with: scheme, username, password, hostname, port, path
+    """
+    # Regex to extract: scheme://[user[:password]@]host[:port][/path]
+    # We use a non-greedy match for everything before the first / after the scheme
+    regex = r"^(?P<scheme>[^:]+)://(?:(?P<user>[^:@/]+)(?::(?P<password>[^@/]+))?@)?(?P<host>[^:/]+)(?::(?P<port>\d+))?(?P<path>/.*)?$"
+    
+    match = re.match(regex, url)
+    if not match:
+        # Fallback to a very basic split if regex fails
+        try:
+            scheme, rest = url.split("://", 1)
+            path = ""
+            if "/" in rest:
+                rest, path = rest.split("/", 1)
+                path = "/" + path
+            
+            user_pass = ""
+            host_port = rest
+            if "@" in rest:
+                user_pass, host_port = rest.rsplit("@", 1)
+            
+            username = ""
+            password = ""
+            if ":" in user_pass:
+                username, password = user_pass.split(":", 1)
+            else:
+                username = user_pass
+                
+            hostname = host_port
+            port = None
+            if ":" in host_port:
+                hostname, port_str = host_port.rsplit(":", 1)
+                try:
+                    port = int(port_str)
+                except ValueError:
+                    hostname = host_port # colon was part of host (IPv6?)
+            
+            return {
+                "scheme": scheme,
+                "username": username or None,
+                "password": password or None,
+                "hostname": hostname,
+                "port": port,
+                "path": path
+            }
+        except Exception:
+            raise ValueError(f"Could not parse database URL: {url}")
 
-logger = logging.getLogger(__name__)
+    d = match.groupdict()
+    return {
+        "scheme": d["scheme"],
+        "username": d["user"],
+        "password": d["password"],
+        "hostname": d["host"],
+        "port": int(d["port"]) if d["port"] else None,
+        "path": d["path"] or ""
+    }
 
-class Metadata(BaseModel):
+
+# ---------------------------------------------------------------------------
+# MLGradeInterceptor
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CleaningMetadata:
     row_count_original: int
     row_count_cleaned: int
     anomaly_detected: bool
-    summary_stats: Dict[str, Dict[str, Any]]
+    anomalous_columns: List[str]
+    summary_stats: Dict[str, Any]
 
-class BusinessAnalystResponse(BaseModel):
-    data: List[Dict[str, Any]]
-    metadata: Metadata
-    frontend_json: str
-    action_bar: List[str] = []
+
+@dataclass
+class CleanedResponse:
+    """Returned by MLGradeInterceptor.process()."""
+    data: List[Dict[str, Any]]          # cleaned rows as list-of-dicts
+    metadata: CleaningMetadata
+    frontend_json: str                   # JSON string ready for the DataTable component
+    action_bar: List[str]                # suggested next actions for the UI
+
 
 class MLGradeInterceptor:
-    def __init__(self) -> None:
-        pass
+    """
+    Lightweight data-cleaning pipeline for SQL result payloads.
 
-    def process(self, raw_json: str, anomaly_method: str = "iqr") -> BusinessAnalystResponse:
+    Converts the raw {"columns": [...], "rows": [[...]]} wire format into
+    list-of-dicts, optionally flags IQR outliers in numeric columns, and
+    computes summary statistics that the ResponseSynthesizerNode embeds in
+    its LLM prompt.
+    """
+
+    # Columns that contain identifiers / timestamps — skip stats for these
+    _SKIP_STAT_PATTERNS = re.compile(
+        r"(id|uuid|key|token|hash|created|updated|timestamp|date|time)$",
+        re.IGNORECASE,
+    )
+
+    def process(
+        self,
+        sql_result_json: str,
+        anomaly_method: str = "iqr",
+    ) -> CleanedResponse:
         """
-        Process the raw JSON result from SQL execution into cleaned tabular data.
-        
-        Steps:
-        A. Deduplication & Integrity
-        B. Categorical Normalization
-        C. Outlier & Anomaly Detection
-        D. Unit & Temporal Standardization
-        E. Smart Action Suggestions
+        Parse *sql_result_json*, clean rows, compute metadata.
+
+        Args:
+            sql_result_json: JSON string with keys "columns" and "rows".
+            anomaly_method:  "iqr" (default) flags rows where any numeric
+                             column value is outside [Q1 - 1.5*IQR, Q3 + 1.5*IQR].
+                             Any other value disables outlier detection.
         """
-        if not raw_json:
-            return BusinessAnalystResponse(
-                data=[],
-                metadata=Metadata(row_count_original=0, row_count_cleaned=0, anomaly_detected=False, summary_stats={}),
-                frontend_json="{}",
-                action_bar=[]
-            )
-        
         try:
-            result_dict = json.loads(raw_json)
-        except json.JSONDecodeError:
-            logger.error("Failed to parse raw_json into dict")
-            return BusinessAnalystResponse(
-                data=[],
-                metadata=Metadata(row_count_original=0, row_count_cleaned=0, anomaly_detected=False, summary_stats={}),
-                frontend_json="{}",
-                action_bar=[]
-            )
+            raw = json.loads(sql_result_json) if sql_result_json else {}
+        except (json.JSONDecodeError, TypeError):
+            raw = {}
 
-        rows = result_dict.get("rows", [])
-        columns = result_dict.get("columns", [])
-        
-        if not rows or not columns:
-            return BusinessAnalystResponse(
-                data=[],
-                metadata=Metadata(row_count_original=0, row_count_cleaned=0, anomaly_detected=False, summary_stats={}),
-                frontend_json="{}",
-                action_bar=[]
-            )
+        columns: List[str] = raw.get("columns") or []
+        rows: List = raw.get("rows") or []
+        total_count: int = raw.get("total_count", len(rows))
+        is_lake_result: bool = raw.get("is_lake_result", False)
 
-        row_count_original = len(rows)
-        
-        # Convert to DataFrame
-        df = pd.DataFrame(rows, columns=columns)
-        
-        # A. Deduplication & Integrity
-        try:
-            df = df.drop_duplicates()
-        except (TypeError, ValueError):
-            # Fallback for unhashable types (e.g. lists, dicts) in the DataFrame
-            # We use a string representation mask for deduplication
-            try:
-                df = df[~df.astype(str).duplicated()]
-            except Exception as e:
-                logger.warning(f"Deduplication failed even with string conversion: {e}")
-        
-        # Handle missing values
-        for col in df.columns:
-            if pd.api.types.is_numeric_dtype(df[col]) and not pd.api.types.is_bool_dtype(df[col]):
-                df[col] = df[col].replace([np.inf, -np.inf], np.nan)
-                df[col] = df[col].fillna(0)
-            else:
-                df[col] = df[col].fillna("missing")
+        # Normalise every row to a dict
+        dicts: List[Dict[str, Any]] = []
+        for row in rows:
+            if isinstance(row, dict):
+                dicts.append(row)
+            elif isinstance(row, (list, tuple)) and columns:
+                dicts.append({columns[i]: v for i, v in enumerate(row) if i < len(columns)})
+            # rows of unknown shape are dropped
 
-        # B. Categorical Normalization
-        for col in df.columns:
-            if pd.api.types.is_string_dtype(df[col]) or pd.api.types.is_object_dtype(df[col]):
-                try:
-                    # Only capitalize strings, ignore other types that might be objects
-                    df[col] = df[col].apply(lambda x: str(x).strip().capitalize() if isinstance(x, str) and x != "missing" else x)
-                except Exception:
-                    pass
+        row_count_original = len(dicts)
 
-        # Rename columns to Human Readable Title Case
-        def rename_col(col_name: str) -> str:
-            return col_name.replace("_", " ").title()
-            
-        df.rename(columns={col: rename_col(col) for col in df.columns}, inplace=True)
-        
-        # E. Aggressive ID & UUID Stripping (The "Ghost ID" Killer)
-        import re
-        UUID_REGEX = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
-        
-        cols_to_drop = []
-        for col in df.columns:
-            lower_col = col.lower()
-            # 1. Column Name Match
-            if lower_col in ["id", "uuid", "guid", "pk", "fk", "file key", "embedding key"] or \
-               lower_col.endswith(" id") or lower_col.endswith(" key") or lower_col.endswith("_id"):
-                cols_to_drop.append(col)
-                continue
-            
-            # 2. Value Pattern Match (Check first 3 rows for UUID patterns)
-            sample_values = df[col].dropna().head(3).astype(str).tolist()
-            if any(UUID_REGEX.match(val) for val in sample_values):
-                logger.info(f"Dropping column {col} due to UUID pattern detection.")
-                cols_to_drop.append(col)
-                
-        # Only drop if it doesn't leave the DataFrame empty
-        if len(cols_to_drop) < len(df.columns):
-            df.drop(columns=cols_to_drop, inplace=True)
-        elif len(cols_to_drop) == len(df.columns) and len(df.columns) > 1:
-            # Keep at least one column if all were IDs (last resort)
-            df.drop(columns=cols_to_drop[:-1], inplace=True)
-        
-        # C. Outlier & Anomaly Detection
-        anomaly_detected = False
-        is_anomaly_mask = pd.Series([False] * len(df), index=df.index)
-        
-        for col in df.columns:
-            if pd.api.types.is_numeric_dtype(df[col]) and not pd.api.types.is_bool_dtype(df[col]):
-                if anomaly_method == "z_score":
-                    mean = df[col].mean()
-                    std = df[col].std()
-                    if std > 0:
-                        col_anomaly = np.abs(df[col] - mean) > (3 * std)
-                        is_anomaly_mask = is_anomaly_mask | col_anomaly
-                elif anomaly_method == "iqr":
-                    Q1 = df[col].quantile(0.25)
-                    Q3 = df[col].quantile(0.75)
-                    IQR = Q3 - Q1
-                    lower_bound = Q1 - 1.5 * IQR
-                    upper_bound = Q3 + 1.5 * IQR
-                    col_anomaly = (df[col] < lower_bound) | (df[col] > upper_bound)
-                    is_anomaly_mask = is_anomaly_mask | col_anomaly
-                    
-        df["Is Anomaly"] = is_anomaly_mask
-        if is_anomaly_mask.any():
-            anomaly_detected = True
+        # Identify numeric columns
+        numeric_cols = self._numeric_columns(dicts, columns)
 
-        # D. Unit & Temporal Standardization
-        for col in df.columns:
-            # Check for currency
-            lower_col = col.lower()
-            if "price" in lower_col or "revenue" in lower_col or "amount" in lower_col or "cost" in lower_col:
-                if pd.api.types.is_numeric_dtype(df[col]) and not pd.api.types.is_bool_dtype(df[col]):
-                    df[col] = df[col].round(2)
-                    
-            # Check for dates
-            if "date" in lower_col or "time" in lower_col or "created" in lower_col or "updated" in lower_col:
-                if not pd.api.types.is_numeric_dtype(df[col]):
-                    try:
-                        parsed = pd.to_datetime(df[col], errors='coerce')
-                        df[col] = np.where(parsed.notnull(), parsed.dt.strftime("%Y-%m-%d"), df[col])
-                    except Exception:
-                        pass
-        
-        # Smart Action Suggestions
-        action_bar = []
-        if anomaly_detected:
-            action_bar.append("Highlight Outliers")
-        
-        # Check if there is a categorical string column and a numeric column to group by
-        has_categorical = False
-        has_numeric = False
-        cat_col = ""
-        for col in df.columns:
-            if col == "Is Anomaly":
-                continue
-            if pd.api.types.is_numeric_dtype(df[col]) and not pd.api.types.is_bool_dtype(df[col]):
-                has_numeric = True
-            elif pd.api.types.is_string_dtype(df[col]) or pd.api.types.is_object_dtype(df[col]):
-                has_categorical = True
-                cat_col = col
-        
-        if has_categorical and has_numeric:
-            action_bar.append(f"Summarize by {cat_col}")
-        
-        if any("date" in c.lower() for c in df.columns):
-            action_bar.append("Compare with Last Month")
-            
-        if not action_bar:
-            action_bar = ["Show detailed statistics", "Export to CSV"]
+        # Outlier detection
+        anomalous_cols: List[str] = []
+        anomalous_row_indices: set = set()
+        if anomaly_method == "iqr" and numeric_cols:
+            anomalous_cols, anomalous_row_indices = self._iqr_flag(dicts, numeric_cols)
 
-        # Extract summary stats
-        summary_stats = {}
-        for col in df.columns:
-            if pd.api.types.is_numeric_dtype(df[col]) and not pd.api.types.is_bool_dtype(df[col]) and col != "Is Anomaly":
-                summary_stats[col] = {
-                    "mean": float(df[col].mean()) if not pd.isna(df[col].mean()) else 0.0,
-                    "median": float(df[col].median()) if not pd.isna(df[col].median()) else 0.0,
-                    "min": float(df[col].min()) if not pd.isna(df[col].min()) else 0.0,
-                    "max": float(df[col].max()) if not pd.isna(df[col].max()) else 0.0
-                }
-                
-        row_count_cleaned = len(df)
-        
-        # Convert back to list of dicts
-        cleaned_data = df.to_dict(orient="records")
-        
-        # Prepare frontend JSON payload
-        frontend_payload = {
-            "columns": list(df.columns),
-            "rows": df.replace({np.nan: None}).values.tolist(),
-            "total_count": len(df)
-        }
-        
-        metadata = Metadata(
+        # Summary statistics (non-id numeric columns only)
+        summary_stats = self._summary_stats(dicts, numeric_cols)
+
+        cleaned = [r for i, r in enumerate(dicts) if i not in anomalous_row_indices]
+        row_count_cleaned = len(cleaned)
+
+        metadata = CleaningMetadata(
             row_count_original=row_count_original,
             row_count_cleaned=row_count_cleaned,
-            anomaly_detected=anomaly_detected,
-            summary_stats=summary_stats
+            anomaly_detected=bool(anomalous_row_indices),
+            anomalous_columns=anomalous_cols,
+            summary_stats=summary_stats,
         )
-        
-        return BusinessAnalystResponse(
-            data=cleaned_data, 
-            metadata=metadata, 
-            frontend_json=json.dumps(frontend_payload, default=str),
-            action_bar=action_bar
+
+        # Re-serialise for the frontend DataTable, preserving wire-format fields
+        frontend_payload: Dict[str, Any] = {
+            "columns": columns or (list(cleaned[0].keys()) if cleaned else []),
+            "rows": [
+                [row.get(c) for c in (columns or list(row.keys()))]
+                for row in cleaned
+            ],
+            "total_count": total_count,
+        }
+        if is_lake_result:
+            frontend_payload["is_lake_result"] = True
+            frontend_payload["source_count"] = raw.get("source_count", 1)
+
+        frontend_json = json.dumps(frontend_payload, default=str)
+        action_bar = self._action_bar(cleaned, numeric_cols, is_lake_result)
+
+        return CleanedResponse(
+            data=cleaned,
+            metadata=metadata,
+            frontend_json=frontend_json,
+            action_bar=action_bar,
         )
+
+    # ------------------------------------------------------------------ #
+    #  Helpers                                                             #
+    # ------------------------------------------------------------------ #
+
+    def _numeric_columns(
+        self, rows: List[Dict], columns: List[str]
+    ) -> List[str]:
+        """Return column names that contain predominantly numeric values."""
+        candidates = columns or (list(rows[0].keys()) if rows else [])
+        numeric: List[str] = []
+        for col in candidates:
+            if self._SKIP_STAT_PATTERNS.search(col):
+                continue
+            values = [r.get(col) for r in rows if r.get(col) is not None]
+            if not values:
+                continue
+            numeric_count = sum(1 for v in values if isinstance(v, (int, float)))
+            if numeric_count / len(values) >= 0.7:
+                numeric.append(col)
+        return numeric
+
+    @staticmethod
+    def _iqr_flag(
+        rows: List[Dict], numeric_cols: List[str]
+    ) -> tuple[List[str], set]:
+        """
+        Flag rows that are outliers in any numeric column.
+        Returns (anomalous_column_names, set_of_row_indices).
+        """
+        anomalous_cols: List[str] = []
+        flagged: set = set()
+
+        for col in numeric_cols:
+            vals = [(i, float(r[col])) for i, r in enumerate(rows) if isinstance(r.get(col), (int, float))]
+            if len(vals) < 4:
+                continue
+            sorted_vals = sorted(v for _, v in vals)
+            n = len(sorted_vals)
+            q1 = sorted_vals[n // 4]
+            q3 = sorted_vals[(3 * n) // 4]
+            iqr = q3 - q1
+            if iqr == 0:
+                continue
+            lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+            outlier_indices = {i for i, v in vals if v < lo or v > hi}
+            if outlier_indices:
+                anomalous_cols.append(col)
+                flagged.update(outlier_indices)
+
+        return anomalous_cols, flagged
+
+    @staticmethod
+    def _summary_stats(
+        rows: List[Dict], numeric_cols: List[str]
+    ) -> Dict[str, Any]:
+        """Compute min/max/mean/count for each numeric column."""
+        stats: Dict[str, Any] = {}
+        for col in numeric_cols:
+            vals = [float(r[col]) for r in rows if isinstance(r.get(col), (int, float))]
+            if not vals:
+                continue
+            stats[col] = {
+                "count": len(vals),
+                "min": round(min(vals), 4),
+                "max": round(max(vals), 4),
+                "mean": round(sum(vals) / len(vals), 4),
+            }
+        return stats
+
+    @staticmethod
+    def _action_bar(
+        rows: List[Dict], numeric_cols: List[str], is_lake_result: bool
+    ) -> List[str]:
+        """Suggest relevant actions based on what the data contains."""
+        actions: List[str] = []
+        if not rows:
+            return actions
+        if numeric_cols:
+            actions.append("Visualize")
+        if len(rows) > 1:
+            actions.append("Download CSV")
+        if is_lake_result:
+            actions.append("Compare Sources")
+        actions.append("Deep Dive")
+        return actions

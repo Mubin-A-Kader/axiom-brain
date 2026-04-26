@@ -34,6 +34,28 @@ Write ONLY the description. No preamble, no bullet points."""
 _EAV_KEY_COLUMNS = {"system_label", "key", "label", "question_type", "answer_key", "attribute", "field_name", "metric_name", "event_type", "category"}
 
 
+def _get_content(response) -> str:
+    """Safely extract string content from OpenAI/LiteLLM response."""
+    content = response.choices[0].message.content
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        # Handle content blocks
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(block.get("text", ""))
+            else:
+                parts.append(str(block))
+        content_str = "".join(parts)
+    else:
+        content_str = str(content)
+        
+    import re
+    content_str = re.sub(r"<think>.*?</think>", "", content_str, flags=re.DOTALL)
+    return content_str
+
+
 async def _generate_table_summary(
     client: openai.AsyncOpenAI,
     model: str,
@@ -87,7 +109,7 @@ async def _generate_table_summary(
                 max_tokens=150,
                 temperature=0.2,
             )
-            return resp.choices[0].message.content.strip()
+            return _get_content(resp).strip()
         except Exception as exc:
             logger.warning("Summary generation failed for %s: %s", table_name, exc)
             return f"Table containing {table_name} data."
