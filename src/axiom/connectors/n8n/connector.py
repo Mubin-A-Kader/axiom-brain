@@ -96,16 +96,39 @@ class N8nConnector(BaseConnector):
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(webhook_url, json=payload, headers=headers)
             r.raise_for_status()
-            data = r.json()
+            
+            # Check for empty response body before parsing JSON
+            content = r.text.strip()
+            if not content:
+                logger.warning("n8n webhook returned an empty response for %s", self.source_id)
+                return {"columns": [], "rows": []}
+                
+            try:
+                data = r.json()
+            except json.JSONDecodeError as e:
+                logger.error("Failed to parse n8n response as JSON: %s (Content: %s)", e, content[:100])
+                raise RuntimeError(f"n8n returned invalid JSON: {content[:50]}...")
 
         # n8n returns a list of objects — normalize to columns/rows format
-        if isinstance(data, list) and data:
-            columns = list(data[0].keys())
-            rows = [[row.get(col) for col in columns] for row in data]
-            return {"columns": columns, "rows": rows}
+        if isinstance(data, list):
+            if not data:
+                return {"columns": [], "rows": []}
+            # Support both list of dicts and list of lists (if n8n already normalized it)
+            if isinstance(data[0], dict):
+                columns = list(data[0].keys())
+                rows = [[row.get(col) for col in columns] for row in data]
+                return {"columns": columns, "rows": rows}
+            elif isinstance(data[0], list):
+                # Guess columns if they are not provided
+                columns = [f"col{i}" for i in range(len(data[0]))]
+                return {"columns": columns, "rows": data}
 
-        if isinstance(data, dict) and "columns" in data and "rows" in data:
-            return data
+        if isinstance(data, dict):
+            if "columns" in data and "rows" in data:
+                return data
+            # Single object response? Wrap in list
+            columns = list(data.keys())
+            return {"columns": columns, "rows": [[data.get(col) for col in columns]]}
 
         return {"columns": [], "rows": []}
 
@@ -128,22 +151,29 @@ class N8nConnector(BaseConnector):
                     headers=headers,
                 )
                 r.raise_for_status()
+                
+                content = r.text.strip()
+                if not content:
+                    return _placeholder_schema(self.config.get("source_label", "n8n_source"))
                 data = r.json()
         except Exception as e:
             logger.warning("N8nConnector.get_schema probe failed for %s: %s", self.source_id, e)
             source_label = self.config.get("source_label", "n8n_source")
             return _placeholder_schema(source_label)
 
-        rows = data if isinstance(data, list) else data.get("rows", [])
+        # Normalize data to rows list
+        rows = []
+        if isinstance(data, list):
+            rows = data
+        elif isinstance(data, dict):
+            rows = data.get("rows", [data] if data else [])
+        
         source_label = self.config.get("source_label", "n8n_source")
 
-        if not rows:
+        if not rows or not isinstance(rows[0], dict):
             return _placeholder_schema(source_label)
 
-        sample = rows[0] if isinstance(rows[0], dict) else {}
-        if not sample:
-            return _placeholder_schema(source_label)
-
+        sample = rows[0]
         fields = {k: _infer_type(v) for k, v in sample.items()}
         ddl = _build_ddl(source_label, fields)
         return {
