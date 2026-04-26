@@ -9,11 +9,14 @@ import logging
 import secrets
 import copy
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Dict
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, Optional
 
 import httpx
 
 from axiom.config import settings
+
+if TYPE_CHECKING:
+    from axiom.connectors.n8n.services import NativeNodeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +46,7 @@ _WORKFLOW_TEMPLATE = {
             "position": [240, 0],
             "parameters": {
                 "method": "GET",
-                "url": "={{ $json.body.fetch_url }}",
+                "url": "",
                 "authentication": "predefinedCredentialType",
                 "nodeCredentialType": "",
                 "options": {},
@@ -145,23 +148,33 @@ class N8nClient:
         credential_type: str,
         credential_id: str,
         webhook_secret: str,
-        default_fetch_url: str = "",
+        native_node: Optional["NativeNodeConfig"] = None,
+        user_params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        wf = copy.deepcopy(_WORKFLOW_TEMPLATE)
+        """
+        Build and activate an n8n workflow.
+
+        When *native_node* is supplied the middle node is replaced with the
+        service-specific native node (e.g. n8n-nodes-base.googleSheets).
+        When it is None, the generic httpRequest template is used as a fallback.
+        """
         webhook_path = secrets.token_urlsafe(16)
-        wf["name"] = f"axiom:{source_name}"
 
-        webhook_node = next(n for n in wf["nodes"] if n["id"] == "webhook-node")
-        webhook_node["parameters"]["path"] = webhook_path
-        webhook_node["webhookId"] = webhook_path
-
-        fetch_node = next(n for n in wf["nodes"] if n["id"] == "fetch-node")
-        fetch_node["parameters"]["nodeCredentialType"] = credential_type
-        fetch_node["credentials"] = {credential_type: {"id": credential_id, "name": source_name}}
-        # Bake the URL in as a static string when known at provision time,
-        # avoiding any expression ambiguity in n8n's webhook context.
-        if default_fetch_url:
-            fetch_node["parameters"]["url"] = default_fetch_url
+        if native_node is not None:
+            wf = self._build_native_workflow(
+                source_name=source_name,
+                webhook_path=webhook_path,
+                credential_id=credential_id,
+                native_node=native_node,
+                user_params=user_params or {},
+            )
+        else:
+            wf = self._build_generic_workflow(
+                source_name=source_name,
+                webhook_path=webhook_path,
+                credential_type=credential_type,
+                credential_id=credential_id,
+            )
 
         async with self._session() as c:
             r = await c.post("/rest/workflows", json=wf)
@@ -179,6 +192,97 @@ class N8nClient:
         webhook_url = f"{self._base}/webhook/{webhook_path}"
         logger.info("Provisioned n8n workflow %s → %s", workflow_id, webhook_url)
         return {"workflow_id": workflow_id, "webhook_url": webhook_url, "webhook_secret": webhook_secret}
+
+    # ── Private helpers ──────────────────────────────────────────────────────
+
+    def _build_native_workflow(
+        self,
+        source_name: str,
+        webhook_path: str,
+        credential_id: str,
+        native_node: "NativeNodeConfig",
+        user_params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Construct a Webhook → <native service node> → Respond workflow dict.
+        """
+        params = {**native_node.base_params, **user_params}
+        data_node: Dict[str, Any] = {
+            "id": "data-node",
+            "name": "Fetch Data",
+            "type": native_node.node_type,
+            "typeVersion": native_node.type_version,
+            "position": [240, 0],
+            "parameters": params,
+            "credentials": {
+                native_node.credential_key: {
+                    "id": credential_id,
+                    "name": source_name,
+                }
+            },
+        }
+        return {
+            "name": f"axiom:{source_name}",
+            "active": True,
+            "nodes": [
+                {
+                    "id": "webhook-node",
+                    "name": "Webhook",
+                    "type": "n8n-nodes-base.webhook",
+                    "typeVersion": 1.1,
+                    "position": [0, 0],
+                    "parameters": {
+                        "httpMethod": "POST",
+                        "path": webhook_path,
+                        "responseMode": "responseNode",
+                        "options": {},
+                    },
+                    "webhookId": webhook_path,
+                },
+                data_node,
+                {
+                    "id": "respond-node",
+                    "name": "Respond",
+                    "type": "n8n-nodes-base.respondToWebhook",
+                    "typeVersion": 1,
+                    "position": [480, 0],
+                    "parameters": {
+                        "respondWith": "json",
+                        "responseBody": "={{ JSON.stringify($input.all().map(i => i.json)) }}",
+                        "options": {},
+                    },
+                },
+            ],
+            "connections": {
+                "Webhook": {"main": [[{"node": "Fetch Data", "type": "main", "index": 0}]]},
+                "Fetch Data": {"main": [[{"node": "Respond", "type": "main", "index": 0}]]},
+            },
+            "settings": {"executionOrder": "v1"},
+        }
+
+    def _build_generic_workflow(
+        self,
+        source_name: str,
+        webhook_path: str,
+        credential_type: str,
+        credential_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Fallback: generic httpRequest template for services without a native_node.
+        The URL is left empty — callers that need a specific URL should use native_node.
+        """
+        wf = copy.deepcopy(_WORKFLOW_TEMPLATE)
+        wf["name"] = f"axiom:{source_name}"
+
+        webhook_node = next(n for n in wf["nodes"] if n["id"] == "webhook-node")
+        webhook_node["parameters"]["path"] = webhook_path
+        webhook_node["webhookId"] = webhook_path
+
+        fetch_node = next(n for n in wf["nodes"] if n["id"] == "fetch-node")
+        fetch_node["parameters"]["nodeCredentialType"] = credential_type
+        fetch_node["credentials"] = {credential_type: {"id": credential_id, "name": source_name}}
+
+        return wf
 
     async def delete_workflow(self, workflow_id: str) -> None:
         async with self._session() as c:

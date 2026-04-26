@@ -4,7 +4,7 @@ Adding a new service = add one entry here + build the n8n workflow in n8n UI.
 No Python connector code needed per service.
 """
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Optional
 
 
 AuthType = Literal["apikey", "oauth2", "basic", "bearer"]
@@ -16,6 +16,41 @@ class CredentialField:
     label: str
     placeholder: str = ""
     secret: bool = False
+
+
+@dataclass
+class ProvisionField:
+    """
+    Describes a field the user must fill in at provision time (e.g. a sheet URL).
+    Declared on NativeNodeConfig so the API and UI are driven entirely by data —
+    no per-service if-branches needed anywhere outside this file.
+    """
+    key: str                    # form field key sent in provision_data, e.g. "sheet_url"
+    label: str                  # UI label shown in the wizard
+    placeholder: str = ""
+    required: bool = True
+    # Optional regex applied to the raw input to extract the real value
+    # (e.g. pull the spreadsheet ID out of a full Google Sheets URL)
+    extract_pattern: str = ""
+    # Which key in user_params to set with the extracted value
+    user_param_key: str = ""
+    # Template dict merged with {"value": <extracted>} to form the user_param value
+    user_param_template: dict = field(default_factory=dict)
+
+
+@dataclass
+class NativeNodeConfig:
+    """
+    Describes the native n8n node to use for a service instead of the
+    generic httpRequest fallback.  The provisioning code will build a
+    workflow with this node type wired between Webhook and Respond.
+    """
+    node_type: str          # e.g. "n8n-nodes-base.googleSheets"
+    type_version: float     # e.g. 4
+    credential_key: str     # key used in the credentials dict (often == n8n_credential_type)
+    base_params: dict       # fixed node parameters (resource, operation, options, …)
+    # Provision-time fields the user must fill in; drives both API validation and UI rendering
+    provision_fields: List[ProvisionField] = field(default_factory=list)
 
 
 @dataclass
@@ -33,7 +68,9 @@ class ServiceDefinition:
     oauth_scopes: List[str] = field(default_factory=list)
     auth_url: str = ""          # OAuth authorization endpoint
     token_url: str = ""         # OAuth token exchange endpoint
-    default_fetch_url: str = "" # Baked into the n8n workflow; used when the caller doesn't specify a URL
+    # When set, the provisioning step builds a workflow using the native n8n node
+    # instead of the generic httpRequest fallback.
+    native_node: Optional[NativeNodeConfig] = None
 
 
 SERVICES: Dict[str, ServiceDefinition] = {
@@ -53,11 +90,26 @@ SERVICES: Dict[str, ServiceDefinition] = {
             ],
             auth_url="https://accounts.google.com/o/oauth2/v2/auth",
             token_url="https://oauth2.googleapis.com/token",
-            default_fetch_url=(
-                "https://www.googleapis.com/drive/v3/files"
-                "?q=mimeType%3D%27application%2Fvnd.google-apps.spreadsheet%27"
-                "&fields=files(id%2Cname%2CcreatedTime%2CmodifiedTime%2CwebViewLink)"
-                "&orderBy=modifiedTime+desc&pageSize=100"
+            native_node=NativeNodeConfig(
+                node_type="n8n-nodes-base.googleSheets",
+                type_version=4,
+                credential_key="googleSheetsOAuth2Api",
+                base_params={
+                    "resource": "sheet",
+                    "operation": "read",
+                    "sheetName": {"__rl": True, "value": "Sheet1", "mode": "name"},
+                    "options": {},
+                },
+                provision_fields=[
+                    ProvisionField(
+                        key="sheet_url",
+                        label="Google Sheet URL",
+                        placeholder="https://docs.google.com/spreadsheets/d/...",
+                        extract_pattern=r"/spreadsheets/d/([a-zA-Z0-9_-]+)",
+                        user_param_key="documentId",
+                        user_param_template={"__rl": True, "mode": "id"}
+                    )
+                ]
             ),
         ),
         ServiceDefinition(

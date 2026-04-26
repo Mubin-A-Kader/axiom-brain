@@ -643,6 +643,7 @@ class N8nProvisionRequest(BaseModel):
     source_name: str
     tenant_id: str
     credentials: Dict[str, Any] = {}   # API key / bearer fields; empty for OAuth2 (handled separately)
+    provision_data: Dict[str, Any] = {} # Generic provision-time fields (e.g. sheet_url)
 
 
 class N8nOAuthCallbackRequest(BaseModel):
@@ -670,6 +671,15 @@ async def list_n8n_services(user_id: str = Depends(verify_token)) -> Dict[str, A
                 "credential_fields": [
                     {"key": f.key, "label": f.label, "placeholder": f.placeholder, "secret": f.secret}
                     for f in svc.credential_fields
+                ],
+                "provision_fields": [
+                    {
+                        "key": f.key,
+                        "label": f.label,
+                        "placeholder": f.placeholder,
+                        "required": f.required
+                    }
+                    for f in (svc.native_node.provision_fields if svc.native_node else [])
                 ],
             }
             for svc in SERVICES.values()
@@ -775,12 +785,36 @@ async def n8n_provision(
             data=req.credentials,
         )
 
+    # Build user_params for native-node services that require caller-supplied values.
+    user_params: dict = {}
+    if svc.native_node:
+        for field in svc.native_node.provision_fields:
+            val = req.provision_data.get(field.key)
+            if not val:
+                continue
+            
+            # Extract real value if a pattern is provided
+            extracted = val
+            if field.extract_pattern:
+                import re
+                m = re.search(field.extract_pattern, val)
+                if m:
+                    extracted = m.group(1)
+            
+            # Map to user_param_key using template if provided
+            if field.user_param_key:
+                if field.user_param_template:
+                    user_params[field.user_param_key] = {**field.user_param_template, "value": extracted}
+                else:
+                    user_params[field.user_param_key] = extracted
+
     wf = await client.create_workflow(
         source_name=req.source_name,
         credential_type=svc.n8n_credential_type,
         credential_id=credential_id,
         webhook_secret=webhook_secret,
-        default_fetch_url=svc.default_fetch_url,
+        native_node=svc.native_node,
+        user_params=user_params if user_params else None,
     )
 
     # Register as a data source in Axiom
@@ -790,7 +824,6 @@ async def n8n_provision(
         "service_id": req.service_id,
         "n8n_workflow_id": wf["workflow_id"],
         "n8n_credential_id": credential_id,
-        "default_fetch_url": svc.default_fetch_url,
     }
 
     from axiom.api.onboard import run_ingestion

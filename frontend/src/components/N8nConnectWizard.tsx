@@ -13,6 +13,13 @@ interface CredentialField {
   secret: boolean;
 }
 
+interface ProvisionField {
+  key: string;
+  label: string;
+  placeholder: string;
+  required: boolean;
+}
+
 interface Service {
   id: string;
   label: string;
@@ -21,6 +28,7 @@ interface Service {
   auth_type: "apikey" | "oauth2" | "basic" | "bearer";
   description: string;
   credential_fields: CredentialField[];
+  provision_fields: ProvisionField[];
 }
 
 interface Props {
@@ -60,6 +68,7 @@ export function N8nConnectWizard({ tenantId, onDone, onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [oauthPending, setOauthPending] = useState(false);
   const [oauthCredentialId, setOauthCredentialId] = useState<string | null>(null);
+  const [provisionData, setProvisionData] = useState<Record<string, string>>({});
 
   useEffect(() => {
     (async () => {
@@ -85,6 +94,7 @@ export function N8nConnectWizard({ tenantId, onDone, onClose }: Props) {
     setSelected(svc);
     setSourceName(svc.label);
     setCredentials({});
+    setProvisionData({});
     setError(null);
     setStep("configure");
   };
@@ -146,6 +156,7 @@ export function N8nConnectWizard({ tenantId, onDone, onClose }: Props) {
           source_name: sourceName,
           tenant_id: tenantId,
           credentials: creds,
+          provision_data: provisionData,
         }),
       });
       if (!res.ok) throw new Error((await res.json()).detail || "Provision failed");
@@ -158,9 +169,8 @@ export function N8nConnectWizard({ tenantId, onDone, onClose }: Props) {
   };
 
   const canProvision =
-    selected?.auth_type === "oauth2"
-      ? !!oauthCredentialId
-      : selected?.credential_fields.every((f) => !!credentials[f.key]);
+    (selected?.auth_type === "oauth2" ? !!oauthCredentialId : selected?.credential_fields.every((f) => !!credentials[f.key])) &&
+    selected?.provision_fields.every((f) => !f.required || !!provisionData[f.key]);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
@@ -254,27 +264,59 @@ export function N8nConnectWizard({ tenantId, onDone, onClose }: Props) {
                       {oauthPending ? "Waiting for authorization…" : `Authorize ${selected.label}`}
                     </button>
                   ) : (
-                    <div className="flex items-center gap-2 text-sm text-[#638A70]">
-                      <Check className="w-4 h-4" />
-                      Authorization complete
+                    <div className="space-y-3">
+                      <div className="flex items-center gap-2 text-sm text-[#638A70]">
+                        <Check className="w-4 h-4" />
+                        Authorization complete
+                      </div>
+                      {selected.provision_fields.map((field) => (
+                        <div key={field.key}>
+                          <label className="block text-xs text-[#9A9589] mb-1">
+                            {field.label} {field.required && <span className="text-red-500">*</span>}
+                          </label>
+                          <input
+                            className="w-full bg-white/5 border border-white/10 rounded-md px-3 py-2 text-sm text-[#E6E1D8] placeholder-[#9A9589]/60 focus:outline-none focus:border-[#638A70] font-mono"
+                            placeholder={field.placeholder}
+                            value={provisionData[field.key] || ""}
+                            onChange={(e) => setProvisionData((prev) => ({ ...prev, [field.key]: e.target.value }))}
+                          />
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>
               )}
 
               {/* API key / bearer path */}
-              {selected.auth_type !== "oauth2" && selected.credential_fields.map((field) => (
-                <div key={field.key}>
-                  <label className="block text-xs text-[#9A9589] mb-1">{field.label}</label>
-                  <input
-                    type={field.secret ? "password" : "text"}
-                    className="w-full bg-white/5 border border-white/10 rounded-md px-3 py-2 text-sm text-[#E6E1D8] placeholder-[#9A9589]/60 focus:outline-none focus:border-[#638A70] font-mono"
-                    placeholder={field.placeholder}
-                    value={credentials[field.key] || ""}
-                    onChange={(e) => setCredentials((prev) => ({ ...prev, [field.key]: e.target.value }))}
-                  />
+              {selected.auth_type !== "oauth2" && (
+                <div className="space-y-4">
+                  {selected.credential_fields.map((field) => (
+                    <div key={field.key}>
+                      <label className="block text-xs text-[#9A9589] mb-1">{field.label}</label>
+                      <input
+                        type={field.secret ? "password" : "text"}
+                        className="w-full bg-white/5 border border-white/10 rounded-md px-3 py-2 text-sm text-[#E6E1D8] placeholder-[#9A9589]/60 focus:outline-none focus:border-[#638A70] font-mono"
+                        placeholder={field.placeholder}
+                        value={credentials[field.key] || ""}
+                        onChange={(e) => setCredentials((prev) => ({ ...prev, [field.key]: e.target.value }))}
+                      />
+                    </div>
+                  ))}
+                  {selected.provision_fields.map((field) => (
+                    <div key={field.key}>
+                      <label className="block text-xs text-[#9A9589] mb-1">
+                        {field.label} {field.required && <span className="text-red-500">*</span>}
+                      </label>
+                      <input
+                        className="w-full bg-white/5 border border-white/10 rounded-md px-3 py-2 text-sm text-[#E6E1D8] placeholder-[#9A9589]/60 focus:outline-none focus:border-[#638A70] font-mono"
+                        placeholder={field.placeholder}
+                        value={provisionData[field.key] || ""}
+                        onChange={(e) => setProvisionData((prev) => ({ ...prev, [field.key]: e.target.value }))}
+                      />
+                    </div>
+                  ))}
                 </div>
-              ))}
+              )}
 
               {error && <p className="text-xs text-red-400">{error}</p>}
             </div>

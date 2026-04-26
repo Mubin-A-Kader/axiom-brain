@@ -91,10 +91,6 @@ class N8nConnector(BaseConnector):
         except json.JSONDecodeError:
             payload = {}
 
-        default_fetch_url = self.config.get("default_fetch_url", "")
-        if default_fetch_url and "fetch_url" not in payload:
-            payload["fetch_url"] = default_fetch_url
-
         headers = {"X-Axiom-Secret": secret, "Content-Type": "application/json"}
 
         async with httpx.AsyncClient(timeout=30) as client:
@@ -122,10 +118,7 @@ class N8nConnector(BaseConnector):
         secret = self.config.get("webhook_secret", "")
         headers = {"X-Axiom-Secret": secret, "Content-Type": "application/json"}
 
-        default_fetch_url = self.config.get("default_fetch_url", "")
         probe_payload: dict = {"limit": 1, "filters": {}, "fields": []}
-        if default_fetch_url:
-            probe_payload["fetch_url"] = default_fetch_url
 
         try:
             async with httpx.AsyncClient(timeout=30) as client:
