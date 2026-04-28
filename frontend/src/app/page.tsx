@@ -382,69 +382,47 @@ function ChatInner({ tenantId, lakes, selectedLakeId, setSelectedLakeId }: any) 
 
                         {/* Proactive Probing Comparison Card */}
                         {msg.metadata?.probing_options && msg.metadata.probing_options.length > 0 && (
-                           <div className="bg-tactile-surface border border-tactile-primary/30 rounded-3xl p-10 space-y-8 shadow-2xl mt-10 relative z-30 animate-in zoom-in-95 duration-500">
-                              <div className="flex items-center gap-5">
-                                 <div className="w-12 h-12 rounded-2xl bg-tactile-base border border-tactile-border flex items-center justify-center text-tactile-primary shadow-tactile-inner">
-                                   <Search className="w-6 h-6" />
-                                 </div>
-                                 <div>
-                                   <h3 className="text-lg font-bold text-tactile-text tracking-tight">Verify Business Intent</h3>
-                                   <p className="text-xs font-mono text-tactile-text/30 uppercase tracking-widest mt-1">Ambiguous Schema Mapping Detected</p>
-                                 </div>
-                              </div>
-                              <p className="text-lg text-tactile-text/70 leading-relaxed font-medium">
-                                I discovered multiple entities that could resolve this query. Which business logic should be applied?
-                              </p>
-                              
-                              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                                {msg.metadata.probing_options.map((opt: any) => (
-                                  <div 
-                                    key={opt.id}
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      const prevMsg = messages[messages.findIndex((m: any) => m.id === msg.id) - 1];
-                                      const userQ = prevMsg ? prevMsg.content : "";
-                                      sendMessage(`CONFIRMED_SOURCE: Use the '${opt.table_name}' table to answer my question about '${userQ}'.`);
-                                    }}
-                                    className="bg-tactile-base border border-tactile-border rounded-2xl p-8 cursor-pointer hover:border-tactile-primary hover:bg-tactile-primary/5 transition-all group/opt shadow-tactile hover:shadow-2xl"
-                                  >
-                                    <div className="flex items-center justify-between mb-5">
-                                      <span className="text-xs font-bold text-tactile-primary uppercase tracking-[0.2em]">{opt.business_name}</span>
-                                      <div className="w-6 h-6 rounded-full border-2 border-tactile-border group-hover/opt:border-tactile-primary transition-all shadow-inner" />
-                                    </div>
-                                    <p className="text-sm text-tactile-text/50 mb-8 h-12 overflow-hidden leading-relaxed font-medium">{opt.description}</p>
-                                    
-                                    <div className="bg-black/40 rounded-xl p-5 overflow-hidden border border-tactile-border shadow-tactile-inner">
-                                       <div className="flex items-center gap-2 mb-3">
-                                          <div className="w-1.5 h-1.5 rounded-full bg-tactile-primary/40" />
-                                          <span className="text-[9px] font-mono text-tactile-primary uppercase tracking-[0.3em] font-bold">Schema_Preview</span>
-                                       </div>
-                                       <pre className="text-[10px] font-mono text-tactile-text/30 leading-tight">
-                                          {opt.sample_data && opt.sample_data[0] 
-                                            ? JSON.stringify(opt.sample_data[0], null, 2).slice(0, 120) 
-                                            : "No metadata available"}...
-                                       </pre>
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-
-                              <div className="pt-8 border-t border-tactile-border flex justify-end">
+                          <div className="flex flex-col gap-4 mt-6 p-4 bg-tactile-primary/5 rounded-2xl border border-tactile-primary/10 max-w-fit shadow-tactile-inner">
+                            <div className="flex items-center gap-3">
+                              <Search className="w-4 h-4 text-tactile-primary" />
+                              <span className="text-[10px] font-mono text-tactile-text/40 uppercase tracking-[0.2em] font-bold">Clarify Intent: Which data source should I use?</span>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2 ml-7">
+                              {msg.metadata.probing_options.map((opt: any) => (
                                 <button 
+                                  key={opt.id}
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     const prevMsg = messages[messages.findIndex((m: any) => m.id === msg.id) - 1];
                                     const userQ = prevMsg ? prevMsg.content : "";
-                                    const suggestedTables = msg.metadata.probing_options.map((opt: any) => `'${opt.table_name}'`).join(", ");
-                                    sendMessage(`REJECTED_INTENT: The suggested tables [${suggestedTables}] are not what I meant. Please find other tables to answer my question about '${userQ}'.`);
+                                    
+                                    // If this is a database routing candidate (e.g. n8n source), use CONFIRMED_DATABASE
+                                    if (opt.id.startsWith("n8n_") || opt.id === opt.table_name) {
+                                      sendMessage(`CONFIRMED_DATABASE: Use the '${opt.id}' database to answer my question about '${userQ}'.`);
+                                    } else {
+                                      sendMessage(`CONFIRMED_SOURCE: Use the '${opt.table_name}' table to answer my question about '${userQ}'.`);
+                                    }
                                   }}
-                                  className="text-xs font-bold uppercase tracking-[0.2em] text-tactile-text/20 hover:text-tactile-warning transition-all flex items-center gap-3 px-6 py-3 hover:bg-tactile-warning/5 rounded-xl border border-transparent hover:border-tactile-warning/20"
+                                  className="px-4 py-1.5 text-[11px] font-bold uppercase tracking-[0.2em] bg-tactile-surface text-tactile-text/80 border border-tactile-border rounded-lg hover:border-tactile-primary hover:text-tactile-primary transition-all shadow-tactile"
+                                  title={opt.description}
                                 >
-                                  <X className="w-4 h-4" />
-                                  None of these match my intent
+                                  {opt.business_name}
                                 </button>
-                              </div>
-                           </div>
+                              ))}
+                              <button 
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  const prevMsg = messages[messages.findIndex((m: any) => m.id === msg.id) - 1];
+                                  const userQ = prevMsg ? prevMsg.content : "";
+                                  const suggestedTables = msg.metadata.probing_options.map((opt: any) => `'${opt.table_name}'`).join(", ");
+                                  sendMessage(`REJECTED_INTENT: The suggested tables [${suggestedTables}] are not what I meant. Please find other tables to answer my question about '${userQ}'.`);
+                                }}
+                                className="px-4 py-1.5 text-[11px] font-bold uppercase tracking-[0.2em] bg-transparent text-tactile-text/40 border border-transparent rounded-lg hover:text-tactile-warning hover:bg-tactile-warning/10 transition-all"
+                              >
+                                None of these
+                              </button>
+                            </div>
+                          </div>
                         )}
 
                         {/* Artifact Indicator */}

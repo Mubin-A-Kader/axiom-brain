@@ -219,10 +219,15 @@ class DatabaseSelectionNode:
             }
 
         # 3. No explicit lake — LLM routing with confidence scoring
+        history_context = state.get("history_context", "")
+        
         source_list = "\n".join(
             [f'- {s["source_id"]} ({s["db_type"]}): {s["description"] or "no description"}' for s in sources]
         )
         prompt = f"""You are a database router. A user asked: "{question}"
+
+### CONVERSATION HISTORY (to help understand ambiguous references like "this"):
+{history_context}
 
 ### AVAILABLE DATABASES:
 {source_list}
@@ -1362,13 +1367,27 @@ class PythonCodeGenerationNode:
 
     async def __call__(self, state: SQLAgentState) -> dict:
         raw_result = state.get("sql_result") or state.get("last_sql_result")
-        if not raw_result or raw_result == "CONCLUDED":
+        mcp_results = state.get("mcp_tool_results", [])
+        
+        if (not raw_result or raw_result == "CONCLUDED") and not mcp_results:
             return {"python_code": None}
 
         try:
-            result_json = json.loads(raw_result)
-            columns = result_json.get("columns", [])
-            sample_rows = result_json.get("rows", [])[:5]
+            columns = []
+            sample_rows = []
+            if raw_result and raw_result != "CONCLUDED":
+                result_json = json.loads(raw_result)
+                columns = result_json.get("columns", [])
+                sample_rows = result_json.get("rows", [])[:5]
+            elif mcp_results:
+                # App Connector path - use raw JSON tools results directly
+                columns = ["Raw Data from API"]
+                # Show first 1000 chars of the first successful tool result as a sample
+                for t in mcp_results:
+                    if t.get("result"):
+                        sample_rows = [str(t["result"])[:1000] + "..."]
+                        break
+
             question = state["question"]
             insight = state.get("response_text", "")
             error = state.get("python_error")
@@ -1474,7 +1493,9 @@ class NotebookArtifactNode:
     async def __call__(self, state: SQLAgentState) -> dict:
         # action_plan clears sql_result to None after RCA; fall back to last_sql_result
         raw_result = state.get("sql_result") or state.get("last_sql_result")
-        if state.get("error") or not raw_result or raw_result == "CONCLUDED":
+        mcp_results = state.get("mcp_tool_results", [])
+        
+        if state.get("error") or ((not raw_result or raw_result == "CONCLUDED") and not mcp_results):
             return {"artifact": None}
 
         from axiom.notebooks.builder import build_analysis_notebook
@@ -1484,16 +1505,41 @@ class NotebookArtifactNode:
         thread_id = state.get("thread_id", artifact_id)
 
         try:
-            result_json = json.loads(raw_result)
-            columns = result_json.get("columns", [])
-            rows = result_json.get("rows", [])
-            if not isinstance(columns, list) or not isinstance(rows, list):
-                raise ValueError("SQL result must contain list-valued columns and rows")
+            result_for_notebook = None
+            if raw_result and raw_result != "CONCLUDED":
+                result_json = json.loads(raw_result)
+                columns = result_json.get("columns", [])
+                rows = result_json.get("rows", [])
+                if not isinstance(columns, list) or not isinstance(rows, list):
+                    raise ValueError("SQL result must contain list-valued columns and rows")
+                result_for_notebook = result_json
+            elif mcp_results:
+                # App Connector path - pass the raw results list 
+                results_list = []
+                for t in mcp_results:
+                    if t.get("result"):
+                        try:
+                            # Try to parse as JSON if it's a string, to avoid double-encoding
+                            if isinstance(t["result"], str):
+                                parsed = json.loads(t["result"])
+                                # If it's a list of dicts, extend
+                                if isinstance(parsed, list):
+                                    results_list.extend(parsed)
+                                else:
+                                    results_list.append(parsed)
+                            else:
+                                results_list.append(t["result"])
+                        except Exception:
+                            # Fallback: Just wrap the raw text in a dict
+                            results_list.append({"raw_text": str(t["result"])})
+                result_for_notebook = results_list
+                if not result_for_notebook:
+                    return {"artifact": None}
 
             notebook, cells_summary = build_analysis_notebook(
                 question=state["question"],
                 sql=state.get("sql_query") or "",
-                result=result_json,
+                result=result_for_notebook,
                 insight=state.get("response_text"),
                 python_code=state.get("python_code"),
             )
@@ -1590,6 +1636,16 @@ class ResponseSynthesizerNode:
         return no_match, first_sentence[:300]
 
     async def __call__(self, state: SQLAgentState) -> dict:
+        if state.get("probing_options"):
+            return {
+                "response_text": "I found multiple tables that could answer your question. Which one did you mean?",
+            }
+
+        if state.get("needs_source_clarification"):
+            return {
+                "response_text": "I found multiple databases that could answer your question. Which one did you mean?",
+            }
+
         if state.get("error"):
             error = state.get("error", "")
             # For zero-result failures, surface only the clean investigation signal —
@@ -1622,7 +1678,7 @@ class ResponseSynthesizerNode:
             return {"response_text": f"I encountered an error: {error}"}
 
         # RCA path: ActionPlanNode already populated response_text and cleared sql_result
-        if state.get("response_text") and not state.get("sql_result"):
+        if state.get("response_text") and not state.get("sql_result") and not state.get("mcp_tool_results"):
             artifact = state.get("artifact")
             return {
                 "response_text": state.get("response_text", ""),
@@ -1630,55 +1686,63 @@ class ResponseSynthesizerNode:
                 "action_bar": [],
             }
 
-        if not state.get("sql_result"):
+        sql_result = state.get("sql_result")
+        mcp_results = state.get("mcp_tool_results", [])
+
+        if not sql_result and not mcp_results:
             return {"response_text": "I couldn't find any data to answer your question."}
 
         question = state["question"]
-        
-        from axiom.core.cleansing import MLGradeInterceptor
-        interceptor = MLGradeInterceptor()
-        
-        # Apply deterministic ML-grade data cleaning
-        cleaned_response = interceptor.process(state.get("sql_result", ""), anomaly_method="iqr")
-        cleaned_data = cleaned_response.data
-        metadata = cleaned_response.metadata
-        
         artifact = state.get("artifact")
-
-        if not cleaned_data:
-            return {"response_text": "The query returned no results."}
-
-        # Extract column names from the cleaned data
-        columns = list(cleaned_data[0].keys()) if cleaned_data else []
-
-        # Data sample for synthesis
-        sample = cleaned_data[:5]
         
-        prompt = f"""You are a senior Business Analyst. 
-Based on the user's question and the cleaned data results provided, write a concise, professional response.
+        # 1. Handle SQL Path
+        if sql_result:
+            from axiom.core.cleansing import MLGradeInterceptor
+            interceptor = MLGradeInterceptor()
+            
+            # Apply deterministic ML-grade data cleaning
+            cleaned_response = interceptor.process(sql_result, anomaly_method="iqr")
+            cleaned_data = cleaned_response.data
+            metadata = cleaned_response.metadata
+            
+            if not cleaned_data:
+                return {"response_text": "The query returned no results."}
 
-### USER QUESTION:
-{question}
-
-### DATA RESULTS (Columns: {columns}):
+            columns = list(cleaned_data[0].keys()) if cleaned_data else []
+            sample = cleaned_data[:5]
+            
+            data_context = f"""### DATA RESULTS (Columns: {columns}):
 {sample}
 
 ### METADATA:
 - Original Row Count: {metadata.row_count_original}
 - Cleaned Row Count: {metadata.row_count_cleaned}
-- Anomalies Detected: {metadata.anomaly_detected}
-- Summary Stats: {json.dumps(metadata.summary_stats, indent=2)}
+- Summary Stats: {json.dumps(metadata.summary_stats, indent=2)}"""
+        
+        # 2. Handle App Path
+        else:
+            # For apps, we use the response_text from the AppExecutionNode as the primary insight,
+            # but we can synthesize a better one if needed from the tool results.
+            app_insight = state.get("response_text", "")
+            data_context = f"""### APP TOOL RESULTS:
+{json.dumps(mcp_results, indent=2)[:5000]}
+
+### PRELIMINARY INSIGHT:
+{app_insight}"""
+
+        prompt = f"""You are a senior Business Analyst. 
+Based on the user's question and the data results provided, write a concise, professional response.
+
+### USER QUESTION:
+{question}
+
+{data_context}
 
 ### INSTRUCTIONS:
 1. ABSOLUTELY NO RAW DATA TABLES OR JSON. You must ONLY output a conversational summary. NEVER render the data as a table, markdown grid, or raw list unless explicitly asked by the user to "show me a table".
-2. NEVER output raw UUIDs, internal IDs (e.g., user_id, file_key), or technical column names.
-3. NEVER print "null" or "None". Instead say "missing" or "not provided".
-4. DO NOT show database field names like `collection_id`, `status`, `created_at`. Use plain labels: "collection", "status", "upload date".
-5. If you need to reference an image or record, use its human-readable title or a short description. Never show the full UUID.
-6. Aggregate counts and list only the most relevant examples (max 5 items).
-7. Output in plain English, with bullet points or short sentences. 
-8. If there's an obvious trend or anomaly, highlight it. If an analysis notebook artifact was generated, mention that the workspace contains the executable notebook.
-9. Keep it concise. Be precise but conversational.
+2. NEVER output raw UUIDs, internal IDs, or technical column names.
+3. If an analysis notebook artifact was generated, mention that a detailed notebook is available in the workspace.
+4. Keep it concise. Be precise but conversational.
 
 Response:"""
 
@@ -1689,10 +1753,14 @@ Response:"""
                 temperature=0.7,
             )
             content = _get_content(response).strip()
-            return {"response_text": content, "sql_result": cleaned_response.frontend_json, "layout": "notebook" if artifact else "default", "action_bar": cleaned_response.action_bar}
+            
+            if sql_result:
+                return {"response_text": content, "sql_result": cleaned_response.frontend_json, "layout": "notebook" if artifact else "default", "action_bar": cleaned_response.action_bar}
+            else:
+                return {"response_text": content, "layout": "notebook" if artifact else "default"}
         except Exception as exc:
             logger.warning("Failed to synthesize response: %s", exc)
-            return {"response_text": "Here are the results for your query:", "sql_result": cleaned_response.frontend_json, "layout": "notebook" if artifact else "default", "action_bar": cleaned_response.action_bar}
+            return {"response_text": state.get("response_text", "I have processed your request.")}
 
 
 class LakeOrchestratorNode:

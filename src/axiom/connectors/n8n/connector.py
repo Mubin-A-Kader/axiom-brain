@@ -1,227 +1,107 @@
-"""
-N8nConnector — treats an n8n webhook as a data source.
-Axiom calls the webhook with the user's question; n8n fetches from whatever
-third-party service it's wired to and returns rows as JSON.
-No SQL generated — this connector lives in QueryMode.PIPELINE.
-"""
+import json
 import logging
 from typing import Any, Dict, Optional
-
-import httpx
+import urllib.parse
 
 from axiom.connectors.base import BaseConnector, QueryMode
 
 logger = logging.getLogger(__name__)
 
-
 class N8nConnector(BaseConnector):
     """
-    Connector backed by an n8n webhook.
-    db_url  = the webhook URL (e.g. https://n8n.company.com/webhook/abc123)
-    config  = {"webhook_secret": "...", "source_label": "Google Sheets / Sales"}
+    DuckDB-powered connector for querying the dynamic n8n HTTP proxy webhook.
+    It allows the LLM to write SQL queries that pull data from the generic n8n proxy using read_json_auto().
     """
-
-    query_mode = QueryMode.PIPELINE
+    query_mode = QueryMode.SQL
 
     @property
     def dialect_name(self) -> str:
-        return "n8n"
+        return "duckdb"
 
     @property
     def llm_prompt_instructions(self) -> str:
-        return (
-            "This data source is a third-party integration via n8n. "
-            "The data is returned as JSON rows. "
-            "Identify the relevant fields from the schema and filter logically. "
-            "Do NOT generate SQL. Output a JSON filter object inside <query></query> tags with keys: "
-            "'filters' (key/value pairs to match), 'limit' (int, default 100), 'fields' (list of field names to return, empty = all). "
-            "Example: <query>{\"filters\": {\"status\": \"active\"}, \"limit\": 50, \"fields\": [\"name\", \"email\"]}</query>"
-        )
-
-    def build_query_prompt(
-        self,
-        question: str,
-        schema_context: str,
-        custom_rules: str,
-        few_shot_examples: str,
-        history_context: str,
-    ) -> str:
-        return (
-            f"You are a data analyst querying a third-party data source via n8n.\n"
-            f"Source type: {self.config.get('source_label', 'n8n integration')}\n\n"
-            f"### SCHEMA:\n{schema_context}\n\n"
-            f"### BUSINESS RULES:\n{custom_rules or 'None'}\n\n"
-            f"### HISTORY:\n{history_context or 'None'}\n\n"
-            f"### INSTRUCTIONS:\n{self.llm_prompt_instructions}\n\n"
-            f"Answer this question: {question}"
-        )
-
-    def extract_query(self, llm_content: str) -> Optional[str]:
-        import re
-        import json
-        match = re.search(r"<query>(.*?)</query>", llm_content, re.DOTALL)
-        if not match:
-            return "{}"
-        try:
-            json.loads(match.group(1).strip())
-            return match.group(1).strip()
-        except json.JSONDecodeError:
-            return "{}"
-
-    def is_read_only_query(self, query: str) -> bool:
-        return True  # n8n webhooks are always read-only from Axiom's side
+        return """
+    - N8N PROXY INSTRUCTIONS (CRITICAL): The target database is an in-memory DuckDB instance. You MUST fetch data using the `fetch_api(url)` table-valued macro.
+    - HOW TO USE: `SELECT * FROM fetch_api('https://api.github.com/users/torvalds')`
+    - To perform multi-table JOINs across different APIs, use multiple `fetch_api` calls: `SELECT a.*, b.* FROM fetch_api('url1') a JOIN fetch_api('url2') b ON ...`
+    - Only perform GET requests via SQL. For mutations, use app agent tools.
+        """.strip()
 
     async def connect(self) -> None:
-        pass  # stateless HTTP — no persistent connection
+        import duckdb
+        # We spawn an ephemeral in-memory database per query
+        self._conn = duckdb.connect(':memory:')
+        # Enable HTTP and JSON extensions
+        self._conn.execute("INSTALL httpfs; LOAD httpfs;")
+        self._conn.execute("INSTALL json; LOAD json;")
+        
+        config = self.config or {}
+        webhook_secret = config.get("webhook_secret", "")
+        # Create a macro that handles the webhook url and secret automatically
+        # DuckDB's read_json_auto can't easily pass dynamic headers from macro params, 
+        # so we pass the URL as a base64 encoded query string parameter to avoid breaking the webhook URL.
+        self._conn.execute(f"CREATE MACRO fetch_api(target_url) AS TABLE SELECT * FROM read_json_auto('{self.db_url}?method=GET&target_b64=' || to_base64(target_url), headers={{'X-Axiom-Secret': '{webhook_secret}'}})")
 
     async def disconnect(self) -> None:
-        pass
+        if hasattr(self, "_conn") and self._conn:
+            self._conn.close()
+            self._conn = None
 
-    async def execute_query(self, query: str) -> Dict[str, Any]:
-        """
-        POST the filter query to the n8n webhook; return {"columns": [...], "rows": [...]}.
-        query is a JSON string produced by extract_query().
-        """
-        import json
-        webhook_url = self.db_url
-        secret = self.config.get("webhook_secret", "")
-
+    async def execute_query(self, sql: str) -> Dict[str, Any]:
+        await self.connect()
         try:
-            payload = json.loads(query) if query else {}
-        except json.JSONDecodeError:
-            payload = {}
-
-        headers = {"X-Axiom-Secret": secret, "Content-Type": "application/json"}
-
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(webhook_url, json=payload, headers=headers)
-            r.raise_for_status()
+            # We run the query asynchronously (in a thread pool since duckdb is synchronous)
+            import asyncio
+            loop = asyncio.get_event_loop()
             
-            # Check for empty response body before parsing JSON
-            content = r.text.strip()
-            if not content:
-                logger.warning("n8n webhook returned an empty response for %s", self.source_id)
-                return {"columns": [], "rows": []}
-                
-            try:
-                data = r.json()
-            except json.JSONDecodeError as e:
-                logger.error("Failed to parse n8n response as JSON: %s (Content: %s)", e, content[:100])
-                raise RuntimeError(f"n8n returned invalid JSON: {content[:50]}...")
+            def _run():
+                cursor = self._conn.execute(sql)
+                if cursor.description is None:
+                    return {"columns": [], "rows": []}
+                columns = [desc[0] for desc in cursor.description]
+                rows = cursor.fetchall()
+                # DuckDB returns tuples, we convert to list of lists with standard types
+                return {"columns": columns, "rows": [list(row) for row in rows]}
 
-        # n8n returns a list of objects — normalize to columns/rows format
-        if isinstance(data, list):
-            if not data:
-                return {"columns": [], "rows": []}
-            # Support both list of dicts and list of lists (if n8n already normalized it)
-            if isinstance(data[0], dict):
-                columns = list(data[0].keys())
-                rows = [[row.get(col) for col in columns] for row in data]
-                return {"columns": columns, "rows": rows}
-            elif isinstance(data[0], list):
-                # Guess columns if they are not provided
-                columns = [f"col{i}" for i in range(len(data[0]))]
-                return {"columns": columns, "rows": data}
-
-        if isinstance(data, dict):
-            if "columns" in data and "rows" in data:
-                return data
-            # Single object response? Wrap in list
-            columns = list(data.keys())
-            return {"columns": columns, "rows": [[data.get(col) for col in columns]]}
-
-        return {"columns": [], "rows": []}
+            result = await loop.run_in_executor(None, _run)
+            return result
+        finally:
+            await self.disconnect()
 
     async def get_schema(self) -> Dict[str, Any]:
         """
-        Probe the webhook with an empty query to get a sample row,
-        then infer schema from field names and value types.
+        Since n8n is a proxy for 7000+ APIs, we don't have a static schema.
+        We provide the proxy endpoint and instructions to the LLM so it knows how to query it.
         """
-        webhook_url = self.db_url
-        secret = self.config.get("webhook_secret", "")
-        headers = {"X-Axiom-Secret": secret, "Content-Type": "application/json"}
-
-        probe_payload: dict = {"limit": 1, "filters": {}, "fields": []}
-
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                r = await client.post(
-                    webhook_url,
-                    json=probe_payload,
-                    headers=headers,
-                )
-                r.raise_for_status()
-                
-                content = r.text.strip()
-                if not content:
-                    return _placeholder_schema(self.config.get("source_label", "n8n_source"))
-                data = r.json()
-        except Exception as e:
-            logger.warning("N8nConnector.get_schema probe failed for %s: %s", self.source_id, e)
-            source_label = self.config.get("source_label", "n8n_source")
-            return _placeholder_schema(source_label)
-
-        # Normalize data to rows list
-        rows = []
-        if isinstance(data, list):
-            rows = data
-        elif isinstance(data, dict):
-            rows = data.get("rows", [data] if data else [])
+        from axiom.connectors.n8n.services import get_service
         
-        source_label = self.config.get("source_label", "n8n_source")
+        config = self.config or {}
+        webhook_secret = config.get("webhook_secret", "")
+        service_id = config.get("service_id", "unknown_service")
+        
+        service_desc = f"Dynamic proxy for {service_id}. Use DuckDB's read_json_auto to query REST API endpoints."
+        try:
+            svc = get_service(service_id)
+            if svc:
+                service_desc += f"\n\nAPI INSTRUCTIONS:\n{svc.description}"
+        except Exception:
+            pass
+            
+        # Build the example URL
+        example_target = urllib.parse.quote_plus(f"https://api.{service_id}.com/v1/resource")
+        proxy_url = f"{self.db_url}?method=GET&url={example_target}"
 
-        if not rows or not isinstance(rows[0], dict):
-            return _placeholder_schema(source_label)
+        ddl = f"-- This is a dynamic proxy for {service_id}.\n"
+        ddl += f"-- Use DuckDB to query it:\n"
+        ddl += f"-- SELECT * FROM read_json_auto('{self.db_url}?method=GET&url=<ENCODED_API_URL>', headers={{'X-Axiom-Secret': '{webhook_secret}'}})\n"
+        ddl += f"-- IMPORTANT: URL encode the target API URL! (e.g. replace :// with %3A%2F%2F)\n"
+        ddl += f"CREATE VIEW n8n_proxy AS SELECT 'Dynamic JSON' as data;"
 
-        sample = rows[0]
-        fields = {k: _infer_type(v) for k, v in sample.items()}
-        ddl = _build_ddl(source_label, fields)
         return {
-            "tables": {
-                source_label: {
-                    "columns": fields,
-                    "primary_key": None,
-                    "foreign_keys": [],
-                    "ddl": ddl,
-                }
-            }
-        }
-
-
-def _infer_type(value: Any) -> str:
-    if isinstance(value, bool):
-        return "boolean"
-    if isinstance(value, int):
-        return "integer"
-    if isinstance(value, float):
-        return "float"
-    if isinstance(value, list):
-        return "array"
-    if isinstance(value, dict):
-        return "object"
-    return "text"
-
-
-def _build_ddl(table_name: str, fields: dict) -> str:
-    cols = ",\n  ".join(f'"{col}" {typ.upper()}' for col, typ in fields.items()) or '"id" TEXT'
-    return f'CREATE TABLE "{table_name}" (\n  {cols}\n);'
-
-
-def _placeholder_schema(source_label: str) -> dict:
-    """
-    Returned when the webhook probe can't fetch a sample row yet
-    (e.g. the n8n workflow hasn't been triggered or the sheet is empty).
-    The DDL is a minimal placeholder so the onboarding pipeline doesn't crash.
-    Schema will be re-synced once real data flows through.
-    """
-    ddl = f'CREATE TABLE "{source_label}" (\n  "id" TEXT,\n  "value" TEXT\n);'
-    return {
-        "tables": {
-            source_label: {
-                "columns": {"id": "text", "value": "text"},
-                "primary_key": None,
+            f"n8n_{service_id}_proxy": {
+                "columns": ["data"],
                 "foreign_keys": [],
                 "ddl": ddl,
+                "description": service_desc
             }
         }
-    }

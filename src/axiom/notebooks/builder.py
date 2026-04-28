@@ -15,14 +15,18 @@ def _cell(cell_type: str, source: str, **extra: Any) -> Dict[str, Any]:
 def build_analysis_notebook(
     *,
     question: str,
-    sql: str,
-    result: Dict[str, Any],
+    sql: str = "",
+    result: Any,
     insight: str | None = None,
     python_code: str | None = None,
 ) -> tuple[Dict[str, Any], List[str]]:
-    columns = result.get("columns", [])
-    rows = result.get("rows", [])
-    records = [dict(zip(columns, row)) for row in rows]
+    if isinstance(result, dict) and "columns" in result and "rows" in result:
+        columns = result.get("columns", [])
+        rows = result.get("rows", [])
+        records = [dict(zip(columns, row)) for row in rows]
+    else:
+        # App Connector / JSON fallback path
+        records = result if isinstance(result, list) else [result]
 
     # Base64-encode the data so the embedded literal is always safe
     # regardless of quotes, backslashes, or unicode in the values.

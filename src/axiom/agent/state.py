@@ -83,3 +83,6 @@ class AppAgentState(GlobalAgentState):
     # Generic app connector state (Gmail, Slack, GitHub, ...)
     mcp_tool_results: list[dict]
     app_error: Optional[str]
+    python_code: Optional[str]
+    python_error: Optional[str]
+    notebook_attempts: int

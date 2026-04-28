@@ -37,6 +37,7 @@ dependencies = [
     "nbformat>=5.10.0",
     "ipykernel>=6.29.0",
     "temporalio>=1.26.0",
+    "duckdb>=1.5.2",
 ]
 
 [project.optional-dependencies]

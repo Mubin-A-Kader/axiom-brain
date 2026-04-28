@@ -87,6 +87,37 @@ class MemoryManagerNode:
                     "history_tables": history_tables
                 }
 
+        if question.startswith("CONFIRMED_DATABASE:"):
+            import re
+            db_match = re.search(r"Use the '(.*?)' database", question)
+            q_match = re.search(r"answer my question about '(.*?)'", question)
+            
+            if db_match:
+                confirmed_db = db_match.group(1)
+                real_question = q_match.group(1) if q_match else question
+                logger.info(f"System Command Executed: Confirmed Database -> {confirmed_db}")
+                
+                # Persist this confirmed database to the thread metadata for future turns
+                metadata["source_id"] = confirmed_db
+                client = await thread_mgr._get_client()
+                key = f"axiom:thread:{thread_id}"
+                data = await client.get(key)
+                if data:
+                    parsed_data = json.loads(data)
+                    parsed_data["metadata"] = metadata
+                    await client.setex(key, 86400, json.dumps(parsed_data))
+                
+                return {
+                    "question": real_question, 
+                    "source_id": confirmed_db, # Enforce database selection
+                    "active_filters": active_filters,
+                    "verified_joins": verified_joins,
+                    "error_log": error_log,
+                    "negative_constraints": negative_constraints,
+                    "confirmed_tables": confirmed_tables,
+                    "history_tables": history_tables
+                }
+
         if question.startswith("REJECTED_INTENT:"):
             import re
             table_match = re.search(r"The suggested tables \[(.*?)\]", question)

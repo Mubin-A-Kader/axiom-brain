@@ -75,8 +75,23 @@ class AppExecutionNode:
                 "mcp_tool_results": [],
             }
 
+        try:
+            manifest = AppConnectorFactory.get_manifest(self.connector_name)
+            sys_msg = f"""You are a specialized agent for {manifest.display_name}.
+
+INSTRUCTIONS:
+{manifest.description}
+
+SEARCH STRATEGY (CRITICAL):
+When a user asks you to find or search for something, DO NOT rely solely on strict API filters. Users make typos.
+1. Try the API's native search first.
+2. If no results are found, try searching with partial substrings.
+3. IF STILL NOT FOUND, YOU MUST issue a request with NO search filters (e.g., list all recent files/items) to fetch the raw list. Then, manually inspect the returned JSON to find the closest semantic match or typo equivalent. DO NOT tell the user you couldn't find it until you have fetched the unfiltered list and checked it yourself!"""
+        except Exception:
+            sys_msg = f"You are a specialized agent for connecting to {self.connector_name}."
+
         openai_tools = _mcp_tools_to_openai(tools)
-        messages: list[dict] = []
+        messages: list[dict] = [{"role": "system", "content": sys_msg}]
         if history:
             messages.append({"role": "system", "content": f"Conversation so far:\n{history}"})
         messages.append({"role": "user", "content": question})

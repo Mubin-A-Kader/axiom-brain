@@ -179,7 +179,17 @@ export function useAxiomChat(tenantId: string = "default_tenant", lakeId?: strin
               artifact: finalState.artifact as QueryResponse["artifact"],
               layout: typeof finalState.layout === "string" ? finalState.layout : "default",
               action_bar: Array.isArray(finalState.action_bar) ? finalState.action_bar as string[] : [],
-              probing_options: Array.isArray(finalState.probing_options) ? finalState.probing_options as QueryResponse["probing_options"] : [],
+              probing_options: Array.isArray(finalState.probing_options) && finalState.probing_options.length > 0
+                ? finalState.probing_options as QueryResponse["probing_options"] 
+                : Array.isArray(finalState.routing_candidates) && finalState.routing_candidates.length > 0
+                  ? (finalState.routing_candidates as any[]).map(c => ({
+                      id: c.source_id,
+                      business_name: c.source_id.replace(/^n8n_/, '').replace(/_/g, ' ').toUpperCase(),
+                      description: c.reason,
+                      table_name: c.source_id,
+                      sample_data: []
+                    }))
+                  : [],
               session_id: sessionId || String(finalState.session_id || ""),
               thread_id: threadId || String(finalState.thread_id || ""),
               tenant_id: tenantId,

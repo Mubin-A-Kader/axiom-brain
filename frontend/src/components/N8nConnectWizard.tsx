@@ -45,7 +45,11 @@ function ServiceCard({ svc, onClick }: { svc: Service; onClick: () => void }) {
       onClick={onClick}
       className="flex items-center gap-3 w-full px-4 py-3 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 hover:border-[#638A70]/50 transition-all text-left group"
     >
-      <span className="text-2xl">{svc.icon}</span>
+      {svc.icon.startsWith("http") ? (
+        <img src={svc.icon} alt={svc.label} className="w-8 h-8 object-contain" />
+      ) : (
+        <span className="text-2xl">{svc.icon}</span>
+      )}
       <div className="flex-1 min-w-0">
         <p className="text-sm font-semibold text-[#E6E1D8]">{svc.label}</p>
         <p className="text-xs text-[#9A9589] truncate">{svc.description}</p>
@@ -74,7 +78,10 @@ export function N8nConnectWizard({ tenantId, onDone, onClose }: Props) {
     (async () => {
       try {
         const headers = await getAuthHeaders();
-        const res = await fetch(`${getApiUrl()}/api/n8n/services`, { headers });
+        const res = await fetch(`${getApiUrl()}/api/n8n/services`, { 
+          headers,
+          cache: "no-store"
+        });
         if (!res.ok) throw new Error("Failed to load services");
         const data = await res.json();
         setServices(data.services);
@@ -229,7 +236,11 @@ export function N8nConnectWizard({ tenantId, onDone, onClose }: Props) {
               </button>
 
               <div className="flex items-center gap-2">
-                <span className="text-2xl">{selected.icon}</span>
+                {selected.icon.startsWith("http") ? (
+                  <img src={selected.icon} alt={selected.label} className="w-8 h-8 object-contain" />
+                ) : (
+                  <span className="text-2xl">{selected.icon}</span>
+                )}
                 <span className="text-sm font-semibold text-[#E6E1D8]">{selected.label}</span>
                 <span className="ml-auto text-xs px-2 py-0.5 rounded-full bg-white/10 text-[#9A9589]">
                   {selected.auth_type === "oauth2" ? "OAuth2" : "API Key"}

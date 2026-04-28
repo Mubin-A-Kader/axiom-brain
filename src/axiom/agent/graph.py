@@ -9,11 +9,12 @@ from axiom.agent.nodes import (
     NotebookArtifactNode, ResponseSynthesizerNode, SQLCriticNode, DiscoveryNode,
     PythonCodeGenerationNode
 )
+from axiom.agent.probing import IntentProberNode
 from axiom.agent.memory_manager import MemoryManagerNode
 from axiom.agent.state import SQLAgentState, AppAgentState, GlobalAgentState
 from axiom.agent.thread import ThreadManager
 from axiom.agent.supervisor import SupervisorNode
-from axiom.agent.gmail_nodes import AppExecutionNode
+from axiom.agent.app_nodes import AppExecutionNode
 from axiom.config import settings
 from axiom.rag.schema import SchemaRAG
 import axiom.connectors.apps  # registers all app connector manifests
@@ -80,14 +81,39 @@ def _should_retry_notebook(state: SQLAgentState) -> str:
     return "synthesize_response"
 
 
+def _route_after_probing(state: SQLAgentState) -> str:
+    """Route after checking schema ambiguity.
+    
+    If the prober identified multiple unconfirmed candidate tables, 
+    short-circuit to synthesize_response so the user is prompted to clarify.
+    """
+    if state.get("probing_options") or state.get("needs_source_clarification"):
+        return "synthesize_response"
+    return "retrieve_schema"
+
+
 def _route_supervisor(state: GlobalAgentState) -> str:
-    agent = state.get("next_agent", "SQL_AGENT")
-    if agent == "SQL_AGENT":
+    agent = state.get("next_agent", "DATA_AGENT")
+    if agent == "AMBIGUOUS_AGENT":
+        return END
+    if agent == "DATA_AGENT":
         return "sql_subgraph"
     # Dynamic: "GMAIL_AGENT" → "gmail_subgraph", "SLACK_AGENT" → "slack_subgraph", ...
     name = agent.removesuffix("_AGENT").lower()
     return f"{name}_subgraph"
 
+
+def _should_generate_app_notebook(state: AppAgentState) -> str:
+    question = state.get("question", "").lower()
+    if "notebook" in question or "chart" in question or "graph" in question or "plot" in question:
+        if state.get("mcp_tool_results"):
+            return "generate_python_code"
+    return END
+
+def _should_retry_app_notebook(state: AppAgentState) -> str:
+    if state.get("python_error") and not state.get("artifact"):
+        return "generate_python_code"
+    return END
 
 async def build_graph(hitl: bool = True):
     rag = SchemaRAG()
@@ -104,6 +130,7 @@ async def build_graph(hitl: bool = True):
 
     # Single-source path
     sql_graph.add_node("route_tables", TableSelectionNode(rag))
+    sql_graph.add_node("intent_prober", IntentProberNode())
     sql_graph.add_node("retrieve_schema", SchemaRetrievalNode(rag))
     sql_graph.add_node("generate_sql", SQLGenerationNode(rag))
     sql_graph.add_node("execute_sql", SQLExecutionNode(thread_mgr, rag))
@@ -137,7 +164,12 @@ async def build_graph(hitl: bool = True):
     )
 
     # Single-source path (unchanged)
-    sql_graph.add_edge("route_tables", "retrieve_schema")
+    sql_graph.add_edge("route_tables", "intent_prober")
+    sql_graph.add_conditional_edges(
+        "intent_prober",
+        _route_after_probing,
+        {"retrieve_schema": "retrieve_schema", "synthesize_response": "synthesize_response"}
+    )
     sql_graph.add_edge("retrieve_schema", "generate_sql")
     sql_graph.add_edge("generate_sql", "execute_sql")
     sql_graph.add_conditional_edges("execute_sql", _should_correct)
@@ -162,8 +194,14 @@ async def build_graph(hitl: bool = True):
     for manifest in AppConnectorFactory.all_manifests():
         g = StateGraph(AppAgentState)
         g.add_node("execute", AppExecutionNode(manifest.name))
+        g.add_node("generate_python_code", PythonCodeGenerationNode())
+        g.add_node("build_notebook_artifact", NotebookArtifactNode())
+        
         g.set_entry_point("execute")
-        g.add_edge("execute", END)
+        g.add_conditional_edges("execute", _should_generate_app_notebook)
+        g.add_edge("generate_python_code", "build_notebook_artifact")
+        g.add_conditional_edges("build_notebook_artifact", _should_retry_app_notebook)
+        
         app_subgraphs[manifest.name] = g.compile()
         logger.info("Built subgraph for app connector: %s", manifest.name)
 
