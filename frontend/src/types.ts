@@ -36,8 +36,11 @@ export interface QueryResponse {
   insight?: string;
   thought?: string;
   layout?: string;
+  visual_manifest?: JsonObject;
+  insight_kpis?: JsonObject[];
   action_bar?: string[];
   probing_options?: JsonObject[];
+  clarification_questions?: JsonObject[];
   session_id: string;
   thread_id: string;
   tenant_id: string;
@@ -129,6 +132,7 @@ export interface SourceIn {
 export interface ReasoningStep {
   node: string;
   description: string;
+  output?: string;
   status: 'active' | 'completed' | 'error';
 }
 
@@ -145,8 +149,11 @@ export interface ChatMessage {
     insight?: string;
     thought?: string;
     layout?: string;
+    visual_manifest?: JsonObject;
+    insight_kpis?: JsonObject[];
     action_bar?: string[];
     probing_options?: JsonObject[];
+    clarification_questions?: JsonObject[];
     artifact?: NotebookArtifact;
     thread_id?: string;
     session_id?: string;

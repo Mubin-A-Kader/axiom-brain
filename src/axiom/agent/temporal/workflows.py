@@ -20,7 +20,7 @@ def _should_correct(state: SQLAgentState) -> str:
     attempts = state.get("attempts", 0)
 
     if sql_result:
-        return "build_notebook"
+        return "visualize"
     if attempts >= settings.max_correction_attempts:
         return "synthesize"
     if error and (
@@ -75,6 +75,12 @@ class ExecutionWorkflow:
                 SQLActivities.execute_sql, state, **long_act
             )
             self._state = state
+            
+            # Validate data quality (null checks)
+            state = await workflow.execute_activity(
+                SQLActivities.validate_data, state, **act
+            )
+            self._state = state
 
             next_step = _should_correct(state)
             workflow.logger.info(
@@ -82,33 +88,18 @@ class ExecutionWorkflow:
                 state.get("thread_id"), state.get("attempts"), next_step,
             )
 
-            if next_step == "build_notebook":
-                # ── Generate dynamic analysis code ───────────────────────────
+            if next_step == "visualize":
+                # ── Generate declarative visualization manifest ───────────
                 state = await workflow.execute_activity(
-                    SQLActivities.generate_python_code, state, **act
+                    SQLActivities.visualize, state, **act
                 )
                 self._state = state
 
-                # ── Execute + Fix Loop ───────────────────────────────────────
-                max_python_attempts = 3
-                python_attempts = 0
-                while python_attempts < max_python_attempts:
-                    python_attempts += 1
-                    state = await workflow.execute_activity(
-                        SQLActivities.build_notebook, state, **long_act
-                    )
-                    self._state = state
-                    
-                    artifact = state.get("artifact")
-                    if artifact and artifact.get("execution_error"):
-                        state["python_error"] = artifact["execution_error"]
-                        # Re-generate code with the error context
-                        state = await workflow.execute_activity(
-                            SQLActivities.generate_python_code, state, **act
-                        )
-                        self._state = state
-                    else:
-                        break
+                # Also build the optional notebook artifact in the background
+                state = await workflow.execute_activity(
+                    SQLActivities.build_notebook, state, **long_act
+                )
+                self._state = state
                 break
 
             if next_step == "synthesize":

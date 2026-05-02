@@ -84,6 +84,32 @@ function ChatInner({ tenantId, lakes, selectedLakeId, setSelectedLakeId }: any) 
   const router = useRouter();
 
   const latestArtifactMsg = [...messages].reverse().find((m: any) => m.metadata?.result || m.metadata?.artifact);
+
+  // Walk back through messages from a given agent message to find the original user
+  // question — skipping any system-command messages (CONFIRMED_*, REJECTED_*, CLARIFIED_*)
+  // so system commands never nest inside each other.
+  const SYSTEM_PREFIXES = ['CONFIRMED_SOURCE:', 'CONFIRMED_DATABASE:', 'REJECTED_INTENT:', 'CLARIFIED_INTENT:', 'CONFIRMED_SOURCES:'];
+  const getOriginalQuestion = (agentMsgId: string): string => {
+    const idx = messages.findIndex((m: any) => m.id === agentMsgId);
+    for (let i = idx - 1; i >= 0; i--) {
+      const m = messages[i] as any;
+      if (m.role === 'user' && !SYSTEM_PREFIXES.some(p => m.content.startsWith(p))) {
+        return m.content;
+      }
+    }
+    return "";
+  };
+
+  // Multi-select state for probing option cards: msgId → Set of selected table_names
+  const [probingSelections, setProbingSelections] = useState<Record<string, Set<string>>>({});
+  const toggleProbingSelection = (msgId: string, tableKey: string) => {
+    setProbingSelections(prev => {
+      const current = new Set(prev[msgId] || []);
+      if (current.has(tableKey)) current.delete(tableKey);
+      else current.add(tableKey);
+      return { ...prev, [msgId]: current };
+    });
+  };
   
   // Logic: Prefer manually selected artifact, otherwise fall back to the latest one
   const activeArtifactMsg = selectedArtifactId 
@@ -275,6 +301,7 @@ function ChatInner({ tenantId, lakes, selectedLakeId, setSelectedLakeId }: any) 
                 <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
               </optgroup>
               <optgroup label="DeepSeek Systems">
+                <option value="deepseek-v4-flash">DeepSeek V4 Flash ★</option>
                 <option value="deepseek-chat">DeepSeek Chat</option>
                 <option value="deepseek-reasoner">DeepSeek Reasoner</option>
               </optgroup>
@@ -346,13 +373,45 @@ function ChatInner({ tenantId, lakes, selectedLakeId, setSelectedLakeId }: any) 
               ) : (
                 messages.map((msg: any) => (
                   <div key={msg.id} className="relative animate-in fade-in duration-500">
-                    {msg.role === "user" && (
-                      <div className="flex flex-col items-start border-l-[3px] border-tactile-primary pl-10 py-2 mb-4">
-                        <h2 className="text-2xl font-heading font-bold text-tactile-text tracking-tight leading-tight">
-                          {msg.content}
-                        </h2>
-                      </div>
-                    )}
+                    {msg.role === "user" && (() => {
+                      const isSystemCmd = SYSTEM_PREFIXES.some(p => msg.content.startsWith(p));
+                      if (isSystemCmd) {
+                        // Render system-generated intent commands as a compact robotic action tag,
+                        // not as a user chat bubble — the raw command text is internal plumbing.
+                        const label = (() => {
+                          if (msg.content.startsWith('CONFIRMED_SOURCE:') || msg.content.startsWith('CONFIRMED_SOURCES:')) {
+                            const m = msg.content.match(/Use (?:the '(.+?)' table|(\[.+?\]))/);
+                            const src = m ? (m[1] || m[2]) : '—';
+                            return `✦ Source confirmed: ${src}`;
+                          }
+                          if (msg.content.startsWith('CONFIRMED_DATABASE:')) {
+                            const m = msg.content.match(/Use the '(.+?)' database/);
+                            return `✦ Database confirmed: ${m ? m[1] : '—'}`;
+                          }
+                          if (msg.content.startsWith('REJECTED_INTENT:')) return '✦ Intent rejected — searching again';
+                          if (msg.content.startsWith('CLARIFIED_INTENT:')) {
+                            const m = msg.content.match(/CLARIFIED_INTENT:\s*([^|]+)\|/);
+                            const pairs = m ? m[1].trim() : '';
+                            return `✦ Clarified: ${pairs}`;
+                          }
+                          return '✦ System action';
+                        })();
+                        return (
+                          <div className="flex items-center gap-2 pl-10 py-1 mb-2 opacity-40 hover:opacity-60 transition-opacity">
+                            <span className="text-[10px] font-mono font-bold uppercase tracking-[0.2em] text-tactile-primary/70 bg-tactile-primary/5 border border-tactile-primary/10 rounded-md px-2.5 py-1">
+                              {label}
+                            </span>
+                          </div>
+                        );
+                      }
+                      return (
+                        <div className="flex flex-col items-start border-l-[3px] border-tactile-primary pl-10 py-2 mb-4">
+                          <h2 className="text-2xl font-heading font-bold text-tactile-text tracking-tight leading-tight">
+                            {msg.content}
+                          </h2>
+                        </div>
+                      );
+                    })()}
 
                     {msg.role === "agent" && (
                       <div 
@@ -380,48 +439,110 @@ function ChatInner({ tenantId, lakes, selectedLakeId, setSelectedLakeId }: any) 
                           />
                         </div>
 
-                        {/* Proactive Probing Comparison Card */}
-                        {msg.metadata?.probing_options && msg.metadata.probing_options.length > 0 && (
-                          <div className="flex flex-col gap-4 mt-6 p-4 bg-tactile-primary/5 rounded-2xl border border-tactile-primary/10 max-w-fit shadow-tactile-inner">
-                            <div className="flex items-center gap-3">
-                              <Search className="w-4 h-4 text-tactile-primary" />
-                              <span className="text-[10px] font-mono text-tactile-text/40 uppercase tracking-[0.2em] font-bold">Clarify Intent: Which data source should I use?</span>
-                            </div>
-                            <div className="flex flex-wrap items-center gap-2 ml-7">
-                              {msg.metadata.probing_options.map((opt: any) => (
-                                <button 
-                                  key={opt.id}
+                        {/* Proactive Probing Comparison Card — with multi-select */}
+                        {msg.metadata?.probing_options && msg.metadata.probing_options.length > 0 && (() => {
+                          const selected = probingSelections[msg.id] || new Set<string>();
+                          const userQ = getOriginalQuestion(msg.id);
+                          return (
+                            <div className="flex flex-col gap-4 mt-6 p-4 bg-tactile-primary/5 rounded-2xl border border-tactile-primary/10 max-w-fit shadow-tactile-inner">
+                              <div className="flex items-center gap-3">
+                                <Search className="w-4 h-4 text-tactile-primary" />
+                                <span className="text-[10px] font-mono text-tactile-text/40 uppercase tracking-[0.2em] font-bold">
+                                  Clarify Intent — select one or more sources
+                                </span>
+                              </div>
+                              <div className="flex flex-wrap items-center gap-2 ml-7">
+                                {msg.metadata.probing_options.map((opt: any) => {
+                                  const key = opt.table_name || opt.id;
+                                  const isSelected = selected.has(key);
+                                  return (
+                                    <button
+                                      key={opt.id}
+                                      onClick={(e) => { e.stopPropagation(); toggleProbingSelection(msg.id, key); }}
+                                      disabled={isLoading}
+                                      className={`px-4 py-1.5 text-[11px] font-bold uppercase tracking-[0.2em] border rounded-lg transition-all shadow-tactile ${
+                                        isSelected
+                                          ? 'bg-tactile-primary text-tactile-base border-tactile-primary'
+                                          : 'bg-tactile-surface text-tactile-text/80 border-tactile-border hover:border-tactile-primary hover:text-tactile-primary'
+                                      } ${isLoading ? 'opacity-40 cursor-not-allowed' : ''}`}
+                                      title={opt.description}
+                                    >
+                                      {opt.business_name}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                              <div className="flex items-center gap-3 ml-7">
+                                {selected.size > 0 && (
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      const tables = Array.from(selected);
+                                      if (tables.length === 1) {
+                                        const opt = msg.metadata.probing_options.find((o: any) => (o.table_name || o.id) === tables[0]);
+                                        if (opt && (opt.id.startsWith("n8n_") || opt.id === opt.table_name)) {
+                                          sendMessage(`CONFIRMED_DATABASE: Use the '${opt.id}' database to answer my question about '${userQ}'.`);
+                                        } else {
+                                          sendMessage(`CONFIRMED_SOURCE: Use the '${tables[0]}' table to answer my question about '${userQ}'.`);
+                                        }
+                                      } else {
+                                        sendMessage(`CONFIRMED_SOURCES: ${JSON.stringify(tables)} | question: '${userQ}'`);
+                                      }
+                                      setProbingSelections(prev => { const n = {...prev}; delete n[msg.id]; return n; });
+                                    }}
+                                    disabled={isLoading}
+                                    className="px-4 py-1.5 text-[11px] font-bold uppercase tracking-[0.2em] bg-tactile-primary text-tactile-base rounded-lg hover:bg-tactile-primary-hover transition-all disabled:opacity-40 shadow-tactile"
+                                  >
+                                    Use {selected.size > 1 ? `${selected.size} sources` : 'selected'}
+                                  </button>
+                                )}
+                                <button
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    const prevMsg = messages[messages.findIndex((m: any) => m.id === msg.id) - 1];
-                                    const userQ = prevMsg ? prevMsg.content : "";
-                                    
-                                    // If this is a database routing candidate (e.g. n8n source), use CONFIRMED_DATABASE
-                                    if (opt.id.startsWith("n8n_") || opt.id === opt.table_name) {
-                                      sendMessage(`CONFIRMED_DATABASE: Use the '${opt.id}' database to answer my question about '${userQ}'.`);
-                                    } else {
-                                      sendMessage(`CONFIRMED_SOURCE: Use the '${opt.table_name}' table to answer my question about '${userQ}'.`);
-                                    }
+                                    const userQ = getOriginalQuestion(msg.id);
+                                    const suggestedTables = msg.metadata.probing_options.map((opt: any) => `'${opt.table_name}'`).join(", ");
+                                    sendMessage(`REJECTED_INTENT: The suggested tables [${suggestedTables}] are not what I meant. Please find other tables to answer my question about '${userQ}'.`);
                                   }}
-                                  className="px-4 py-1.5 text-[11px] font-bold uppercase tracking-[0.2em] bg-tactile-surface text-tactile-text/80 border border-tactile-border rounded-lg hover:border-tactile-primary hover:text-tactile-primary transition-all shadow-tactile"
-                                  title={opt.description}
+                                  disabled={isLoading}
+                                  className="px-4 py-1.5 text-[11px] font-bold uppercase tracking-[0.2em] bg-transparent text-tactile-text/40 border border-transparent rounded-lg hover:text-tactile-warning hover:bg-tactile-warning/10 transition-all disabled:opacity-40"
                                 >
-                                  {opt.business_name}
+                                  None of these
                                 </button>
-                              ))}
-                              <button 
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  const prevMsg = messages[messages.findIndex((m: any) => m.id === msg.id) - 1];
-                                  const userQ = prevMsg ? prevMsg.content : "";
-                                  const suggestedTables = msg.metadata.probing_options.map((opt: any) => `'${opt.table_name}'`).join(", ");
-                                  sendMessage(`REJECTED_INTENT: The suggested tables [${suggestedTables}] are not what I meant. Please find other tables to answer my question about '${userQ}'.`);
-                                }}
-                                className="px-4 py-1.5 text-[11px] font-bold uppercase tracking-[0.2em] bg-transparent text-tactile-text/40 border border-transparent rounded-lg hover:text-tactile-warning hover:bg-tactile-warning/10 transition-all"
-                              >
-                                None of these
-                              </button>
+                              </div>
                             </div>
+                          );
+                        })()}
+
+                        {/* Semantic Clarification Card */}
+                        {msg.metadata?.clarification_questions && msg.metadata.clarification_questions.length > 0 && (
+                          <div className="flex flex-col gap-5 mt-6 p-4 bg-tactile-primary/5 rounded-2xl border border-tactile-primary/10 max-w-xl shadow-tactile-inner">
+                            <div className="flex items-center gap-3">
+                              <Search className="w-4 h-4 text-tactile-primary" />
+                              <span className="text-[10px] font-mono text-tactile-text/40 uppercase tracking-[0.2em] font-bold">Clarify Intent</span>
+                            </div>
+                            {msg.metadata.clarification_questions.map((cq: any) => {
+                              const userQ = getOriginalQuestion(msg.id);
+                              return (
+                                <div key={cq.id} className="flex flex-col gap-2 ml-7">
+                                  <span className="text-[11px] text-tactile-text/60 font-medium">{cq.question}</span>
+                                  <div className="flex flex-wrap gap-2">
+                                    {cq.options.map((opt: string) => (
+                                      <button
+                                        key={opt}
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          sendMessage(`CLARIFIED_INTENT: ${cq.dimension}=${opt} | question: '${userQ}'`);
+                                        }}
+                                        disabled={isLoading}
+                                        className={`px-4 py-1.5 text-[11px] font-bold uppercase tracking-[0.2em] bg-tactile-surface text-tactile-text/80 border border-tactile-border rounded-lg hover:border-tactile-primary hover:text-tactile-primary transition-all shadow-tactile ${isLoading ? 'opacity-40 cursor-not-allowed' : ''}`}
+                                      >
+                                        {opt}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              );
+                            })}
                           </div>
                         )}
 

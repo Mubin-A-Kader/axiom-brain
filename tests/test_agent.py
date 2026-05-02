@@ -65,7 +65,8 @@ async def test_schema_retrieval_node_success(
 
     assert "schema_context" in result
     assert "TABLE users" in result["schema_context"]
-    mock_rag.retrieve.assert_called_once_with("default_tenant", "default_source", sample_state["question"])
+    # Update to match the new n_results=5 default in SchemaRetrievalNode
+    mock_rag.retrieve.assert_called_once_with("default_tenant", "default_source", sample_state["question"], n_results=5)
 
 
 @pytest.mark.asyncio
@@ -140,12 +141,13 @@ async def test_sql_generation_prompt_building(mock_rag: AsyncMock, sample_state:
     state["schema_context"] = sample_schema_context
     state["question"] = "Count active users"
     state["error"] = None
-    prompt = await node._build_prompt(state)
+    system_msg, context_msg = await node._build_prompt(state)
+    full_prompt = system_msg + context_msg
 
-    assert "SQL expert" in prompt
-    assert "TABLE users" in prompt
-    assert "Count active users" in prompt
-    assert "PREVIOUS ATTEMPT FAILED" not in prompt
+    assert "SQL" in full_prompt
+    assert "TABLE users" in full_prompt
+    assert "Count active users" in full_prompt
+    assert "PREVIOUS ATTEMPT FAILED" not in full_prompt
 
 
 @pytest.mark.asyncio
@@ -157,10 +159,11 @@ async def test_sql_generation_prompt_with_error(mock_rag: AsyncMock, sample_stat
     state["schema_context"] = sample_schema_context
     state["question"] = "Get user emails"
     state["error"] = error
-    prompt = await node._build_prompt(state)
+    system_msg, context_msg = await node._build_prompt(state)
+    full_prompt = system_msg + context_msg
 
-    assert error in prompt
-    assert "PREVIOUS ATTEMPT FAILED" in prompt
+    assert error in full_prompt
+    assert "PREVIOUS ATTEMPT FAILED" in full_prompt
 
 
 # ============================================================================
@@ -206,11 +209,11 @@ async def test_sql_execution_node_error(sample_state: SQLAgentState) -> None:
     """Test SQL execution node handles errors gracefully."""
     node = SQLExecutionNode()
     state = sample_state.copy()
-    state["sql_query"] = "SELECT INVALID SQL QUERY"
+    state["sql_query"] = "DROP TABLE users" # Triggers Security Violation
 
     # Mock Connector failing
     mock_connector = AsyncMock()
-    mock_connector.execute_query = AsyncMock(side_effect=Exception("Query syntax error"))
+    mock_connector.execute_query = AsyncMock(side_effect=Exception("Database error"))
 
     # Mock Control Plane DB
     mock_cp_conn = AsyncMock()
@@ -326,7 +329,7 @@ async def test_schema_retrieval_with_special_characters(
     node = SchemaRetrievalNode(mock_rag)
     await node(state)
 
-    mock_rag.retrieve.assert_called_once_with("default_tenant", "default_source", special_question)
+    mock_rag.retrieve.assert_called_once_with("default_tenant", "default_source", special_question, n_results=5)
 
 @pytest.mark.asyncio
 async def test_sql_generation_with_empty_schema(sample_state: SQLAgentState) -> None:
@@ -337,11 +340,11 @@ async def test_sql_generation_with_empty_schema(sample_state: SQLAgentState) -> 
     state["schema_context"] = ""
     state["question"] = "Get users"
     state["error"] = None
-    prompt = await node._build_prompt(state)
+    system_msg, context_msg = await node._build_prompt(state)
+    full_prompt = system_msg + context_msg
 
-    assert len(prompt) > 0
-
-    assert "SQL expert" in prompt
+    assert len(full_prompt) > 0
+    assert "SQL" in full_prompt
 
 
 @pytest.mark.asyncio

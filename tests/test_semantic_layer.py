@@ -23,15 +23,16 @@ async def test_semantic_layer_enforcement():
         "query_type": "NEW_TOPIC"
     }
 
-    # Generate the prompt
-    prompt = await node._build_prompt(state)
+    # Generate the prompt (returns system_msg, context_msg tuple)
+    system_msg, context_msg = await node._build_prompt(state)
+    full_prompt = system_msg + context_msg
 
     # Verify the custom rules (Business Glossary) are injected correctly
-    assert "BUSINESS GLOSSARY (SEMANTIC LAYER):" in prompt
-    assert "Net Revenue" in prompt
-    assert "SUM(amount) FILTER (WHERE status = 'paid')" in prompt
-    
+    assert "BUSINESS GLOSSARY (SEMANTIC LAYER):" in full_prompt
+    assert "Net Revenue" in full_prompt
+    assert "SUM(amount) FILTER (WHERE status = 'paid')" in full_prompt
+
     # Verify the enforcement instructions are present
-    assert "SEMANTIC LAYER ENFORCEMENT:" in prompt
-    assert "MUST use the EXACT SQL formula provided in the glossary" in prompt
+    assert "SEMANTIC LAYER ENFORCEMENT:" in full_prompt
+    assert "MUST use the EXACT SQL formula provided in the glossary" in full_prompt
 

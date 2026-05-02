@@ -26,15 +26,23 @@ class GlobalAgentState(TypedDict, total=False):
     lake_worker_results: list[dict]    # serialised LakeWorkerResult per source
     needs_source_clarification: bool   # True when router is ambiguous → HITL
     routing_candidates: list[dict]     # candidate sources surfaced to the user when ambiguous
+    schema_contracts: list[dict]       # serialised SchemaContract list — cross-source column mappings
+    task_plan: list[dict]              # serialised AxiomTask list produced by TaskPlannerNode
 
     # Common Outputs
     response_text: Optional[str]
     agent_thought: Optional[str]
     artifact: Optional[dict]
+    visual_manifest: Optional[dict]     # Declarative ChartManifest JSON
+    insight_kpis: list[dict]           # [{ "label": "Total Rev", "value": "$5M", "trend": "up" }, ...]
     layout: str
     action_bar: list[str]
     error: Optional[str]
     sql_query: Optional[str]   # surfaced here so CLI HITL can read it post-interrupt
+
+    # Clarification — declared here so it propagates from sql_subgraph → parent graph
+    probing_options: list[dict]
+    clarification_questions: list[dict]
 
 
 class SQLAgentState(GlobalAgentState):
@@ -59,7 +67,6 @@ class SQLAgentState(GlobalAgentState):
     verified_joins: list[str]
     error_log: list[str]
     negative_constraints: list[str]
-    probing_options: list[dict]
     confirmed_tables: list[str]
     history_tables: list[str]
     last_sql_result: Optional[str]

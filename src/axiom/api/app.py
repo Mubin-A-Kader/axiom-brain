@@ -141,8 +141,11 @@ class QueryResponse(BaseModel):
     insight: Optional[str] = None
     thought: Optional[str] = None
     layout: str = "default"
+    visual_manifest: Optional[Dict[str, Any]] = None
+    insight_kpis: List[Dict[str, Any]] = []
     action_bar: List[str] = []
     probing_options: List[Dict[str, Any]] = []
+    clarification_questions: List[Dict[str, Any]] = []
     session_id: str
     thread_id: str
     tenant_id: str
@@ -1035,6 +1038,8 @@ async def query_stream(req: QueryRequest, user_id: str = Depends(verify_token)):
         "lake_worker_results": [],
         "needs_source_clarification": False,
         "routing_candidates": [],
+        "probing_options": [],
+        "clarification_questions": [],
         "sql_query": None,
         "sql_result": None,
         "error": None,
@@ -1207,8 +1212,11 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
         error = state.get("error")
         
         layout = state.get("layout", "default")
+        visual_manifest = state.get("visual_manifest")
+        insight_kpis = state.get("insight_kpis", [])
         action_bar = state.get("action_bar", [])
         probing_options = state.get("probing_options", [])
+        clarification_questions = state.get("clarification_questions", [])
 
         if sql and not await _guard.is_safe(sql):
             logger.warning("Security Violation: Generated SQL blocked by Lakera Guard: %s", sql)
@@ -1255,8 +1263,11 @@ async def query(req: QueryRequest, user_id: str = Depends(verify_token)) -> Quer
             insight=state.get("response_text") if not error else f"I encountered a database error: {error}",
             thought=state.get("agent_thought"),
             layout=layout,
+            visual_manifest=visual_manifest,
+            insight_kpis=insight_kpis,
             action_bar=action_bar,
             probing_options=probing_options,
+            clarification_questions=clarification_questions,
             session_id=session_id,
             thread_id=thread_id,
             tenant_id=tenant_id,
@@ -1335,6 +1346,7 @@ async def approve(req: ApproveRequest, user_id: str = Depends(verify_token)) -> 
         layout = state.get("layout", "default")
         action_bar = state.get("action_bar", [])
         probing_options = state.get("probing_options", [])
+        clarification_questions = state.get("clarification_questions", [])
 
         if state.get("error") and not state.get("sql_result"):
             raise HTTPException(status_code=422, detail=state["error"])
@@ -1372,6 +1384,7 @@ async def approve(req: ApproveRequest, user_id: str = Depends(verify_token)) -> 
             layout=layout,
             action_bar=action_bar,
             probing_options=probing_options,
+            clarification_questions=clarification_questions,
             session_id=req.session_id,
             thread_id=req.thread_id,
             tenant_id=req.tenant_id,

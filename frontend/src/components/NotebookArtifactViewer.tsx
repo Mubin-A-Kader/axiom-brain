@@ -41,38 +41,55 @@ function isInteractiveChart(html: string): boolean {
   return lower.includes("plotly") || lower.includes("echarts") || lower.includes("vega") || lower.includes("bokeh");
 }
 
-// Auto-resizing iframe for interactive Plotly/ECharts charts
+// Auto-resizing iframe for interactive Plotly/ECharts charts.
+// Plotly renders asynchronously via JS so we can't read scrollHeight on load —
+// instead the iframe sends its height via postMessage after Plotly finishes.
 function ChartFrame({ html }: { html: string }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
-  const [height, setHeight] = useState(420);
+  const [height, setHeight] = useState(460);
+  const frameId = useRef(`cf-${Math.random().toString(36).slice(2)}`);
 
   useEffect(() => {
-    const iframe = iframeRef.current;
-    if (!iframe) return;
-    const onLoad = () => {
-      try {
-        const body = iframe.contentDocument?.body;
-        if (body) {
-          const h = body.scrollHeight;
-          if (h > 0) setHeight(Math.min(Math.max(h + 16, 300), 640));
-        }
-      } catch {
-        // cross-origin or not ready — keep default height
+    const id = frameId.current;
+    const handler = (e: MessageEvent) => {
+      if (e.data?.frameId === id && e.data?.type === "axiom-chart-height") {
+        const h = Number(e.data.height);
+        if (h > 0) setHeight(Math.min(Math.max(h + 24, 320), 720));
       }
     };
-    iframe.addEventListener("load", onLoad);
-    return () => iframe.removeEventListener("load", onLoad);
-  }, [html]);
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, []);
+
+  // Inject a tiny script that reports body height to the parent after Plotly draws
+  const resizeScript = `
+<script>
+(function(){
+  var fid="${frameId.current}";
+  function report(){
+    var h=document.body.scrollHeight;
+    if(h>0) window.parent.postMessage({type:"axiom-chart-height",frameId:fid,height:h},"*");
+  }
+  // fire at 200 ms, 600 ms, 1.5 s — Plotly usually finishes within 600 ms
+  setTimeout(report,200); setTimeout(report,600); setTimeout(report,1500);
+  try{ new ResizeObserver(report).observe(document.body); }catch(e){}
+})();
+</script>`;
+
+  const srcDoc = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:transparent;color:#E6E1D8;font:13px/1.5 system-ui,-apple-system,sans-serif}
+.plotly-graph-div{width:100%!important}
+</style></head><body>${html}${resizeScript}</body></html>`;
 
   return (
     <iframe
       ref={iframeRef}
       title="Interactive chart"
-      // allow-scripts is required for Plotly/ECharts interactivity
       sandbox="allow-scripts"
-      srcDoc={`<!DOCTYPE html><html><head><meta charset="utf-8"><style>*{margin:0;padding:0;box-sizing:border-box}body{background:#1E1E1C;color:#E6E1D8;font:12px system-ui}</style></head><body>${html}</body></html>`}
+      srcDoc={srcDoc}
       style={{ height }}
-      className="w-full border-0"
+      className="w-full border-0 block"
       scrolling="no"
     />
   );
@@ -120,7 +137,11 @@ function CellOutputs({ outputs }: { outputs: NotebookCellOutput[] }) {
 
         if (html) {
           return (
-            <div key={i} className="rounded-lg border border-white/5 overflow-hidden">
+            <div key={i} className={`rounded-xl overflow-hidden border ${
+              isInteractiveChart(html)
+                ? "border-white/5 bg-[#181816]"
+                : "border-white/5"
+            }`}>
               {isInteractiveChart(html) ? <ChartFrame html={html} /> : <TableFrame html={html} />}
             </div>
           );
@@ -299,8 +320,13 @@ export function NotebookArtifactViewer({ artifact }: NotebookArtifactViewerProps
           const source = sourceToText(cell.source);
           if (cell.cell_type === "markdown") {
             return (
-              <div key={index} className="px-4 py-3">
-                <div className="prose prose-sm prose-zinc prose-invert max-w-none text-[#E6E1D8]/80">
+              <div key={index} className="px-5 py-4">
+                <div className="prose prose-sm max-w-none
+                  [&_h1]:text-lg [&_h1]:font-bold [&_h1]:text-[#E6E1D8] [&_h1]:tracking-tight [&_h1]:mb-2 [&_h1]:mt-0
+                  [&_h2]:text-base [&_h2]:font-semibold [&_h2]:text-[#E6E1D8]/80 [&_h2]:mt-4 [&_h2]:mb-1
+                  [&_p]:text-sm [&_p]:text-[#E6E1D8]/60 [&_p]:leading-relaxed [&_p]:my-1
+                  [&_strong]:text-[#E6E1D8]/90 [&_em]:text-[#638A70]
+                  [&_code]:text-[11px] [&_code]:bg-white/5 [&_code]:px-1 [&_code]:rounded [&_code]:text-[#638A70]">
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>{source}</ReactMarkdown>
                 </div>
               </div>

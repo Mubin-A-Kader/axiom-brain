@@ -157,8 +157,9 @@ class SchemaRAG:
 
             ordered: list[str] = []
             seen: set[str] = set()
-            if vector_results and vector_results["metadatas"] and vector_results["metadatas"][0]:
-                for meta in vector_results["metadatas"][0]:
+            metadatas = vector_results.get("metadatas")
+            if metadatas and metadatas[0]:
+                for meta in metadatas[0]:
                     t = meta.get("table")
                     if t and t not in seen:
                         ordered.append(t)
@@ -169,18 +170,30 @@ class SchemaRAG:
             final_lines: list[str] = []
             total_tokens = 0
             for table in ordered:
+                # 1. Get DDL
                 res = self._collection.get(
                     ids=[f"{tenant_id}_{source_id}_{table}"], include=["documents"]
                 )
                 if not (res and res["documents"] and res["documents"][0]):
                     continue
                 ddl = res["documents"][0]
-                tokens = self._count_tokens(ddl)
+                
+                # 2. Get Summary/Description
+                desc_text = ""
+                desc_res = self._collection.get(
+                    ids=[f"{tenant_id}_{source_id}_summary_{table}"], include=["documents"]
+                )
+                if desc_res and desc_res["documents"] and desc_res["documents"][0]:
+                    desc_text = f"-- Description: {desc_res['documents'][0]}\n"
+
+                block = desc_text + ddl
+                tokens = self._count_tokens(block)
                 if total_tokens + tokens > settings.max_schema_tokens:
                     break
-                final_lines.append(ddl)
+                final_lines.append(block)
                 total_tokens += tokens
 
+                # 3. Get Samples
                 s_res = self._collection.get(
                     ids=[f"{tenant_id}_{source_id}_sample_{table}"], include=["documents"]
                 )
@@ -196,6 +209,23 @@ class SchemaRAG:
         except Exception:
             logger.exception("retrieve() failed for %s/%s", tenant_id, source_id)
             return "No schema context found."
+
+    async def search_tables(self, tenant_id: str, source_id: str, question: str, n_results: int = 10) -> list[str]:
+        """Vector search over DDL documents to find tables by column/structure similarity."""
+        try:
+            q_embedding = await self._embed([question])
+            results = self._collection.query(
+                query_embeddings=q_embedding,
+                n_results=n_results,
+                where=_where(tenant_id, source_id, "schema"),
+                include=["metadatas"],
+            )
+            metadatas = results.get("metadatas")
+            if not (metadatas and metadatas[0]):
+                return []
+            return [meta["table"] for meta in metadatas[0]]
+        except Exception:
+            return []
 
     async def search_table_summaries(self, tenant_id: str, source_id: str, question: str, n_results: int = 10) -> list[dict]:
         """Vector search over table summaries for routing."""
@@ -236,25 +266,41 @@ class SchemaRAG:
                 resolved.append(match if match else t)
 
         related: set[str] = set(resolved)
-        for t in resolved:
-            if t in graph:
-                related.update(nx.neighbors(graph, t))
+        # Expand 2 levels of neighbors to catch multi-hop joins (e.g. results -> funds -> companies)
+        for _ in range(2):
+            new_neighbors = set()
+            for t in related:
+                if t in graph:
+                    new_neighbors.update(nx.neighbors(graph, t))
+            related.update(new_neighbors)
 
         lines: list[str] = []
         total_tokens = 0
         for table in resolved + [t for t in related if t not in resolved]:
+            # 1. Get DDL
             res = self._collection.get(
                 ids=[f"{tenant_id}_{source_id}_{table}"], include=["documents"]
             )
             if not (res and res["documents"] and res["documents"][0]):
                 continue
             ddl = res["documents"][0]
-            tokens = self._count_tokens(ddl)
+            
+            # 2. Get Summary/Description
+            desc_text = ""
+            desc_res = self._collection.get(
+                ids=[f"{tenant_id}_{source_id}_summary_{table}"], include=["documents"]
+            )
+            if desc_res and desc_res["documents"] and desc_res["documents"][0]:
+                desc_text = f"-- Description: {desc_res['documents'][0]}\n"
+
+            block = desc_text + ddl
+            tokens = self._count_tokens(block)
             if total_tokens + tokens > settings.max_schema_tokens:
                 continue
-            lines.append(ddl)
+            lines.append(block)
             total_tokens += tokens
 
+            # 3. Get Samples
             s_res = self._collection.get(
                 ids=[f"{tenant_id}_{source_id}_sample_{table}"], include=["documents"]
             )

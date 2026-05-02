@@ -108,7 +108,7 @@ export function IntelligenceOrb({ steps, isCompleted, thought, sql }: Intelligen
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="flex items-baseline gap-4">
-                        <span className={`text-[10px] font-mono font-bold uppercase tracking-[0.2em] transition-colors ${
+                        <span className={`shrink-0 text-[10px] font-mono font-bold uppercase tracking-[0.2em] transition-colors ${
                           step.status === "active" ? "text-tactile-primary" : "text-tactile-text/20 group-hover/step:text-tactile-text/40"
                         }`}>
                           {step.node}
@@ -116,9 +116,14 @@ export function IntelligenceOrb({ steps, isCompleted, thought, sql }: Intelligen
                         <span className={`text-sm leading-relaxed transition-colors ${
                           step.status === "active" ? "text-tactile-text font-medium" : "text-tactile-text/40"
                         }`}>
-                          {step.description}
+                          {step.status === "active" ? step.description : (step.output || step.description)}
                         </span>
                       </div>
+                      {step.status === "active" && step.output && (
+                        <div className="mt-1 ml-0 text-[11px] font-mono text-tactile-primary/70 truncate">
+                          {step.output}
+                        </div>
+                      )}
                     </div>
                   </div>
                 ))}

@@ -7,14 +7,16 @@ from axiom.agent.nodes import (
     TableSelectionNode, DatabaseSelectionNode,
     LakeOrchestratorNode, LakeCuratorNode,
     NotebookArtifactNode, ResponseSynthesizerNode, SQLCriticNode, DiscoveryNode,
-    PythonCodeGenerationNode
+    VisualizationNode, SQLPlannerNode, DataValidatorNode
 )
-from axiom.agent.probing import IntentProberNode
+from axiom.agent.probing import IntentProberNode, QuestionAmbiguityNode
 from axiom.agent.memory_manager import MemoryManagerNode
 from axiom.agent.state import SQLAgentState, AppAgentState, GlobalAgentState
 from axiom.agent.thread import ThreadManager
 from axiom.agent.supervisor import SupervisorNode
 from axiom.agent.app_nodes import AppExecutionNode
+from axiom.agent.recovery import router as _recovery_router
+from axiom.agent.task_planner import TaskPlannerNode, TaskExecutorNode
 from axiom.config import settings
 from axiom.rag.schema import SchemaRAG
 import axiom.connectors.apps  # registers all app connector manifests
@@ -38,47 +40,29 @@ def _route_after_lake_curation(state: SQLAgentState) -> str:
     """Mirror of _should_correct for the lake path.
 
     When the curator produced a sql_result (data to visualise), continue to
-    generate_python_code → build_notebook_artifact exactly as the single-source
+    visualize → build_notebook_artifact exactly as the single-source
     path does.  If the curator produced no data (all workers failed), go
     straight to synthesize_response which will relay the curator's message.
     """
-    return "generate_python_code" if state.get("sql_result") else "synthesize_response"
+    return "visualize" if state.get("sql_result") else "synthesize_response"
 
 
 def _should_correct(state: SQLAgentState) -> str:
-    error = state.get("error")
-    sql_result = state.get("sql_result")
-    attempts = state.get("attempts", 0)
-
-    if sql_result:
-        return "generate_python_code"
-
-    if attempts >= settings.max_correction_attempts:
-        return "synthesize_response"
-
-    if error and (
-        "Exhausted maximum SQL correction" in error
-        or "permission denied" in error.lower()
-    ):
-        return "synthesize_response"
-
-    if error and "ZERO_RESULTS" in error:
-        return "critic"
-
-    if error and "does not exist" in error.lower() and attempts <= 1:
-        return "discovery"
-
-    if error:
-        return "critic"
-
-    return "synthesize_response"
+    return _recovery_router.route(state)
 
 
 def _should_retry_notebook(state: SQLAgentState) -> str:
-    """Route back to code generation if execution failed and retries remain."""
+    """Route back to visualization if execution failed and retries remain."""
     if state.get("python_error") and not state.get("artifact"):
-        return "generate_python_code"
+        return "visualize"
     return "synthesize_response"
+
+
+def _route_after_ambiguity_check(state: SQLAgentState) -> str:
+    """Short-circuit to synthesize_response when the question needs clarification."""
+    if state.get("clarification_questions"):
+        return "synthesize_response"
+    return "route_database"
 
 
 def _route_after_probing(state: SQLAgentState) -> str:
@@ -98,6 +82,8 @@ def _route_supervisor(state: GlobalAgentState) -> str:
         return END
     if agent == "DATA_AGENT":
         return "sql_subgraph"
+    if agent == "PLANNER_AGENT":
+        return "planner_subgraph"
     # Dynamic: "GMAIL_AGENT" → "gmail_subgraph", "SLACK_AGENT" → "slack_subgraph", ...
     name = agent.removesuffix("_AGENT").lower()
     return f"{name}_subgraph"
@@ -107,12 +93,12 @@ def _should_generate_app_notebook(state: AppAgentState) -> str:
     question = state.get("question", "").lower()
     if "notebook" in question or "chart" in question or "graph" in question or "plot" in question:
         if state.get("mcp_tool_results"):
-            return "generate_python_code"
+            return "visualize"
     return END
 
 def _should_retry_app_notebook(state: AppAgentState) -> str:
     if state.get("python_error") and not state.get("artifact"):
-        return "generate_python_code"
+        return "visualize"
     return END
 
 async def build_graph(hitl: bool = True):
@@ -122,6 +108,7 @@ async def build_graph(hitl: bool = True):
     # ── 1. SQL Sub-Graph ──
     sql_graph = StateGraph(SQLAgentState)
     sql_graph.add_node("memory_manager", MemoryManagerNode())
+    sql_graph.add_node("question_ambiguity", QuestionAmbiguityNode())
     sql_graph.add_node("route_database", DatabaseSelectionNode())
 
     # Lake fan-out path
@@ -132,16 +119,23 @@ async def build_graph(hitl: bool = True):
     sql_graph.add_node("route_tables", TableSelectionNode(rag))
     sql_graph.add_node("intent_prober", IntentProberNode())
     sql_graph.add_node("retrieve_schema", SchemaRetrievalNode(rag))
+    sql_graph.add_node("sql_planner", SQLPlannerNode())
     sql_graph.add_node("generate_sql", SQLGenerationNode(rag))
     sql_graph.add_node("execute_sql", SQLExecutionNode(thread_mgr, rag))
+    sql_graph.add_node("data_validator", DataValidatorNode())
     sql_graph.add_node("critic", SQLCriticNode())
     sql_graph.add_node("discovery", DiscoveryNode())
-    sql_graph.add_node("generate_python_code", PythonCodeGenerationNode())
+    sql_graph.add_node("visualize", VisualizationNode())
     sql_graph.add_node("build_notebook_artifact", NotebookArtifactNode())
     sql_graph.add_node("synthesize_response", ResponseSynthesizerNode())
 
     sql_graph.set_entry_point("memory_manager")
-    sql_graph.add_edge("memory_manager", "route_database")
+    sql_graph.add_edge("memory_manager", "question_ambiguity")
+    sql_graph.add_conditional_edges(
+        "question_ambiguity",
+        _route_after_ambiguity_check,
+        {"route_database": "route_database", "synthesize_response": "synthesize_response"},
+    )
 
     # After DB selection: fan-out to lake orchestrator or continue to single-source path.
     # "synthesize_response" is included so routing errors short-circuit cleanly.
@@ -160,7 +154,7 @@ async def build_graph(hitl: bool = True):
     sql_graph.add_conditional_edges(
         "lake_curator",
         _route_after_lake_curation,
-        {"generate_python_code": "generate_python_code", "synthesize_response": "synthesize_response"},
+        {"visualize": "visualize", "synthesize_response": "synthesize_response"},
     )
 
     # Single-source path (unchanged)
@@ -170,16 +164,18 @@ async def build_graph(hitl: bool = True):
         _route_after_probing,
         {"retrieve_schema": "retrieve_schema", "synthesize_response": "synthesize_response"}
     )
-    sql_graph.add_edge("retrieve_schema", "generate_sql")
+    sql_graph.add_edge("retrieve_schema", "sql_planner")
+    sql_graph.add_edge("sql_planner", "generate_sql")
     sql_graph.add_edge("generate_sql", "execute_sql")
-    sql_graph.add_conditional_edges("execute_sql", _should_correct)
+    sql_graph.add_edge("execute_sql", "data_validator")
+    sql_graph.add_conditional_edges("data_validator", _should_correct)
     sql_graph.add_edge("critic", "generate_sql")
     sql_graph.add_edge("discovery", "generate_sql")
-    sql_graph.add_edge("generate_python_code", "build_notebook_artifact")
+    sql_graph.add_edge("visualize", "build_notebook_artifact")
     sql_graph.add_conditional_edges(
         "build_notebook_artifact",
         _should_retry_notebook,
-        {"generate_python_code": "generate_python_code", "synthesize_response": "synthesize_response"},
+        {"visualize": "visualize", "synthesize_response": "synthesize_response"},
     )
     sql_graph.add_edge("synthesize_response", END)
     
@@ -188,33 +184,46 @@ async def build_graph(hitl: bool = True):
         interrupt_before=["execute_sql"] if hitl else []
     )
 
-    # ── 2. App Sub-Graphs (one per registered manifest) ──
+    # ── 2. Planner Sub-Graph ──
+    planner_graph = StateGraph(SQLAgentState)
+    planner_graph.add_node("task_planner", TaskPlannerNode())
+    planner_graph.add_node("task_executor", TaskExecutorNode())
+    planner_graph.add_node("synthesize_response", ResponseSynthesizerNode())
+    planner_graph.set_entry_point("task_planner")
+    planner_graph.add_edge("task_planner", "task_executor")
+    planner_graph.add_edge("task_executor", "synthesize_response")
+    planner_graph.add_edge("synthesize_response", END)
+    compiled_planner = planner_graph.compile()
+
+    # ── 3. App Sub-Graphs (one per registered manifest) ──
     from axiom.connectors.apps.factory import AppConnectorFactory
     app_subgraphs: dict[str, object] = {}
     for manifest in AppConnectorFactory.all_manifests():
         g = StateGraph(AppAgentState)
         g.add_node("execute", AppExecutionNode(manifest.name))
-        g.add_node("generate_python_code", PythonCodeGenerationNode())
+        g.add_node("visualize", VisualizationNode())
         g.add_node("build_notebook_artifact", NotebookArtifactNode())
         
         g.set_entry_point("execute")
         g.add_conditional_edges("execute", _should_generate_app_notebook)
-        g.add_edge("generate_python_code", "build_notebook_artifact")
+        g.add_edge("visualize", "build_notebook_artifact")
         g.add_conditional_edges("build_notebook_artifact", _should_retry_app_notebook)
         
         app_subgraphs[manifest.name] = g.compile()
         logger.info("Built subgraph for app connector: %s", manifest.name)
 
-    # ── 3. Master Supervisor Graph ──
+    # ── 4. Master Supervisor Graph ──
     main_graph = StateGraph(GlobalAgentState)
     main_graph.add_node("supervisor", SupervisorNode())
     main_graph.add_node("sql_subgraph", compiled_sql)
+    main_graph.add_node("planner_subgraph", compiled_planner)
     for name, compiled_app in app_subgraphs.items():
         main_graph.add_node(f"{name}_subgraph", compiled_app)
 
     main_graph.set_entry_point("supervisor")
     main_graph.add_conditional_edges("supervisor", _route_supervisor)
     main_graph.add_edge("sql_subgraph", END)
+    main_graph.add_edge("planner_subgraph", END)
     for name in app_subgraphs:
         main_graph.add_edge(f"{name}_subgraph", END)
 

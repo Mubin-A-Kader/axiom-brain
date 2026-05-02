@@ -28,10 +28,11 @@ async def run_worker() -> None:
         workflows=[ExecutionWorkflow],
         activities=[
             activities.execute_sql,
+            activities.validate_data,
             activities.generate_sql,
             activities.run_critic,
             activities.run_discovery,
-            activities.generate_python_code,
+            activities.visualize,
             activities.build_notebook,
             activities.synthesize_response,
         ],

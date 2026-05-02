@@ -77,6 +77,7 @@ class LakeWorker:
         semaphore: asyncio.Semaphore,
         history_context: str = "",
         query_type: str = "NEW_TOPIC",
+        schema_contract_hint: str = "",
     ) -> LakeWorkerResult:
         async with semaphore:
             t0 = time.monotonic()
@@ -88,6 +89,7 @@ class LakeWorker:
                         llm_model=llm_model or settings.llm_model,
                         history_context=history_context,
                         query_type=query_type,
+                        schema_contract_hint=schema_contract_hint,
                     ),
                     timeout=settings.lake_worker_timeout_secs,
                 )
@@ -118,6 +120,7 @@ class LakeWorker:
         llm_model: str,
         history_context: str,
         query_type: str = "NEW_TOPIC",
+        schema_contract_hint: str = "",
     ) -> LakeWorkerResult:
         # 1. Load source metadata from control plane
         cp_conn = await asyncpg.connect(settings.database_url)
@@ -179,6 +182,7 @@ class LakeWorker:
             custom_rules=custom_rules,
             history_context=history_context,
             llm_model=llm_model,
+            schema_contract_hint=schema_contract_hint,
         )
         if not sql:
             return LakeWorkerResult.failure(
@@ -208,8 +212,15 @@ class LakeWorker:
         custom_rules: str,
         history_context: str,
         llm_model: str,
+        schema_contract_hint: str = "",
     ) -> Optional[str]:
         prompt = connector.build_query_prompt(question, schema_context, custom_rules, few_shot_examples, history_context)
+        if schema_contract_hint:
+            prompt += (
+                f"\n\n### CROSS-SOURCE SCHEMA CONTRACTS:\n{schema_contract_hint}\n"
+                "These are known column equivalences with other data sources in this lake query. "
+                "Use them to align your column names for consistent result merging."
+            )
         try:
             response = await self._client.chat.completions.create(
                 model=llm_model,

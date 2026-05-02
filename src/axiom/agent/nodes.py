@@ -16,6 +16,11 @@ from axiom.config import settings
 from axiom.rag.schema import SchemaRAG
 from axiom.core.inference import AdaptiveInferenceManager
 from axiom.agent.lake_worker import LakeWorker, LakeWorkerResult
+from axiom.agent.prompt_registry import registry as _prompt_registry
+from axiom.agent.toolkits import CRITIC_TOOLS, investigation_toolkit
+from axiom.agent.shared_memory import (
+    SchemaContract, SchemaContractNegotiator, shared_memory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -343,9 +348,49 @@ class TableSelectionNode:
         except Exception as e:
             logger.warning(f"Metadata grep failed: {e}")
 
-        # 2. Get RAG Summaries
-        summaries = await self._rag.search_table_summaries(tenant_id, source_id, search_query, n_results=20)
+        # 2. Get RAG Candidates (Dual-Vector Search)
+        # Search summaries for semantic/intent match
+        summaries = await self._rag.search_table_summaries(tenant_id, source_id, search_query, n_results=15)
+        # Search DDLs for column/structure match
+        ddl_tables = await self._rag.search_tables(tenant_id, source_id, search_query, n_results=10)
         
+        # 3. Perform a 'Value Sniff' for entity matches (The 'embeddings we need' alternative)
+        sniffed_tables = []
+        sniff_keywords = [k for k in search_query.split() if len(k) > 4 and k.lower() not in ["show", "tell", "list", "query", "what", "where", "when"]]
+        if sniff_keywords:
+            try:
+                cp_conn = await asyncpg.connect(settings.database_url, timeout=5)
+                try:
+                    row = await cp_conn.fetchrow("SELECT db_url FROM data_sources WHERE source_id = $1", source_id)
+                    if row:
+                        target_conn = await asyncpg.connect(row["db_url"], timeout=5)
+                        try:
+                            all_cols = await DynamicSchemaMapper.get_searchable_columns(target_conn)
+                            for term in sniff_keywords[:2]:
+                                hits = await DynamicSchemaMapper.sniff_value(target_conn, term, all_cols)
+                                sniffed_tables.extend([h.table for h in hits])
+                        finally:
+                            await target_conn.close()
+                finally:
+                    await cp_conn.close()
+            except Exception:
+                pass
+
+        # 4. Prepare Candidate Text for LLM
+        summary_text = "\n".join([f"- {s['table']}: {s['summary']}" for s in summaries])
+        
+        for t in ddl_tables:
+            if t not in [s['table'] for s in summaries]:
+                summary_text += f"\n- {t}: Potential match based on column structure."
+        
+        for t in grepped_tables:
+            if t not in [s['table'] for s in summaries] and t not in ddl_tables:
+                summary_text += f"\n- {t}: Potential match found via column name grep."
+                
+        for t in sniffed_tables:
+            if t not in [s['table'] for s in summaries] and t not in ddl_tables and t not in grepped_tables:
+                summary_text += f"\n- {t}: Found actual data matching '{sniff_keywords[0]}' in this table."
+
         # Ensure history_tables are injected into the summary text so the LLM knows about them
         history_summaries_text = ""
         if history_tables:
@@ -359,44 +404,28 @@ class TableSelectionNode:
         if negative_constraints:
             history_summaries_text += "\n### NEGATIVE CONSTRAINTS (DO NOT USE THESE TABLES):\n" + "\n".join([f"- {c}" for c in negative_constraints])
 
-        if not summaries and not grepped_tables and not history_tables and not confirmed_tables:
+        if not summaries and not ddl_tables and not grepped_tables and not sniffed_tables and not history_tables and not confirmed_tables:
             return {"selected_tables": []}
             
-        summary_text = "\n".join([f"- {s['table']}: {s['summary']}" for s in summaries])
-        if grepped_tables:
-            summary_text += "\n" + "\n".join([f"- {t}: Potential match found via column name grep." for t in grepped_tables if t not in [s['table'] for s in summaries]])
-        
         summary_text += history_summaries_text
         
-        prompt = f"""You are a database strategy agent.
-Given the user's question, review the following candidate tables.
-Your goal is to find ALL possible tables that might contain the answer.
-
-### SEARCH RULE:
-If the user confirmed a primary source in the list above, you MUST select it, AND ALSO select any other tables (like 'users' or 'customers') needed to JOIN with it.
-If the user's query is a follow-up (using pronouns or relative terms), you MUST select the tables from 'PREVIOUSLY USED TABLES'.
-If you see multiple tables that seem to store similar information (e.g. 'shared_user_answers' vs 'template_answers'), you MUST select BOTH. 
-Do not try to guess which one is "better" yet—the user will clarify this in the next step.
-Include at least 2-3 tables if there is any doubt about the data's location.
-
-### IMPORTANT:
-Table names may be schema-qualified. Return names EXACTLY as listed.
-CRITICAL: You MUST NOT select any tables listed in the NEGATIVE CONSTRAINTS section. These were explicitly rejected by the user. If you need to find an alternative, look for different tables.
-
-### CANDIDATE TABLES:
-{summary_text}
-
-### QUESTION:
-{search_query}
-
-Respond ONLY with a JSON list of table names, e.g. ["table1", "table2"]. No other text."""
+        from axiom.agent.prompt_registry import registry
+        system_msg = registry.render_system("table_strategy")
+        context_msg = registry.render_context(
+            "table_strategy",
+            summary_text=summary_text,
+            question=search_query
+        )
 
         # Get Wide Routing Parameters
         params = AdaptiveInferenceManager.get_parameters("routing", 0)
 
         response = await self._client.chat.completions.create(
             model=state.get("llm_model") or settings.llm_model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": context_msg}
+            ],
             **params
         )
         
@@ -469,6 +498,50 @@ class SchemaRetrievalNode:
             "few_shot_examples": few_shot_examples
         }
 
+class SQLPlannerNode:
+    """
+    Strategic SQL Architect (CAMEL-inspired Task Specifier).
+    Defines the logical blueprint, granularity, and join path before any SQL is written.
+    """
+
+    def __init__(self) -> None:
+        import openai
+        self._client = openai.AsyncOpenAI(
+            base_url=f"{settings.litellm_url}/v1",
+            api_key=settings.litellm_key,
+        )
+
+    async def __call__(self, state: SQLAgentState) -> dict:
+        question = state.get("question", "")
+        history = state.get("history_context", "No prior history.")
+        schema = state.get("schema_context", "")
+
+        from axiom.agent.prompt_registry import registry
+        system_msg = registry.render_system("sql_planner")
+        context_msg = registry.render_context(
+            "sql_planner",
+            question=question,
+            history_context=history,
+            schema_context=schema
+        )
+
+        try:
+            resp = await self._client.chat.completions.create(
+                model=state.get("llm_model") or settings.llm_model,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": context_msg}
+                ],
+                temperature=0.0,
+            )
+            blueprint = _get_content(resp).strip()
+            logger.info("SQL Blueprint generated for thread %s", state.get("thread_id"))
+            return {"logical_blueprint": blueprint}
+        except Exception as exc:
+            logger.warning("SQLPlannerNode failed: %s", exc)
+            return {"logical_blueprint": None}
+
+
 class SQLGenerationNode:
     def __init__(self, rag: SchemaRAG) -> None:
         self._rag = rag
@@ -478,9 +551,8 @@ class SQLGenerationNode:
             api_key=settings.litellm_key,
         )
 
-    async def _build_prompt(
-        self, state: SQLAgentState
-    ) -> str:
+    async def _build_prompt(self, state: SQLAgentState) -> tuple[str, str]:
+        """Return (system_message, context_message) assembled from the prompt registry."""
         schema_context = state.get("schema_context", "")
         question = state.get("question", "")
         error = state.get("error")
@@ -497,79 +569,65 @@ class SQLGenerationNode:
         from axiom.connectors.factory import ConnectorFactory
         dialect_name, dialect_rules = await ConnectorFactory.get_dialect_info(db_type)
 
-        base = f"""You are a precise SQL expert and Enterprise Data Analyst. 
-The target database is {dialect_name.upper()}.
+        # Pre-process conditional slots before handing to registry
+        if confirmed_tables:
+            confirmed_tables_block = (
+                json.dumps(confirmed_tables) + "\n"
+                "CRITICAL: If a table is listed here, the user explicitly chose it. "
+                "You MUST prioritize it as the primary table for your query. However, "
+                "you are ALLOWED and ENCOURAGED to use ANY OTHER tables from the SCHEMA "
+                "CONTEXT to fully answer the question."
+            )
+        else:
+            confirmed_tables_block = "None. You have full autonomy to select ANY tables from the SCHEMA CONTEXT."
 
-### SCHEMA CONTEXT:
-{schema_context}
+        if negative_constraints:
+            negative_constraints_block = (
+                json.dumps(negative_constraints, indent=2) + "\n"
+                "CRITICAL: If a table or join path is listed in Negative Constraints, "
+                "it was flagged as WRONG by the user. You are FORBIDDEN from using it. "
+                "If you cannot answer the question without these tables, use the <error> "
+                "tags to explain why, rather than repeating a failed path."
+            )
+        else:
+            negative_constraints_block = "None"
 
-### USER CONFIRMED TABLES:
-{json.dumps(confirmed_tables) if confirmed_tables else "None. You have full autonomy to select ANY tables from the SCHEMA CONTEXT."}
-{("CRITICAL: If a table is listed here, the user explicitly chose it. You MUST prioritize it as the primary table for your query. However, you are ALLOWED and ENCOURAGED to use ANY OTHER tables from the SCHEMA CONTEXT to fully answer the question." if confirmed_tables else "")}
-
-### NEGATIVE CONSTRAINTS (PATH BLOCKERS):
-{json.dumps(negative_constraints, indent=2) if negative_constraints else "None"}
-CRITICAL: If a table or join path is listed in Negative Constraints, it was flagged as WRONG by the user. You are FORBIDDEN from using it. If you cannot answer the question without these tables, use the <error> tags to explain why, rather than repeating a failed path.
-
-### CONVERSATION HISTORY:
-{history_context if history_context else "No prior history."}
-
-### BUSINESS GLOSSARY (SEMANTIC LAYER):
-{custom_rules if custom_rules else "None"}
-
-### LOGICAL BLUEPRINT:
-{logical_blueprint if logical_blueprint else "No blueprint provided. Determine logic directly."}
-
-### VERIFIED EXAMPLES:
-{few_shot_examples if few_shot_examples else "No past examples available."}
-
-### INSTRUCTIONS:
-1. Review the SCHEMA CONTEXT carefully. Identify the EXACT table and column names.
-2. SEMANTIC LAYER ENFORCEMENT: Adhere STRICTLY to the BUSINESS GLOSSARY metrics if any are provided. If the user asks for a metric defined in the glossary (e.g., "Revenue", "Active Users"), you MUST use the EXACT SQL formula provided in the glossary. Do not invent your own calculation.
-   - EXCEPTION: If the CRITIC FEEDBACK explicitly instructs you to modify a literal value from the glossary (e.g., changing 'paid' to 'PAID' because of a 0-result failure), you MUST follow the CRITIC'S advice and adjust the literal value to match the actual database.
-3. Use the VERIFIED EXAMPLES as a guide for how this specific tenant structures their queries.
-4. If Query Type is NEW_TOPIC, IGNORE the CONVERSATION HISTORY and generate a fresh query for the current Question.
-5. If Query Type is REFINEMENT, use the CONVERSATION HISTORY to resolve entities and pronouns, and to understand the base dataset being queried.
-   - PURE VISUALIZATION REFINEMENT: If the user purely asks for a chart type change (e.g. "make a pie chart", "show as a scatter plot") and the underlying data needs no changes, you MUST output the EXACT SAME <sql> query from the CONVERSATION HISTORY. You MUST ALWAYS output a valid <sql> query.
-   - If the user asks to filter, sort, or select a subset of the previous results (e.g., "in that who is top"), REUSE the SQL from the previous turn and append the necessary ORDER BY, LIMIT, or WHERE clauses to answer the new question.
-   - If resolving pronouns or partial names, look for the EXACT literal values (IDs, full names, emails) in the "Result" field of the CONVERSATION HISTORY and use them directly in your SQL.
-6. If the user asks for a "date", find the closest column like "created_at" or "timestamp". Do NOT use "order_date" if it is not in the schema.
-7. SECURITY MANDATE: You are ONLY allowed to generate `SELECT` queries. NEVER generate `DROP`, `DELETE`, `UPDATE`, `INSERT`, `TRUNCATE`, `ALTER`, or any other destructive commands, even if the user explicitly asks for them. If a user asks to delete or modify data, explain that you are a read-only assistant in <error> tags.
-8. Think step-by-step: 
-   - Which tables do I need?
-   - Do these tables only contain technical IDs or UUIDs? If yes, find the descriptive table (e.g., users, products, categories) to JOIN with to get human-readable names.
-   - MANDATORY JOIN RULE: Never return a raw UUID (e.g., '2d3f4c9b...') or a technical ID to the user if a descriptive name is available in another table. ALWAYS join to provide the "name", "title", or "label" instead of just the ID.
-   - PIVOT RULE: If the previous turns used a table that is now in NEGATIVE CONSTRAINTS, look for neighboring tables using foreign keys or similar names to find the real source of data.
-   - Which columns exist in those tables?
-   - How do I join them correctly using the foreign keys shown in SCHEMA CONTEXT?
-   - Match exact case for identifiers.
-9. ZERO-RESULT RECOVERY RULE: If the CRITIC FEEDBACK instructs you to try a completely different JOIN path or to drop a WHERE filter entirely because the previous attempt returned 0 rows, you MUST follow those instructions. Do not stubbornly repeat the exact same JOIN or WHERE clause if it has been proven to fail.
-10. NO PLACEHOLDER VALUES — EVER: Never write fake IDs, placeholder UUIDs, or stub values like `'<some_id>'`, `'actual-uuid-here'`, `'<question_id>'`, or similar. If you need a specific ID or lookup value that is not given to you, use a subquery or JOIN to find it from the real lookup table using the EXACT column names shown in SCHEMA CONTEXT. A query with a placeholder is always wrong.
-11. DIRECT COLUMN FIRST (STRICT): Before joining through a question/answer table, check the SCHEMA CONTEXT for a column that directly stores the concept (e.g. a profile column named after the attribute). A direct column query is always simpler and less likely to return 0 rows. Only use question/answer tables if no direct column exists.
-12. Q&A / EAV TABLE PATTERN (STRICT): When an answers/values table has a `*_id` FK column pointing to a labels/questions/categories table:
-   - The label text (question, category name, etc.) lives in the REFERENCED table, not in the answers/values table. Always JOIN to the referenced table and filter the text column there.
-   - NEVER filter the value/answer column for the label text. Value columns hold responses ("Yes"/"No"/"Occasionally"), not labels.
-   - NEVER write a subquery that searches for a label phrase inside a value/answer column.
-   - The correct structure is: JOIN the referenced labels table on the FK column, filter its text column for the label, filter the answers table for the value.
-13. OR OPERATOR — ALWAYS PARENTHESISE: AND binds tighter than OR. Without parentheses `a OR b AND c` silently becomes `a OR (b AND c)`. Any WHERE clause mixing OR and AND MUST wrap the OR group: `(cond1 OR cond2) AND cond3`.
-14. ILIKE PRECISION — use complete meaningful words: `%yes%` not `%ye%` (matches "they", "money", "player"); `%no%` not `%n%`. Always use the full word or a distinctive substring.
-15. Output your thought process inside <thought> tags.
-16. Output the final SQL query inside <sql> tags.
-17. Return ONLY the tags. No other text. No markdown fences.
-15. Use <error> tags ONLY for genuine impossibilities: the required entity truly has no matching table or column anywhere in the schema, OR the request is a destructive command. Do NOT use <error> for vague or broad questions — instead, make a reasonable interpretation and generate SQL. Specifically:
-    - "statistics", "summary", "overview", "breakdown", "distribution" → derive sensible aggregates (COUNT, AVG, SUM, GROUP BY) from the available tables.
-    - "show me X" where X is ambiguous → pick the most relevant table and return representative data.
-    - Uncertainty about which column → use the closest match and note it in <thought>.
-    Only refuse if you genuinely cannot find ANY table or column to work with.
-16. DIALECT SPECIFIC RULES:
-{dialect_rules}
-
-Question: {question}"""
+        extra_footer = ""
         if critic_feedback:
-            base += f"\n\n### CRITIC FEEDBACK (PREVIOUS ATTEMPT FAILED):\n{critic_feedback}\n\nUpdate your query strictly following this technical feedback."
+            extra_footer = (
+                f"\n\n### CRITIC FEEDBACK (PREVIOUS ATTEMPT FAILED):\n{critic_feedback}\n\n"
+                "Update your query strictly following this technical feedback."
+            )
         elif error:
-            base += f"\n\n### PREVIOUS ATTEMPT FAILED:\n{error}\n\nReview the SCHEMA CONTEXT carefully. \n- If the error is \"relation ... does not exist\", you likely forgot the schema prefix (e.g. use \"public\".\"tableName\" instead of \"tableName\").\n- If the error suggests a column or table name that exists but with different capitalization, you MUST use double quotes around that name (e.g., \"membershipFees\").\n- If the error is \"function ... does not exist\" and mentions argument types, you MUST explicitly cast the column to numeric or the appropriate type (e.g., `SUM(column::numeric)`, `AVG(CAST(column AS numeric))`)."
-        return base
+            extra_footer = (
+                f"\n\n### PREVIOUS ATTEMPT FAILED:\n{error}\n\n"
+                "Review the SCHEMA CONTEXT carefully.\n"
+                '- If the error is "relation ... does not exist", you likely forgot the schema prefix '
+                '(e.g. use "public"."tableName" instead of "tableName").\n'
+                "- If the error suggests a column or table name that exists but with different "
+                'capitalization, you MUST use double quotes around that name (e.g., "membershipFees").\n'
+                '- If the error is "function ... does not exist" and mentions argument types, you MUST '
+                "explicitly cast the column to numeric or the appropriate type "
+                "(e.g., `SUM(column::numeric)`, `AVG(CAST(column AS numeric))`)."
+            )
+
+        system_msg = _prompt_registry.render_system("sql_generator")
+        context_msg = _prompt_registry.render_context(
+            "sql_generator",
+            dialect_name=dialect_name.upper(),
+            dialect_rules=dialect_rules,
+            schema_context=schema_context,
+            confirmed_tables_block=confirmed_tables_block,
+            negative_constraints_block=negative_constraints_block,
+            history_context=history_context or "No prior history.",
+            custom_rules=custom_rules or "None",
+            logical_blueprint=logical_blueprint or "No blueprint provided. Determine logic directly.",
+            few_shot_examples=few_shot_examples or "No past examples available.",
+            query_type=query_type,
+            question=question,
+        ) + extra_footer
+
+        return system_msg, context_msg
 
     async def __call__(self, state: SQLAgentState) -> dict:
         attempts = state.get("attempts", 0)
@@ -607,13 +665,16 @@ Question: {question}"""
 
         # Get Dynamic Parameters
         params = AdaptiveInferenceManager.get_parameters("generation", attempts, error)
-        system_msg = AdaptiveInferenceManager.get_system_override("generation")
-        
-        prompt = await self._build_prompt(state)
-        messages = []
-        if system_msg:
-            messages.append({"role": "system", "content": system_msg})
-        messages.append({"role": "user", "content": prompt})
+        adaptive_override = AdaptiveInferenceManager.get_system_override("generation")
+
+        base_system_msg, context_msg = await self._build_prompt(state)
+        system_content = base_system_msg
+        if adaptive_override:
+            system_content = f"{base_system_msg}\n\n{adaptive_override}"
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": context_msg},
+        ]
 
         response = await self._client.chat.completions.create(
             model=state.get("llm_model") or settings.llm_model,
@@ -632,11 +693,14 @@ Question: {question}"""
         # Extract error from <error> tags if present (e.g. semantic impossibility)
         error_match = re.search(r"<error>(.*?)</error>", content, re.DOTALL)
         if error_match:
+            error_msg = error_match.group(1).strip()
+            updated_log = list(state.get("error_log") or []) + [error_msg]
             return {
-                "sql_query": "", 
-                "error": error_match.group(1).strip(), 
+                "sql_query": "",
+                "error": error_msg,
                 "agent_thought": thought,
-                "attempts": settings.max_correction_attempts
+                "attempts": settings.max_correction_attempts,
+                "error_log": updated_log,
             }
 
         # Extract SQL from <sql> tags
@@ -934,212 +998,38 @@ class SQLCriticNode:
             if isinstance(data_probe, Exception):
                 data_probe = ""
 
-            prompt = f"""You are an autonomous SQL Data Engineering Agent diagnosing a "0-Result" (Empty Data) failure.
-The previous query executed successfully but returned zero rows. This can happen because:
-- WHERE / JOIN conditions use wrong literal values (wrong casing, typos, numeric vs string IDs)
-- The JOIN keys don't match between tables
-- **The WRONG TABLE was queried** — a sibling table with a different name may hold the actual data
-
-### ORIGINAL QUESTION:
-{question}
-
-### SCHEMA CONTEXT (retrieved at query time):
-{schema_context}
-
-### BUSINESS GLOSSARY (SEMANTIC LAYER):
-{custom_rules if custom_rules else "None"}
-
-### FAILED (ZERO-RESULT) SQL:
-{sql_query}
-
-### ALL TABLES IN THE DATABASE:
-{table_catalog}
-
-### PRE-SAMPLED DATA (auto-collected before this prompt):
-{data_probe if data_probe else "No samples available."}
-
-### YOUR CAPABILITIES:
-Run investigation queries in this exact format:
-INVESTIGATE: <SQL here>
-
-CRITICAL RULES FOR YOUR TOOL CALLS:
-- NEVER call the same tool with the same arguments twice — results won't change.
-- NEVER use ILIKE directly on a jsonb column — cast first: `"col"::text ILIKE '%val%'`
-- NEVER include apostrophes in ILIKE patterns (e.g. don't write `ILIKE '%don\'t%'`). Use a shorter keyword without the apostrophe: `ILIKE '%no%'` or `ILIKE '%never%'`.
-- When a `describe_table` result shows column names, use ONLY those exact names in subsequent `sample_values` calls. Do not invent column names.
-- After sampling, go directly to `run_query` to test alternative SQL. Do not keep sampling — verify quickly.
-
-### INSTRUCTIONS:
-1. **Read the PRE-SAMPLED DATA first — before making any tool calls.** It shows DISTINCT values of every filtered column (including cross-filtered values) and FK-NEIGHBOR table samples.
-
-2. **Early-exit if data is conclusively absent (NO tool calls needed):** If the PRE-SAMPLED DATA contains a cross-filter result (labelled "filtered by ...") for the answer/value column, and that result does NOT contain anything resembling the searched value, the data simply does not exist. Do NOT make any tool calls. Immediately output:
-FEEDBACK: NO_MATCH — The question exists in the database but no answers match the requested value. Here are the actual stored values for that question: <list the values from the cross-filter sample>
-
-3. **ILIKE match rule:** If the cross-filter sample shows values that are close (different casing, slight wording difference), use the exact stored string and rewrite the SQL. Then output:
-VERIFIED_SQL: <corrected SQL>
-
-4. **Wrong-column detection:** If the sampled values of the filtered column contain nothing resembling the filter pattern AND there is no cross-filter result, the filter belongs on a different column or FK-referenced table. Use `describe_table` to confirm, then rewrite.
-
-5. **Multi-path rule:** Only if the PRE-SAMPLED DATA is inconclusive, try up to 3 alternative queries using `run_query`.
-
-6. **Verify then STOP:** The moment `run_query` returns non-empty rows — output:
-VERIFIED_SQL: <exact SQL that returned rows>
-No further tool calls after this.
-
-7. If ALL paths return 0 rows, output:
-FEEDBACK: <what was tried, what values DO exist, and why the requested value wasn't found>"""
+            system_msg = _prompt_registry.render_system("sql_critic_zero_results")
+            prompt = _prompt_registry.render_context(
+                "sql_critic_zero_results",
+                question=question,
+                schema_context=schema_context,
+                custom_rules=custom_rules or "None",
+                sql_query=sql_query,
+                table_catalog=table_catalog,
+                data_probe=data_probe or "No samples available.",
+            )
         else:
-            prompt = f"""You are a Senior Database Administrator. Analyze the failed SQL draft against the execution traceback to identify syntax violations, logical errors, or schema mismatches.
-Provide exact, technical correction instructions.
-
-### ORIGINAL QUESTION:
-{question}
-
-### SCHEMA CONTEXT:
-{schema_context}
-
-### BUSINESS GLOSSARY (SEMANTIC LAYER):
-{custom_rules if custom_rules else "None"}
-
-### FAILED SQL DRAFT:
-{sql_query}
-
-### EXECUTION TRACEBACK ERROR:
-{error}
-
-### YOUR CAPABILITIES:
-If you need to look up an actual value (e.g. find the real UUID/ID of a question, category, or lookup row), run:
-INVESTIGATE: <SELECT query>
-You may investigate once. After investigating, output your final instructions as:
-FEEDBACK: <your instructions here>
-
-### INSTRUCTIONS:
-1. Diagnose the root cause of the error.
-2. If the error is caused by a placeholder value (e.g. '<some_id>', 'actual-uuid-here') — run an INVESTIGATE query to find the real value, then tell the generator to use a JOIN or subquery so no hard-coded IDs are ever needed.
-3. If the error is a type/cast issue, instruct the generator to use the correct CAST (e.g. `column::numeric`).
-4. If the error is 'No SQL query generated.', instruct the SQL generator that it MUST output a valid SQL query, even if the user's request is purely about visualization. It should reuse the previous working SQL.
-5. Keep feedback concise and strictly technical.
-6. Output:
-FEEDBACK: <your instructions here>"""
-
-        # ── Tool definitions ──────────────────────────────────────────────────
-        # Instead of the fragile "INVESTIGATE: SELECT..." text protocol, the
-        # critic LLM calls these structured tools. No regex parsing, no column
-        # hallucination, JSONB handled automatically.
-        _TOOLS = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "describe_table",
-                    "description": (
-                        "Return the exact column names and data types for a table. "
-                        "Use this first whenever you are unsure of a column name."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "schema_name": {"type": "string", "description": "e.g. 'public'"},
-                            "table_name":  {"type": "string", "description": "e.g. 'ptemplate_questions'"},
-                        },
-                        "required": ["schema_name", "table_name"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "sample_values",
-                    "description": (
-                        "Return up to 30 DISTINCT values of a column cast to text. "
-                        "Use this to see the real stored strings (casing, hyphens, JSON format) "
-                        "before writing an ILIKE pattern."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "schema_name": {"type": "string"},
-                            "table_name":  {"type": "string"},
-                            "column_name": {"type": "string"},
-                        },
-                        "required": ["schema_name", "table_name", "column_name"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "run_query",
-                    "description": (
-                        "Execute a read-only SELECT query and return up to 15 rows. "
-                        "CRITICAL: If the result is non-empty (has rows), you MUST immediately "
-                        "stop all further tool calls and output exactly:\n"
-                        "VERIFIED_SQL: <that exact SQL query>\n"
-                        "Do NOT make any more tool calls after finding a working query."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "sql": {"type": "string"},
-                        },
-                        "required": ["sql"],
-                    },
-                },
-            },
-        ]
+            system_msg = _prompt_registry.render_system("sql_critic_syntax")
+            prompt = _prompt_registry.render_context(
+                "sql_critic_syntax",
+                question=question,
+                schema_context=schema_context,
+                custom_rules=custom_rules or "None",
+                sql_query=sql_query,
+                error=error,
+            )
 
         async def _dispatch_tool(name: str, args: dict) -> str:
-            """Execute whichever tool the LLM called and return a string result."""
-            try:
-                connector, _ = await self._get_connector(state)
-                if connector is None:
-                    return "Tool error: source not found."
-
-                if name == "describe_table":
-                    sql = (
-                        "SELECT column_name, data_type "
-                        "FROM information_schema.columns "
-                        f"WHERE table_schema='{args['schema_name']}' "
-                        f"AND table_name='{args['table_name']}' "
-                        "ORDER BY ordinal_position"
-                    )
-                    r = await connector.execute_query(sql)
-                    cols = [f"{row[0]} ({row[1]})" for row in r["rows"]]
-                    return json.dumps(cols)
-
-                if name == "sample_values":
-                    fqt = f"\"{args['schema_name']}\".\"{args['table_name']}\""
-                    col = args["column_name"]
-                    sql = (
-                        f"SELECT DISTINCT \"{col}\"::text "
-                        f"FROM {fqt} "
-                        f"WHERE \"{col}\" IS NOT NULL LIMIT 30"
-                    )
-                    r = await connector.execute_query(sql)
-                    return json.dumps([row[0] for row in r["rows"]], default=str)
-
-                if name == "run_query":
-                    raw = args.get("sql", "").strip()
-                    if not raw:
-                        return "Error: SQL is empty."
-                    if not isinstance(raw, str):
-                        raw = str(raw).strip()
-                    if not raw.upper().startswith("SELECT"):
-                        return "Blocked: only SELECT queries allowed."
-                    # Auto-fix jsonb ILIKE on the fly
-                    fixed = re.sub(
-                        r'"([^"]+)"\s+(I?LIKE)',
-                        r'"\1"::text \2',
-                        raw, flags=re.IGNORECASE,
-                    )
-                    r = await connector.execute_query(fixed)
-                    return json.dumps(r["rows"][:15], default=str)
-
-                return f"Unknown tool: {name}"
-            except Exception as exc:
-                return f"Tool error ({name}): {exc}"
+            connector, _ = await self._get_connector(state)
+            if connector is None:
+                return "Tool error: source not found."
+            return await investigation_toolkit.dispatch(name, args, connector)
 
         # ── LLM loop with tool use ────────────────────────────────────────────
-        messages = [{"role": "user", "content": prompt}]
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": prompt},
+        ]
         params = AdaptiveInferenceManager.get_parameters("critic", state.get("attempts", 0), error)
         max_tool_calls = 8 if is_zero_results else 3
         tool_calls_made = 0
@@ -1149,7 +1039,7 @@ FEEDBACK: <your instructions here>"""
                 response = await self._client.chat.completions.create(
                     model=state.get("llm_model") or settings.llm_model,
                     messages=messages,
-                    tools=_TOOLS,
+                    tools=CRITIC_TOOLS,
                     tool_choice="auto",
                     **{k: v for k, v in params.items() if k not in ("stream",)},
                 )
@@ -1338,7 +1228,9 @@ class SQLExecutionNode:
 
         except Exception as exc:
             logger.warning("SQL execution error: %s", exc)
-            result_update = {"sql_result": None, "error": str(exc)}
+            error_msg = str(exc)
+            updated_log = list(state.get("error_log") or []) + [error_msg]
+            result_update = {"sql_result": None, "error": error_msg, "error_log": updated_log}
 
         if self._thread_mgr and state.get("sql_query") and not result_update.get("error"):
             await self._thread_mgr.save_turn(
@@ -1356,8 +1248,80 @@ class SQLExecutionNode:
         
         return result_update
 
-class PythonCodeGenerationNode:
-    """Generate dynamic Python code for data analysis based on the actual result set."""
+class DataValidatorNode:
+    """
+    Data Quality Evaluator.
+    Checks SQL results to ensure they contain valid, non-null data for the key metrics.
+    If the data is essentially empty/null, it returns an error so the pipeline can correct itself or abort gracefully.
+    """
+
+    def __init__(self) -> None:
+        import openai
+        self._client = openai.AsyncOpenAI(
+            base_url=f"{settings.litellm_url}/v1",
+            api_key=settings.litellm_key,
+        )
+
+    async def __call__(self, state: SQLAgentState) -> dict:
+        raw_result = state.get("sql_result")
+        
+        # If no result, or already has an error, skip validation
+        if not raw_result or state.get("error") or raw_result == "CONCLUDED":
+            return {}
+
+        try:
+            result_json = json.loads(raw_result)
+            columns: list = result_json.get("columns", [])
+            rows: list = result_json.get("rows", [])
+            
+            # Basic sanity check
+            if not rows:
+                return {"error": "ZERO_RESULTS: The query executed successfully but returned 0 rows.", "sql_result": None}
+
+            from axiom.agent.prompt_registry import registry
+            system_msg = registry.render_system("data_validator")
+            context_msg = registry.render_context(
+                "data_validator",
+                question=state.get("question", ""),
+                sql_query=state.get("sql_query", ""),
+                columns=columns,
+                sample_rows=rows[:5]
+            )
+
+            resp = await self._client.chat.completions.create(
+                model=state.get("llm_model") or settings.llm_model,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": context_msg}
+                ],
+                temperature=0.0,
+                response_format={"type": "json_object"}
+            )
+            
+            data = json.loads(_get_content(resp).strip())
+            is_valid = data.get("is_valid", True)
+            feedback = data.get("feedback", "")
+            
+            if not is_valid:
+                logger.warning("Data Validation Failed: %s", feedback)
+                # Nullify the result and pass the feedback as an error to trigger correction
+                return {
+                    "sql_result": None,
+                    "error": f"DATA_QUALITY_ERROR: {feedback}"
+                }
+                
+            return {} # Valid data, proceed
+
+        except Exception as exc:
+            logger.warning("DataValidatorNode failed (passing through): %s", exc)
+            return {}
+
+class VisualizationNode:
+    """
+    WOW-Factor Plotly Visualization generator.
+    Transforms SQL results into a stunning, interactive Python dashboard.
+    """
+
     def __init__(self) -> None:
         import openai
         self._client = openai.AsyncOpenAI(
@@ -1368,108 +1332,99 @@ class PythonCodeGenerationNode:
     async def __call__(self, state: SQLAgentState) -> dict:
         raw_result = state.get("sql_result") or state.get("last_sql_result")
         mcp_results = state.get("mcp_tool_results", [])
-        
+
         if (not raw_result or raw_result == "CONCLUDED") and not mcp_results:
             return {"python_code": None}
 
+        from axiom.agent.prompt_registry import registry
+        
         try:
-            columns = []
-            sample_rows = []
+            question = state["question"]
+            error = state.get("python_error")
+            
+            boilerplate = """
+# ── Axiom Plotly Template Setup ──
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import plotly.io as pio
+
+pio.templates["axiom_dark"] = go.layout.Template(
+    layout=go.Layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#E6E1D8"),
+        colorway=["#638A70", "#C26D5C", "#A5A58D", "#6B705C", "#B7B7A4"],
+        xaxis=dict(gridcolor="rgba(255,255,255,0.05)", zerolinecolor="rgba(255,255,255,0.1)"),
+        yaxis=dict(gridcolor="rgba(255,255,255,0.05)", zerolinecolor="rgba(255,255,255,0.1)"),
+        hoverlabel=dict(bgcolor="#1E1E1C", bordercolor="rgba(255,255,255,0.1)")
+    )
+)
+pio.templates.default = "axiom_dark"
+"""
+            
+            # ── SQL result path (Structured) ──────────────────────────────────
             if raw_result and raw_result != "CONCLUDED":
                 result_json = json.loads(raw_result)
-                columns = result_json.get("columns", [])
-                sample_rows = result_json.get("rows", [])[:5]
-            elif mcp_results:
-                # App Connector path - use raw JSON tools results directly
-                columns = ["Raw Data from API"]
-                # Show first 1000 chars of the first successful tool result as a sample
+                columns: list = result_json.get("columns", [])
+                rows: list = result_json.get("rows", [])
+
+                if not columns or not rows:
+                    return {"python_code": None}
+
+                system_msg = registry.render_system("visualization_expert")
+                context_msg = registry.render_context(
+                    "visualization_expert",
+                    question=question,
+                    columns=columns,
+                    sample_rows=rows[:2]
+                )
+                
+                if error:
+                    context_msg += f"\n\nPREVIOUS ATTEMPT FAILED:\n{error}\nFix the code."
+
+                resp = await self._client.chat.completions.create(
+                    model=state.get("llm_model") or settings.llm_model,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": context_msg}
+                    ],
+                    temperature=0.0
+                )
+                code = re.sub(r"```python\n?|```", "", _get_content(resp).strip())
+                return {"python_code": boilerplate + "\n\n" + code}
+
+            # ── App connector path (Unstructured) ─────────────────────────────
+            if mcp_results:
+                sample = ""
                 for t in mcp_results:
                     if t.get("result"):
-                        sample_rows = [str(t["result"])[:1000] + "..."]
+                        sample = str(t["result"])[:1000]
                         break
+                
+                system_msg = registry.render_system("visualization_expert")
+                context_msg = f"Convert this unstructured data into a stunning Plotly chart.\nQuestion: {question}\nData: {sample}"
+                
+                if error:
+                    context_msg += f"\n\nPREVIOUS ATTEMPT FAILED:\n{error}\nFix the code."
 
-            question = state["question"]
-            insight = state.get("response_text", "")
-            error = state.get("python_error")
+                resp = await self._client.chat.completions.create(
+                    model=state.get("llm_model") or settings.llm_model,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": context_msg}
+                    ],
+                    temperature=0.0
+                )
+                code = re.sub(r"```python\n?|```", "", _get_content(resp).strip())
+                return {"python_code": boilerplate + "\n\n" + code}
 
-            prompt = f"""**Role & Objective**
-You are an expert Data Visualization Engineer. Your task is to generate Python code using the `plotly` library (preferably `plotly.express`) to create dynamic, highly accurate, and visually premium charts based on the provided dataset.
-
-### USER QUESTION:
-"{question}"
-
-### GENERATED INSIGHT:
-"{insight}"
-
-### DATASET PREVIEW:
-Columns: {columns}
-Sample Data: {sample_rows}
-
-### LIBRARIES AVAILABLE:
-- pandas (as pd)
-- numpy (as np)
-- plotly.express (as px)
-- plotly.graph_objects (as go)
-- IPython.display (HTML, display)
-
-### EXECUTION CONTEXT:
-The data is already loaded into a pandas DataFrame named `df`. 
-The environment supports Plotly's interactive charts.
-
-**Core Directives & Responsiveness (CRITICAL)**
-You must never hardcode absolute pixel dimensions (`width` or `height`) for the figures. The visualization must be fully fluid and responsive to fit seamlessly into modern frontend containers. 
-1. Always use `fig.update_layout(autosize=True)`.
-2. Set tight margins to prevent wasted space, but allow enough room on the right for legends: `margin=dict(l=20, r=150, t=40, b=20)`.
-
-**Legend & High-Cardinality Management**
-Overlapping text and massive legends ruin the user experience. You must dynamically handle data cardinality:
-1. **Placement:** Always anchor the legend strictly outside the plotting area. Use: 
-   `fig.update_layout(legend=dict(yanchor="top", y=1, xanchor="left", x=1.02))`
-2. **Cardinality Limit:** Before plotting, check the number of unique categories in the `color` or `symbol` grouping. 
-   * If unique categories <= 10: Display the legend normally outside the plot.
-   * If unique categories > 10: **Disable the legend entirely** (`showlegend=False`). Instead, heavily format the `hover_data` (tooltips) so the user can identify data points by hovering over them. Do not let a massive legend break the UI.
-
-**Premium Aesthetic Standards**
-The generated charts must look professional, clean, and humanistic. Avoid default, harsh, or overly "robotic" visual choices.
-1. **Background:** Use a transparent background for both the paper and the plot so it blends into the application's theme: `paper_bgcolor='rgba(0,0,0,0)'`, `plot_bgcolor='rgba(0,0,0,0)'`.
-2. **Gridlines:** Use very subtle, muted gridlines to guide the eye without adding clutter. (e.g., `gridcolor='rgba(128, 128, 128, 0.2)'`, `zeroline=False`).
-3. **Color Palettes:** Default to sophisticated, muted, and accessible color palettes (e.g., Plotly's `px.colors.qualitative.Pastel` or `Safe`). Avoid harsh primary colors.
-4. **Typography:** Keep fonts clean and readable. Use a sans-serif font standard, muting the color of axis titles slightly so the data stands out.
-
-**Data Handling & Tooltips**
-1. **Hover Templates:** Always utilize Plotly's interactive strengths. Build rich hover templates that clearly display the X value, Y value, and the specific Category. 
-2. **Axis Formatting:** Automatically format large numbers (e.g., 1,000,000 to 1M) and use readable date formats if the X-axis is a timeseries.
-3. **NO HARDCODING**: Do not hardcode specific table names or column names that are not in the DATASET PREVIEW.
-
-**Output Constraints**
-Output ONLY valid Python code. The code must be self-contained, import `plotly.express` or `plotly.graph_objects`, assume the data is already loaded into a pandas DataFrame named `df`, and end by passing the figure to the `_show_plotly(fig)` helper. Do not include conversational filler.
-
-### HELPER FUNCTIONS ALREADY DEFINED:
-```python
-def _show_plotly(fig):
-    # This renders the plotly figure in the Axiom workspace
-    # The font color is automatically handled, but you must set the rest of the layout
-    _display(HTML(fig.to_html(include_plotlyjs="cdn", full_html=False)))
-```
-"""
-
-            if error:
-                prompt += f"\n\n### PREVIOUS ATTEMPT FAILED WITH ERROR:\n{error}\nFix the code to resolve this error."
-
-            response = await self._client.chat.completions.create(
-                model=state.get("llm_model") or settings.llm_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-            )
-            
-            code = _get_content(response).strip()
-            # Strip markdown fences if the LLM ignored instructions
-            code = re.sub(r"```python\n|```", "", code)
-            
-            return {"python_code": code}
         except Exception as exc:
-            logger.warning("Failed to generate dynamic Python code: %s", exc)
+            logger.warning("VisualizationNode failed: %s", exc)
             return {"python_code": None}
+
+        return {"python_code": None}
 
 
 class HumanApprovalNode:
@@ -1536,11 +1491,22 @@ class NotebookArtifactNode:
                 if not result_for_notebook:
                     return {"artifact": None}
 
+            # Don't embed a clarification/probing message as the notebook insight —
+            # it's internal system state, not meaningful analysis context.
+            _insight = state.get("response_text")
+            _clarification_prefixes = (
+                "I need a bit more context",
+                "I found multiple tables",
+                "I found multiple databases",
+            )
+            if _insight and any(_insight.startswith(p) for p in _clarification_prefixes):
+                _insight = None
+
             notebook, cells_summary = build_analysis_notebook(
                 question=state["question"],
                 sql=state.get("sql_query") or "",
                 result=result_for_notebook,
-                insight=state.get("response_text"),
+                insight=_insight,
                 python_code=state.get("python_code"),
             )
 
@@ -1555,7 +1521,7 @@ class NotebookArtifactNode:
             notebook_attempts = state.get("notebook_attempts", 0) + 1
 
             # If execution failed and we haven't exhausted retries, feed the error
-            # back to PythonCodeGenerationNode for self-correction.
+            # back to VisualizationNode for self-correction.
             if execution_error and notebook_attempts <= 3:
                 logger.warning(
                     "Notebook execution failed (attempt %d/3): %s",
@@ -1636,6 +1602,11 @@ class ResponseSynthesizerNode:
         return no_match, first_sentence[:300]
 
     async def __call__(self, state: SQLAgentState) -> dict:
+        if state.get("clarification_questions"):
+            return {
+                "response_text": "I need a bit more context to answer precisely. Please select from the options below.",
+            }
+
         if state.get("probing_options"):
             return {
                 "response_text": "I found multiple tables that could answer your question. Which one did you mean?",
@@ -1718,6 +1689,7 @@ class ResponseSynthesizerNode:
 - Original Row Count: {metadata.row_count_original}
 - Cleaned Row Count: {metadata.row_count_cleaned}
 - Summary Stats: {json.dumps(metadata.summary_stats, indent=2)}"""
+            metadata_summary = f"Rows: {metadata.row_count_cleaned}, Stats: {json.dumps(metadata.summary_stats)}"
         
         # 2. Handle App Path
         else:
@@ -1729,35 +1701,52 @@ class ResponseSynthesizerNode:
 
 ### PRELIMINARY INSIGHT:
 {app_insight}"""
+            metadata_summary = "N/A (App Data)"
 
-        prompt = f"""You are a senior Business Analyst. 
-Based on the user's question and the data results provided, write a concise, professional response.
-
-### USER QUESTION:
-{question}
-
-{data_context}
-
-### INSTRUCTIONS:
-1. ABSOLUTELY NO RAW DATA TABLES OR JSON. You must ONLY output a conversational summary. NEVER render the data as a table, markdown grid, or raw list unless explicitly asked by the user to "show me a table".
-2. NEVER output raw UUIDs, internal IDs, or technical column names.
-3. If an analysis notebook artifact was generated, mention that a detailed notebook is available in the workspace.
-4. Keep it concise. Be precise but conversational.
-
-Response:"""
+        from axiom.agent.prompt_registry import registry
+        system_msg = registry.render_system("business_analyst")
+        context_msg = registry.render_context(
+            "business_analyst",
+            question=question,
+            data_results=data_context,
+            metadata_summary=metadata_summary if sql_result else "Unstructured app data"
+        )
 
         try:
             response = await self._client.chat.completions.create(
                 model=state.get("llm_model") or settings.llm_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": context_msg}
+                ],
+                temperature=0.1,
             )
             content = _get_content(response).strip()
             
+            insight_match = re.search(r"<insight>(.*?)</insight>", content, re.DOTALL)
+            kpi_match = re.search(r"<kpis>(.*?)</kpis>", content, re.DOTALL)
+            
+            insight = insight_match.group(1).strip() if insight_match else content.strip()
+            kpis = []
+            if kpi_match:
+                try:
+                    kpis = json.loads(kpi_match.group(1).strip())
+                except Exception:
+                    pass
+
+            layout = "default"
+            if state.get("visual_manifest") or artifact:
+                layout = "dashboard"
+
+            res = {
+                "response_text": insight,
+                "insight_kpis": kpis,
+                "layout": layout,
+                "action_bar": cleaned_response.action_bar if sql_result else [],
+            }
             if sql_result:
-                return {"response_text": content, "sql_result": cleaned_response.frontend_json, "layout": "notebook" if artifact else "default", "action_bar": cleaned_response.action_bar}
-            else:
-                return {"response_text": content, "layout": "notebook" if artifact else "default"}
+                res["sql_result"] = cleaned_response.frontend_json
+            return res
         except Exception as exc:
             logger.warning("Failed to synthesize response: %s", exc)
             return {"response_text": state.get("response_text", "I have processed your request.")}
@@ -1811,6 +1800,18 @@ class LakeOrchestratorNode:
                     sid, mode,
                 )
 
+        # Load existing schema contracts for this thread from shared memory.
+        # On first query the list is empty; on follow-up queries it holds
+        # column-mapping hints negotiated by the Curator on the previous turn.
+        thread_id = state.get("thread_id", "")
+        existing_contracts = await shared_memory.read_contracts(thread_id)
+        # Also pull any contracts already serialised into graph state
+        state_contracts = [
+            SchemaContract.from_dict(d)
+            for d in (state.get("schema_contracts") or [])
+        ]
+        all_contracts = shared_memory._merge_contracts(existing_contracts, state_contracts)
+
         tasks = [
             w.run(
                 question=state["question"],
@@ -1819,8 +1820,13 @@ class LakeOrchestratorNode:
                 semaphore=semaphore,
                 history_context=state.get("history_context", ""),
                 query_type=state.get("query_type", "NEW_TOPIC"),
+                schema_contract_hint="\n".join(
+                    hint
+                    for c in shared_memory.contracts_for_source(all_contracts, sid)
+                    if (hint := c.prompt_hint(sid))
+                ),
             )
-            for _, w in workers
+            for sid, w in workers
         ]
         source_ids = [sid for sid, _ in workers]
 
@@ -2010,6 +2016,34 @@ class LakeCuratorNode:
                 f"Found data from {len(successful)} source(s) across your Data Lake."
             )
 
+        # ── Schema contract negotiation ───────────────────────────────────
+        # Compare every pair of successful worker results. Any pair whose
+        # column sets have meaningful overlap produces a SchemaContract that
+        # is persisted to Redis and written into graph state so the next
+        # Orchestrator invocation can inject join-key hints into workers.
+        negotiator = SchemaContractNegotiator()
+        new_contracts: list[SchemaContract] = []
+        for i, ra in enumerate(successful):
+            for rb in successful[i + 1:]:
+                contract = negotiator.negotiate(ra, rb)
+                if contract:
+                    logger.info(
+                        "SchemaContract negotiated: %s ↔ %s  confidence=%.2f  mapping=%s",
+                        contract.source_a, contract.source_b,
+                        contract.confidence, contract.join_key_mapping,
+                    )
+                    new_contracts.append(contract)
+
+        thread_id = state.get("thread_id", "")
+        if new_contracts:
+            await shared_memory.write_contracts(thread_id, new_contracts)
+
+        # Include contracts in state so downstream nodes and future graph
+        # resumptions can access them without a Redis round-trip.
+        all_state_contracts = list(state.get("schema_contracts") or [])
+        for c in new_contracts:
+            all_state_contracts.append(c.to_dict())
+
         merged_sql_result = self._merge_results(worker_results)
 
         # Promote the best worker's SQL to sql_query so it gets saved to thread history.
@@ -2022,6 +2056,7 @@ class LakeCuratorNode:
             "response_text": response_text,
             "sql_result": merged_sql_result,
             "sql_query": best_sql,
+            "schema_contracts": all_state_contracts,
             "layout": "default",
             "action_bar": [],
         }

@@ -33,24 +33,24 @@ async def test_sql_execution_read_only_enforcement():
     # 1. Test DROP TABLE
     state_drop = {"sql_query": "DROP TABLE users", "tenant_id": "t", "attempts": 0}
     result = await node(state_drop)
-    assert "Security violation" in result["error"]
+    assert "Security Violation" in result["error"]
     assert "not a SELECT statement" in result["error"]
     assert result["sql_result"] is None
 
     # 2. Test UPDATE
     state_update = {"sql_query": "UPDATE users SET name = 'hacker'", "tenant_id": "t", "attempts": 0}
     result = await node(state_update)
-    assert "Security violation" in result["error"]
+    assert "Security Violation" in result["error"]
 
     # 3. Test DELETE
     state_delete = {"sql_query": "DELETE FROM users WHERE id = 1", "tenant_id": "t", "attempts": 0}
     result = await node(state_delete)
-    assert "Security violation" in result["error"]
+    assert "Security Violation" in result["error"]
 
     # 4. Test complex injection (CTE that tries to write)
     state_cte = {"sql_query": "WITH deleted AS (DELETE FROM users RETURNING *) SELECT * FROM deleted", "tenant_id": "t", "attempts": 0}
     result = await node(state_cte)
-    assert "Security violation" in result["error"]
+    assert "Security Violation" in result["error"]
 
     # 5. Test valid SELECT
     state_select = {"sql_query": "SELECT * FROM users", "tenant_id": "t", "attempts": 0}
@@ -98,12 +98,21 @@ async def test_token_limit_retrieval():
         
         # Mock collection query
         rag._collection.query = MagicMock(return_value={
-            "documents": [["TABLE t1 (c1 INT)", "TABLE t2 (c2 INT)", "TABLE t3 (c3 INT)"]]
+            "metadatas": [[{"table": "t1"}, {"table": "t2"}, {"table": "t3"}]]
         })
-        
-        with patch.object(settings, "max_schema_tokens", 4): # Max 4 "tokens" (words)
+
+        # Mock collection get for each table
+        def mock_get(ids, include=None):
+            table = ids[0].split("_")[-1]
+            if "summary" in ids[0]:
+                return {"documents": [f"Summary {table}"]}
+            return {"documents": [f"TABLE {table} (c1 INT)"]}
+
+        rag._collection.get = MagicMock(side_effect=mock_get)
+
+        with patch.object(settings, "max_schema_tokens", 10): # Max 10 words
             result = await rag.retrieve("t", "s", "q")
-            # "TABLE t1 (c1 INT)" is 4 words. 
-            # Adding t2 would exceed 4.
+            # TABLE t1 (c1 INT) + Description: Summary t1 = ~6 words
+            # Adding t2 would exceed 10.
             assert "t1" in result
             assert "t2" not in result

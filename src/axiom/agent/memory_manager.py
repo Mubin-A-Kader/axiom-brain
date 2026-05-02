@@ -57,14 +57,42 @@ class MemoryManagerNode:
         # If the frontend sends a system command (like a card click), we process it
         # deterministically and BYPASS the LLM entirely to guarantee 100% reliability
         # and save tokens/latency.
+
+        def _unwrap_question(q: str) -> str:
+            """Recursively strip nested system-command wrappers to get the root question.
+
+            Old frontend code could produce deeply-nested strings like:
+              CONFIRMED_SOURCE: ... about 'CLARIFIED_INTENT: ... | question: 'real question''
+            This unwinds those layers so the SQL generator always sees clean intent.
+            """
+            import re as _re
+            for _ in range(10):  # guard against infinite recursion
+                if q.startswith(("CONFIRMED_SOURCE:", "CONFIRMED_DATABASE:", "REJECTED_INTENT:")):
+                    m = _re.search(r"answer my question about '(.*)'", q, _re.DOTALL)
+                    if m:
+                        # Don't rstrip("'") — the trailing quote may be part of a nested CLARIFIED_INTENT
+                        q = m.group(1).strip()
+                        continue
+                if q.startswith("CLARIFIED_INTENT:"):
+                    pipe = q.find("| question:")
+                    if pipe != -1:
+                        clarifications_str = q[len("CLARIFIED_INTENT:"):pipe].strip()
+                        m = _re.search(r"\| question:\s*'(.*)'", q, _re.DOTALL)
+                        if m:
+                            inner = _unwrap_question(m.group(1).strip())
+                            pairs = [p.strip() for p in clarifications_str.split(",") if "=" in p]
+                            return f"{inner} [{'; '.join(pairs)}]" if pairs else inner
+                break
+            return q
+
         if question.startswith("CONFIRMED_SOURCE:"):
             import re
             table_match = re.search(r"Use the '(.*?)' table", question)
-            q_match = re.search(r"answer my question about '(.*?)'", question)
-            
+            q_match = re.search(r"answer my question about '(.*)'", question, re.DOTALL)
+
             if table_match:
                 confirmed_table = table_match.group(1)
-                real_question = q_match.group(1) if q_match else question
+                real_question = _unwrap_question(q_match.group(1).strip()) if q_match else question
                 logger.info(f"System Command Executed: Confirmed Source -> {confirmed_table}")
                 
                 # Persist this confirmed table to the thread metadata for future turns
@@ -78,23 +106,59 @@ class MemoryManagerNode:
                     await client.setex(key, 86400, json.dumps(parsed_data))
                 
                 return {
-                    "question": real_question, # Strip the system command so the SQL generator just sees the intent
+                    "question": real_question,
                     "active_filters": active_filters,
                     "verified_joins": verified_joins,
                     "error_log": error_log,
                     "negative_constraints": negative_constraints,
                     "confirmed_tables": [confirmed_table],
-                    "history_tables": history_tables
+                    "history_tables": history_tables,
+                    "clarification_questions": [],
+                    "probing_options": [],
+                }
+
+        if question.startswith("CONFIRMED_SOURCES:"):
+            # Multi-select format: CONFIRMED_SOURCES: ["table1", "table2"] | question: 'original'
+            import re
+            q_match = re.search(r"\| question:\s*'(.*)'", question, re.DOTALL)
+            tables_match = re.search(r"CONFIRMED_SOURCES:\s*(\[.*?\])", question)
+            if tables_match and q_match:
+                try:
+                    confirmed_tables_list = json.loads(tables_match.group(1))
+                except Exception:
+                    confirmed_tables_list = []
+                real_question = _unwrap_question(q_match.group(1).strip()) if q_match else question
+                logger.info("System Command Executed: Confirmed Sources (multi) -> %s", confirmed_tables_list)
+
+                metadata["confirmed_tables"] = confirmed_tables_list
+                client = await thread_mgr._get_client()
+                key = f"axiom:thread:{thread_id}"
+                data = await client.get(key)
+                if data:
+                    parsed_data = json.loads(data)
+                    parsed_data["metadata"] = metadata
+                    await client.setex(key, 86400, json.dumps(parsed_data))
+
+                return {
+                    "question": real_question,
+                    "active_filters": active_filters,
+                    "verified_joins": verified_joins,
+                    "error_log": error_log,
+                    "negative_constraints": negative_constraints,
+                    "confirmed_tables": confirmed_tables_list,
+                    "history_tables": history_tables,
+                    "clarification_questions": [],
+                    "probing_options": [],
                 }
 
         if question.startswith("CONFIRMED_DATABASE:"):
             import re
             db_match = re.search(r"Use the '(.*?)' database", question)
-            q_match = re.search(r"answer my question about '(.*?)'", question)
-            
+            q_match = re.search(r"answer my question about '(.*)'", question, re.DOTALL)
+
             if db_match:
                 confirmed_db = db_match.group(1)
-                real_question = q_match.group(1) if q_match else question
+                real_question = _unwrap_question(q_match.group(1).strip()) if q_match else question
                 logger.info(f"System Command Executed: Confirmed Database -> {confirmed_db}")
                 
                 # Persist this confirmed database to the thread metadata for future turns
@@ -108,22 +172,24 @@ class MemoryManagerNode:
                     await client.setex(key, 86400, json.dumps(parsed_data))
                 
                 return {
-                    "question": real_question, 
-                    "source_id": confirmed_db, # Enforce database selection
+                    "question": real_question,
+                    "source_id": confirmed_db,
                     "active_filters": active_filters,
                     "verified_joins": verified_joins,
                     "error_log": error_log,
                     "negative_constraints": negative_constraints,
                     "confirmed_tables": confirmed_tables,
-                    "history_tables": history_tables
+                    "history_tables": history_tables,
+                    "clarification_questions": [],
+                    "probing_options": [],
                 }
 
         if question.startswith("REJECTED_INTENT:"):
             import re
             table_match = re.search(r"The suggested tables \[(.*?)\]", question)
-            q_match = re.search(r"answer my question about '(.*?)'", question)
-            
-            real_question = q_match.group(1) if q_match else question
+            q_match = re.search(r"answer my question about '(.*)'", question, re.DOTALL)
+
+            real_question = _unwrap_question(q_match.group(1).strip()) if q_match else question
             
             if table_match:
                 rejected_tables_str = table_match.group(1)
@@ -146,13 +212,44 @@ class MemoryManagerNode:
                     await client.setex(key, 86400, json.dumps(parsed_data))
                 
                 return {
-                    "question": real_question, 
+                    "question": real_question,
                     "active_filters": active_filters,
                     "verified_joins": verified_joins,
                     "error_log": error_log,
                     "negative_constraints": negative_constraints,
                     "confirmed_tables": confirmed_tables,
-                    "history_tables": history_tables
+                    "history_tables": history_tables,
+                    "clarification_questions": [],
+                    "probing_options": [],
+                }
+
+        if question.startswith("CLARIFIED_INTENT:"):
+            import re
+            # Format: "CLARIFIED_INTENT: dim1=answer1, dim2=answer2 | question: 'original question'"
+            pipe_idx = question.find("| question:")
+            if pipe_idx != -1:
+                clarifications_str = question[len("CLARIFIED_INTENT:"):pipe_idx].strip()
+                q_match = re.search(r"\| question:\s*'(.*)'", question, re.DOTALL)
+                inner = q_match.group(1).strip() if q_match else question
+                # Unwrap any nested system commands from the inner question
+                real_question = _unwrap_question(inner)
+
+                # Parse key=value pairs and enrich the question
+                pairs = [p.strip() for p in clarifications_str.split(",") if "=" in p]
+                if pairs:
+                    constraints = "; ".join(pairs)
+                    real_question = f"{real_question} [{constraints}]"
+
+                logger.info("System Command Executed: Clarified Intent -> %s", pairs)
+                return {
+                    "question": real_question,
+                    "clarification_questions": [],
+                    "active_filters": active_filters,
+                    "verified_joins": verified_joins,
+                    "error_log": error_log,
+                    "negative_constraints": negative_constraints,
+                    "confirmed_tables": confirmed_tables,
+                    "history_tables": history_tables,
                 }
 
         # --- Standard Natural Language Processing ---

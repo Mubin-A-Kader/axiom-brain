@@ -3,6 +3,8 @@
 import React from 'react';
 import { DataTable } from './DataTable';
 import { NotebookArtifactViewer } from './NotebookArtifactViewer';
+import { AxiomChart } from './AxiomChart';
+import { InsightCards } from './InsightCards';
 import { motion, AnimatePresence } from 'framer-motion';
 import { ChatMessage } from '../types';
 
@@ -12,11 +14,13 @@ interface AxiomArtifactsProps {
 }
 
 export function AxiomArtifacts({ message, onActionClick }: AxiomArtifactsProps) {
-  if (!message || (!message.metadata?.artifact && !message.metadata?.result)) return null;
+  if (!message || (!message.metadata?.artifact && !message.metadata?.result && !message.metadata?.visual_manifest)) return null;
 
   const artifact = message.metadata?.artifact;
   const hasArtifact = !!artifact;
   const hasResult = !!message.metadata?.result;
+  const manifest = message.metadata?.visual_manifest as any;
+  const kpis = message.metadata?.insight_kpis as any[];
 
   return (
     <div className="h-full flex flex-col space-y-8 overflow-y-auto pr-2 custom-scrollbar pb-20">
@@ -29,6 +33,20 @@ export function AxiomArtifacts({ message, onActionClick }: AxiomArtifactsProps) 
           transition={{ duration: 0.3 }}
           className="space-y-12"
         >
+          {kpis && kpis.length > 0 && (
+            <InsightCards kpis={kpis} />
+          )}
+
+          {manifest && (
+            <div className="space-y-6">
+              <div className="flex items-center gap-4 px-4">
+                 <div className="w-2 h-2 rounded-full bg-[#638A70] shadow-[0_0_10px_rgba(99,138,112,0.5)]" />
+                 <h3 className="text-xs font-mono font-bold text-[#638A70] uppercase tracking-[0.3em]">Business Intelligence View</h3>
+               </div>
+              <AxiomChart manifest={manifest} />
+            </div>
+          )}
+
           {hasArtifact && (
              <NotebookArtifactViewer artifact={artifact} />
           )}

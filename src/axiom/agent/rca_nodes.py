@@ -5,6 +5,7 @@ from typing import Dict, Any
 
 from axiom.agent.state import SQLAgentState
 from axiom.config import settings
+from axiom.agent.prompt_registry import registry as _prompt_registry
 
 logger = logging.getLogger(__name__)
 
@@ -40,21 +41,16 @@ class ProblemDefinitionNode:
 
     async def __call__(self, state: SQLAgentState) -> Dict[str, Any]:
         question = state["question"]
-        
-        prompt = f"""You are a Senior Site Reliability Engineer (SRE) and Data Scientist.
-Your task is to convert the user's issue into a precise problem formulation.
-Do NOT attempt to solve it yet.
 
-User Query: "{question}"
-
-Output EXACTLY in this format:
-WHAT IS WRONG: <description>
-EXPECTED: <what should happen>
-DEVIATION: <the difference between expected and actual>"""
+        system_msg = _prompt_registry.render_system("problem_definition")
+        prompt = _prompt_registry.render_context("problem_definition", question=question)
 
         response = await self._client.chat.completions.create(
             model=state.get("llm_model") or settings.llm_model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt},
+            ],
             temperature=0.1,
         )
         problem_statement = _get_content(response).strip()
@@ -73,25 +69,22 @@ class HypothesisGenerationNode:
     async def __call__(self, state: SQLAgentState) -> Dict[str, Any]:
         problem = state.get("problem_statement", state["question"])
         existing_log = "\n".join(state.get("investigation_log", []))
-        
-        prompt = f"""You are a Senior Investigator performing Root Cause Analysis.
-Problem Statement:
-{problem}
 
-Past Investigation Steps / Evidence:
-{existing_log if existing_log else "None so far."}
-
-Generate 3-5 distinct, mutually exclusive hypotheses that could explain this issue.
-Focus on system-level causes (e.g., config change, pipeline failure, traffic shift).
-Do NOT output anything except a JSON list of strings representing the hypotheses.
-Example: ["A recent deployment broke the auth service", "A data pipeline failed causing missing records"]
-"""
+        system_msg = _prompt_registry.render_system("hypothesis_planner")
+        prompt = _prompt_registry.render_context(
+            "hypothesis_planner",
+            problem=problem,
+            existing_log=existing_log or "None so far.",
+        )
 
         response = await self._client.chat.completions.create(
             model=state.get("llm_model") or settings.llm_model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt},
+            ],
             temperature=0.7,
-            response_format={ "type": "json_object" }
+            response_format={"type": "json_object"},
         )
         
         try:

@@ -8,7 +8,7 @@ from axiom.agent.nodes import (
     SchemaRetrievalNode, SQLGenerationNode, SQLExecutionNode,
     TableSelectionNode, DatabaseSelectionNode,
     NotebookArtifactNode, ResponseSynthesizerNode, SQLCriticNode, DiscoveryNode,
-    PythonCodeGenerationNode,
+    VisualizationNode, DataValidatorNode
 )
 from axiom.agent.memory_manager import MemoryManagerNode
 from axiom.rag.schema import SchemaRAG
@@ -38,8 +38,9 @@ class SQLActivities:
         self.exec_node = SQLExecutionNode(thread_mgr, rag)
         self.critic_node = SQLCriticNode()
         self.discovery_node = DiscoveryNode()
+        self.data_validator_node = DataValidatorNode()
         self.notebook_node = NotebookArtifactNode()
-        self.python_gen_node = PythonCodeGenerationNode()
+        self.visualize_node = VisualizationNode()
         self.synthesizer_node = ResponseSynthesizerNode()
 
     async def _run_node(self, node, state: SQLAgentState, heartbeat_msg: str) -> SQLAgentState:
@@ -77,6 +78,10 @@ class SQLActivities:
         return await self._run_node(self.exec_node, state, "Executing SQL...")
 
     @activity.defn
+    async def validate_data(self, state: SQLAgentState) -> SQLAgentState:
+        return await self._run_node(self.data_validator_node, state, "Validating data quality...")
+
+    @activity.defn
     async def run_critic(self, state: SQLAgentState) -> SQLAgentState:
         return await self._run_node(self.critic_node, state, "Running critic...")
 
@@ -85,8 +90,8 @@ class SQLActivities:
         return await self._run_node(self.discovery_node, state, "Running discovery...")
 
     @activity.defn
-    async def generate_python_code(self, state: SQLAgentState) -> SQLAgentState:
-        return await self._run_node(self.python_gen_node, state, "Generating dynamic analysis code...")
+    async def visualize(self, state: SQLAgentState) -> SQLAgentState:
+        return await self._run_node(self.visualize_node, state, "Generating visualization manifest...")
 
     @activity.defn
     async def build_notebook(self, state: SQLAgentState) -> SQLAgentState:

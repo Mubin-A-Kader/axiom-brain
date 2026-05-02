@@ -54,6 +54,18 @@ class SupervisorNode:
 
         agent_lines.append(f"- DATA_AGENT: {data_agent_desc}")
 
+        # PLANNER_AGENT is available when there are 2+ data sources and the question
+        # clearly needs to correlate or compare data across them.
+        if len(data_sources_desc) >= 2:
+            agent_lines.append(
+                "- PLANNER_AGENT: Multi-step cross-source reasoning engine. "
+                "Use this when the question explicitly requires querying MULTIPLE different data sources "
+                "and correlating or comparing their results (e.g. 'compare our internal sales with market trends', "
+                "'how does our retention compare to industry benchmarks', "
+                "'what caused the drop — check both our DB and the market feed'). "
+                "Do NOT use for single-source queries, even complex ones."
+            )
+
         # 2. Dynamically fetch connected App Connectors (Gmail, Slack, etc.)
         try:
             connected_apps = await AppConnectorFactory.get_connected_for_tenant(tenant_id)
@@ -65,38 +77,22 @@ class SupervisorNode:
             logger.warning("Could not load connected apps for tenant '%s': %s", tenant_id, exc)
 
         agent_list = "\n".join(agent_lines)
-        prompt = f"""You are the Master Orchestrator for Axiom Brain.
-Route the user query to the most appropriate agent.
-
-### AVAILABLE AGENTS:
-{agent_list}
-
-### CONVERSATION HISTORY (Context):
-{history_context if history_context else "No prior history."}
-
-### USER QUERY:
-"{question}"
-
-### INSTRUCTIONS:
-Respond strictly with valid JSON:
-{{"next_agent": "<AGENT_NAME>"}}
-
-1. ANALYZE intent: Look for keywords (sheets, email, slack, database, metrics).
-2. REFINEMENT DETECTION (CRITICAL): If the user asks for a "chart", "plot", "graph", "visualization", "summary", "breakdown", or "detailed analysis" based on results they *just saw*, you MUST stay with the agent that provided those results. 
-   - Keywords to stay: "this", "it", "those", "that summary", "above", "result".
-   - Example: If history shows GMAIL_AGENT and user says "can u a graph from this", you MUST stay on GMAIL_AGENT.
-   - Example: If history shows DATA_AGENT and user says "break it down", you MUST stay on DATA_AGENT.
-3. TOPIC SWITCHING: If the user explicitly mentions a NEW topic (e.g. "What is our revenue?"), switch to the corresponding agent (e.g. DATA_AGENT).
-4. AMBIGUITY: Only output "AMBIGUOUS_AGENT" if there is NO recent history context or if the user explicitly asks a question that spans multiple unconnected domains without referring to the previous turn. 
-5. Do NOT arbitrarily default to DATA_AGENT for visualization requests if the data originated from an App Agent (Gmail, Slack, etc.). App agents can build their own notebooks now.
-6. Use exactly the agent name shown above. 
-7. Do NOT stay on the GMAIL_AGENT if the user explicitly asks about a database or spreadsheet.
-"""
+        from axiom.agent.prompt_registry import registry
+        system_msg = registry.render_system("master_supervisor")
+        context_msg = registry.render_context(
+            "master_supervisor",
+            agent_list=agent_list,
+            history_context=history_context or "No prior history.",
+            question=question
+        )
 
         try:
             response = await self._client.chat.completions.create(
                 model=state.get("llm_model") or settings.llm_model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": context_msg}
+                ],
                 temperature=0.0,
                 response_format={"type": "json_object"},
             )
@@ -110,8 +106,13 @@ Respond strictly with valid JSON:
                     "agent_thought": "Query intent is ambiguous based on available agents.",
                     "response_text": "I'm not sure which data source to use for this request. Could you clarify if you mean the database or a specific connected app?"
                 }
-                
-            return {"next_agent": next_agent, "agent_thought": f"Routing to {next_agent}."}
+            
+            # Silence thought on clarifications to avoid UI clutter
+            thought = f"Routing to {next_agent}."
+            if "[" in question and "]" in question:
+                thought = None
+
+            return {"next_agent": next_agent, "agent_thought": thought}
         except Exception as exc:
             logger.warning("Supervisor routing failed: %s. Defaulting to DATA_AGENT.", exc)
             return {"next_agent": "DATA_AGENT"}

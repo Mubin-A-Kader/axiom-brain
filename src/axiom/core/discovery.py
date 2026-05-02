@@ -29,15 +29,15 @@ class DynamicSchemaMapper:
         search_pattern = f"%{keywords[0]}%"
         
         query = f"""
-            SELECT DISTINCT table_name 
+            SELECT DISTINCT (table_schema || '.' || table_name) as full_name
             FROM information_schema.columns 
-            WHERE table_schema = 'public' 
+            WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
             AND ({conditions} OR table_name ILIKE $1)
             LIMIT 10
         """
         # Simplify to use the first/main keyword for the check to keep it fast
         rows = await conn.fetch(query, search_pattern)
-        return [r['table_name'] for r in rows]
+        return [r['full_name'] for r in rows]
 
     @staticmethod
     async def find_similar_tables(conn: asyncpg.Connection, target: str) -> List[str]:
