@@ -37,10 +37,11 @@ class EvalConfig:
 
 async def run_eval(
     session: AsyncSession,
-    dataset_id: UUID,
+    run: EvalRun,
     target: Target,
     config: EvalConfig,
 ) -> EvalRun:
+    dataset_id = run.dataset_id
     dataset = await session.get(EvalDataset, dataset_id)
     if dataset is None:
         raise ValueError(f"Dataset {dataset_id} not found.")
@@ -49,8 +50,7 @@ async def run_eval(
         await session.execute(select(EvalExample).where(EvalExample.dataset_id == dataset_id))
     ).scalars().all()
 
-    run = EvalRun(dataset_id=dataset_id, config={"metrics": config.metrics}, status="running")
-    session.add(run)
+    run.status = "running"
     await session.flush()
 
     sem = asyncio.Semaphore(config.concurrency)

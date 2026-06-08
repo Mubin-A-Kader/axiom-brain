@@ -10,6 +10,8 @@ Inserts a sample document and eval dataset so you can immediately try
 
 import asyncio
 
+from sqlalchemy import select
+
 from axiom.config import get_settings
 from axiom.core.logging import configure_logging
 from axiom.db.models import EvalDataset, EvalExample
@@ -34,7 +36,7 @@ Supported providers: Anthropic Claude, OpenAI GPT series (BYOM plug-in interface
 
 SAMPLE_EVAL_EXAMPLES = [
     {
-        "input": {"question": "What does AXIOM stand for?", "query": "What does AXIOM stand for?"},
+        "input": {"question": "What is AXIOM?", "query": "What is AXIOM?"},
         "expected": {"answer": "AXIOM is a high-performance command nexus for autonomous agents."},
     },
     {
@@ -57,16 +59,24 @@ async def main() -> None:
         )
         print(f"Ingested {len(docs)} document(s), {docs[0].chunks.__len__()} chunks.")
 
-        # Create sample eval dataset
-        dataset = EvalDataset(name="axiom-demo-v1", description="Demo eval dataset for AXIOM.")
-        session.add(dataset)
-        await session.flush()
-        for ex in SAMPLE_EVAL_EXAMPLES:
-            session.add(
-                EvalExample(dataset_id=dataset.id, input=ex["input"], expected=ex["expected"])
-            )
-        await session.commit()
-        print(f"Created eval dataset: {dataset.id}")
+        # Create sample eval dataset if it doesn't exist
+        stmt = select(EvalDataset).where(EvalDataset.name == "axiom-demo-v1")
+        existing_dataset = (await session.execute(stmt)).scalar_one_or_none()
+
+        if existing_dataset:
+            print(f"Eval dataset 'axiom-demo-v1' already exists (ID: {existing_dataset.id}). Skipping creation.")
+            dataset_id = existing_dataset.id
+        else:
+            dataset = EvalDataset(name="axiom-demo-v1", description="Demo eval dataset for AXIOM.")
+            session.add(dataset)
+            await session.flush()
+            for ex in SAMPLE_EVAL_EXAMPLES:
+                session.add(
+                    EvalExample(dataset_id=dataset.id, input=ex["input"], expected=ex["expected"])
+                )
+            await session.commit()
+            dataset_id = dataset.id
+            print(f"Created eval dataset: {dataset_id}")
 
     await close_db()
     print("Seed complete.")

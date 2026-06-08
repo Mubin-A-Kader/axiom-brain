@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, patch
 
-import pytest
+import pytest  # type: ignore
 
 from axiom.evals.metrics import contains, exact_match
 

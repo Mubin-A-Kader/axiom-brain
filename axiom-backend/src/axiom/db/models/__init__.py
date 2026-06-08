@@ -57,12 +57,13 @@ class Chunk(Base, TimestampMixin):
     document: Mapped[Document] = relationship(back_populates="chunks")
 
     __table_args__ = (
-        # IVFFlat index — good default; switch to HNSW for higher recall.
+        # HNSW index — accurate at any table size (IVFFlat drops rows on
+        # tiny tables because it only probes a subset of lists).
         Index(
-            "ix_chunks_embedding_ivfflat",
+            "ix_chunks_embedding_hnsw",
             "embedding",
-            postgresql_using="ivfflat",
-            postgresql_with={"lists": 100},
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
     )

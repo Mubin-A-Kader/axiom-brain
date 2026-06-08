@@ -66,7 +66,8 @@ async def run_eval_task(ctx: dict, run_id: str) -> None:
             threshold=run.config.get("threshold", 0.7),
             concurrency=run.config.get("concurrency", 4),
         )
-        await run_eval(session, run.dataset_id, target, eval_config)
+        await run_eval(session, run, target, eval_config)
+        await session.commit()
 
     log.info("eval_worker.done", run_id=run_id)
 
@@ -102,10 +103,15 @@ def _parse_redis_url(url: str) -> tuple[str, int, int]:
 
 # --- ARQ Worker settings -----------------------------------------------------
 
+def _get_redis_settings() -> RedisSettings:
+    settings = get_settings()
+    host, port, db = _parse_redis_url(str(settings.redis_url))
+    return RedisSettings(host=host, port=port, database=db)
+
 
 class WorkerSettings:
     functions = [run_eval_task]
-    redis_settings = RedisSettings()  # reads REDIS_URL from env via ARQ
+    redis_settings = _get_redis_settings()
 
     @staticmethod
     async def on_startup(ctx: dict) -> None:
