@@ -11,7 +11,8 @@ keyed by principal-id with a per-IP fallback for unauthenticated routes.
 from dataclasses import dataclass
 from typing import Annotated
 
-from fastapi import Depends, Header, Request
+from fastapi import Depends, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from axiom.cache.redis_client import get_redis
 from axiom.config import get_settings
@@ -30,18 +31,24 @@ class Unauthorized(AxiomError):
     status_code = status.HTTP_401_UNAUTHORIZED
 
 
+# This enables the "Authorize" padlock in Swagger UI
+security = HTTPBearer(auto_error=False)
+
+
 async def get_current_principal(
-    authorization: Annotated[str | None, Header()] = None,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security)],
 ) -> Principal:
     """Resolve the caller from an ``Authorization: Bearer <token>`` header.
 
     Replace the body with a real verifier (JWT, opaque-token lookup, etc.).
     """
-    if not authorization or not authorization.lower().startswith("bearer "):
+    if not credentials or credentials.scheme.lower() != "bearer":
         raise Unauthorized("Missing or malformed Authorization header.")
-    token = authorization.split(" ", 1)[1].strip()
+
+    token = credentials.credentials.strip()
     if not token:
         raise Unauthorized("Empty bearer token.")
+
     # TODO: verify token, decode claims
     return Principal(id=f"user::{token[:8]}", scopes=frozenset({"read", "write"}))
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from dataclasses import asdict
 
 from axiom.config import get_settings
 from axiom.llm.client import ChatMessage, get_llm_client
@@ -50,4 +51,4 @@ async def rerank(query: str, candidates: list[RetrievedChunk]) -> list[Retrieved
     scored.sort(key=lambda x: x[1], reverse=True)
     top = scored[: settings.rag_rerank_top_k]
     # Preserve original chunk fields but overwrite score with reranker score.
-    return [RetrievedChunk(**{**c.__dict__, "score": s}) for c, s in top]
+    return [RetrievedChunk(**{**asdict(c), "score": s}) for c, s in top]

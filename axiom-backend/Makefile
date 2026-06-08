@@ -2,41 +2,41 @@
 
 # ── Setup ──────────────────────────────────────────────────────────────────
 install:
-	pip install -e ".[dev]"
+	uv sync
 
 # ── Development ────────────────────────────────────────────────────────────
 dev:
-	uvicorn axiom.main:app --reload --host 0.0.0.0 --port 8000
+	uv run uvicorn axiom.main:app --reload --host 0.0.0.0 --port 8000
 
 worker:
-	arq axiom.workers.tasks.WorkerSettings
+	uv run arq axiom.workers.tasks.WorkerSettings
 
 # ── Quality ────────────────────────────────────────────────────────────────
 test:
-	pytest -v --cov=axiom --cov-report=term-missing
+	uv run pytest -v --cov=axiom --cov-report=term-missing
 
 lint:
-	ruff check src tests
+	uv run ruff check src tests
 
 fmt:
-	ruff format src tests
-	ruff check --fix src tests
+	uv run ruff format src tests
+	uv run ruff check --fix src tests
 
 typecheck:
-	mypy src/axiom --ignore-missing-imports
+	uv run mypy src/axiom --ignore-missing-imports
 
 # ── Database ───────────────────────────────────────────────────────────────
 migrate:
-	alembic upgrade head
+	uv run alembic upgrade head
 
 migrate-gen:
-	alembic revision --autogenerate -m "$(msg)"
+	uv run alembic revision --autogenerate -m "$(msg)"
 
 migrate-down:
-	alembic downgrade -1
+	uv run alembic downgrade -1
 
 seed:
-	python -m scripts.seed
+	uv run python -m scripts.seed
 
 # ── Docker ─────────────────────────────────────────────────────────────────
 docker-up:
